@@ -1,0 +1,77 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<archimate:model xmlns:archimate="http://www.opengroup.org/xsd/archimate/3.0/"
+                 xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                 identifier="model-macrose-invite"
+                 version="1.0">
+  <archimate:name>Macrose Invite Flow</archimate:name>
+
+  <archimate:elements>
+    <archimate:element identifier="ba-trainer" xsi:type="archimate:BusinessActor"><archimate:name>Trainer</archimate:name></archimate:element>
+    <archimate:element identifier="ba-client" xsi:type="archimate:BusinessActor"><archimate:name>Client</archimate:name></archimate:element>
+    <archimate:element identifier="ba-idp" xsi:type="archimate:BusinessActor"><archimate:name>Keycloak IdP</archimate:name></archimate:element>
+
+    <archimate:element identifier="bp-create-invite" xsi:type="archimate:BusinessProcess"><archimate:name>Create Invite</archimate:name></archimate:element>
+    <archimate:element identifier="bp-validate-invite" xsi:type="archimate:BusinessProcess"><archimate:name>Validate Invite Link</archimate:name></archimate:element>
+    <archimate:element identifier="bp-register-login" xsi:type="archimate:BusinessProcess"><archimate:name>Register / Login</archimate:name></archimate:element>
+    <archimate:element identifier="bp-accept-invite" xsi:type="archimate:BusinessProcess"><archimate:name>Accept Invite</archimate:name></archimate:element>
+    <archimate:element identifier="bp-provision-client" xsi:type="archimate:BusinessProcess"><archimate:name>Provision Client Profile</archimate:name></archimate:element>
+
+    <archimate:element identifier="bo-invite-link" xsi:type="archimate:BusinessObject"><archimate:name>Invite Link (ID + Token)</archimate:name></archimate:element>
+    <archimate:element identifier="bo-jwt" xsi:type="archimate:BusinessObject"><archimate:name>JWT (sub = Keycloak UUID)</archimate:name></archimate:element>
+    <archimate:element identifier="bo-client-profile" xsi:type="archimate:BusinessObject"><archimate:name>Client Profile</archimate:name></archimate:element>
+    <archimate:element identifier="bo-trainer-client-rel" xsi:type="archimate:BusinessObject"><archimate:name>Trainer–Client Relationship</archimate:name></archimate:element>
+
+    <archimate:element identifier="ac-frontend" xsi:type="archimate:ApplicationComponent"><archimate:name>Web / Mobile Client</archimate:name></archimate:element>
+    <archimate:element identifier="ac-keycloak" xsi:type="archimate:ApplicationComponent"><archimate:name>Keycloak</archimate:name></archimate:element>
+    <archimate:element identifier="ac-backend" xsi:type="archimate:ApplicationComponent"><archimate:name>Macrose Backend</archimate:name></archimate:element>
+    <archimate:element identifier="ac-auth" xsi:type="archimate:ApplicationComponent"><archimate:name>Auth Module</archimate:name></archimate:element>
+    <archimate:element identifier="ac-client-mgmt" xsi:type="archimate:ApplicationComponent"><archimate:name>Client Management Module</archimate:name></archimate:element>
+
+    <archimate:element identifier="as-invite-api" xsi:type="archimate:ApplicationService"><archimate:name>Invite API</archimate:name></archimate:element>
+    <archimate:element identifier="as-profile-api" xsi:type="archimate:ApplicationService"><archimate:name>Client Profile API</archimate:name></archimate:element>
+    <archimate:element identifier="as-current-user" xsi:type="archimate:ApplicationService"><archimate:name>CurrentUser (JWT sub)</archimate:name></archimate:element>
+
+    <archimate:element identifier="af-validate-invite" xsi:type="archimate:ApplicationFunction"><archimate:name>Validate Invite</archimate:name></archimate:element>
+    <archimate:element identifier="af-accept-invite" xsi:type="archimate:ApplicationFunction"><archimate:name>Accept Invite</archimate:name></archimate:element>
+    <archimate:element identifier="af-update-profile" xsi:type="archimate:ApplicationFunction"><archimate:name>Update Profile</archimate:name></archimate:element>
+
+    <archimate:element identifier="do-client-invites" xsi:type="archimate:DataObject"><archimate:name>client_invites</archimate:name></archimate:element>
+    <archimate:element identifier="do-client-profiles" xsi:type="archimate:DataObject"><archimate:name>client_profiles</archimate:name></archimate:element>
+    <archimate:element identifier="do-trainer-clients" xsi:type="archimate:DataObject"><archimate:name>trainer_clients</archimate:name></archimate:element>
+  </archimate:elements>
+
+  <archimate:relationships>
+    <archimate:relationship identifier="r-b-1" xsi:type="archimate:AssignmentRelationship" source="ba-trainer" target="bp-create-invite"/>
+    <archimate:relationship identifier="r-b-2" xsi:type="archimate:AssignmentRelationship" source="ba-client" target="bp-validate-invite"/>
+    <archimate:relationship identifier="r-b-3" xsi:type="archimate:AssignmentRelationship" source="ba-client" target="bp-register-login"/>
+    <archimate:relationship identifier="r-b-4" xsi:type="archimate:AssignmentRelationship" source="ba-client" target="bp-accept-invite"/>
+    <archimate:relationship identifier="r-b-5" xsi:type="archimate:AccessRelationship" source="bp-create-invite" target="bo-invite-link"/>
+    <archimate:relationship identifier="r-b-6" xsi:type="archimate:AccessRelationship" source="bp-validate-invite" target="bo-invite-link"/>
+    <archimate:relationship identifier="r-b-7" xsi:type="archimate:ServingRelationship" source="ba-idp" target="bp-register-login"/>
+    <archimate:relationship identifier="r-b-8" xsi:type="archimate:AccessRelationship" source="bp-register-login" target="bo-jwt"/>
+    <archimate:relationship identifier="r-b-9" xsi:type="archimate:AccessRelationship" source="bp-accept-invite" target="bo-jwt"/>
+    <archimate:relationship identifier="r-b-10" xsi:type="archimate:TriggeringRelationship" source="bp-accept-invite" target="bp-provision-client"/>
+    <archimate:relationship identifier="r-b-11" xsi:type="archimate:AccessRelationship" source="bp-provision-client" target="bo-client-profile"/>
+    <archimate:relationship identifier="r-b-12" xsi:type="archimate:AccessRelationship" source="bp-provision-client" target="bo-trainer-client-rel"/>
+
+    <archimate:relationship identifier="r-a-1" xsi:type="archimate:UsedByRelationship" source="ac-frontend" target="as-invite-api"/>
+    <archimate:relationship identifier="r-a-2" xsi:type="archimate:UsedByRelationship" source="ac-frontend" target="as-profile-api"/>
+    <archimate:relationship identifier="r-a-3" xsi:type="archimate:UsedByRelationship" source="ac-frontend" target="ac-keycloak"/>
+    <archimate:relationship identifier="r-a-4" xsi:type="archimate:CompositionRelationship" source="ac-backend" target="ac-auth"/>
+    <archimate:relationship identifier="r-a-5" xsi:type="archimate:CompositionRelationship" source="ac-backend" target="ac-client-mgmt"/>
+    <archimate:relationship identifier="r-a-6" xsi:type="archimate:AssignmentRelationship" source="as-invite-api" target="af-validate-invite"/>
+    <archimate:relationship identifier="r-a-7" xsi:type="archimate:AssignmentRelationship" source="as-invite-api" target="af-accept-invite"/>
+    <archimate:relationship identifier="r-a-8" xsi:type="archimate:AssignmentRelationship" source="as-profile-api" target="af-update-profile"/>
+    <archimate:relationship identifier="r-a-9" xsi:type="archimate:AssignmentRelationship" source="ac-auth" target="as-current-user"/>
+    <archimate:relationship identifier="r-a-10" xsi:type="archimate:UsedByRelationship" source="af-accept-invite" target="as-current-user"/>
+    <archimate:relationship identifier="r-a-11" xsi:type="archimate:UsedByRelationship" source="af-update-profile" target="as-current-user"/>
+    <archimate:relationship identifier="r-a-12" xsi:type="archimate:AccessRelationship" source="af-validate-invite" target="do-client-invites"/>
+    <archimate:relationship identifier="r-a-13" xsi:type="archimate:AccessRelationship" source="af-accept-invite" target="do-client-invites"/>
+    <archimate:relationship identifier="r-a-14" xsi:type="archimate:AccessRelationship" source="af-accept-invite" target="do-client-profiles"/>
+    <archimate:relationship identifier="r-a-15" xsi:type="archimate:AccessRelationship" source="af-accept-invite" target="do-trainer-clients"/>
+    <archimate:relationship identifier="r-a-16" xsi:type="archimate:AccessRelationship" source="af-update-profile" target="do-client-profiles"/>
+    <archimate:relationship identifier="r-a-17" xsi:type="archimate:RealizationRelationship" source="ac-client-mgmt" target="as-invite-api"/>
+    <archimate:relationship identifier="r-a-18" xsi:type="archimate:RealizationRelationship" source="ac-client-mgmt" target="as-profile-api"/>
+    <archimate:relationship identifier="r-a-19" xsi:type="archimate:RealizationRelationship" source="ac-auth" target="as-current-user"/>
+  </archimate:relationships>
+</archimate:model>

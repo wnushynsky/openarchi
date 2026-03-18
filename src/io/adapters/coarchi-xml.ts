@@ -209,6 +209,135 @@ function resolveBendpoints(
   });
 }
 
+// ---------------------------------------------------------------------------
+// Recursive view tree walker — handles nested children with relative coords
+// ---------------------------------------------------------------------------
+
+interface ViewWalkContext {
+  viewId: string;
+  elementIds: Set<string>;
+  relationshipIds: Set<string>;
+  viewNodeKeys: Set<string>;
+  viewConnectionKeys: Set<string>;
+  viewNodes: CanonicalViewNode[];
+  viewConnections: CanonicalViewConnection[];
+  relationships: CanonicalRelationship[];
+  fallbackIndex: number;
+}
+
+/**
+ * Recursively walk <children> elements in an Archi view tree.
+ * Each child's bounds are RELATIVE to its parent, so we accumulate
+ * the parent's absolute offset (parentX, parentY) as we descend.
+ */
+function walkViewChildren(
+  parentEl: Element,
+  parentX: number,
+  parentY: number,
+  ctx: ViewWalkContext,
+): void {
+  // Direct <children> (Archi format) or <child> elements
+  const childNodes = Array.from(parentEl.children).filter(c => {
+    const tag = localName(c).toLowerCase();
+    return tag === 'children' || tag === 'child';
+  });
+
+  for (const child of childNodes) {
+    const bounds = parseBounds(child);
+    const absX = parentX + (bounds?.x ?? 0);
+    const absY = parentY + (bounds?.y ?? 0);
+    const width = bounds?.width ?? 160;
+    const height = bounds?.height ?? 72;
+
+    // Check if this node references a semantic element
+    const elementId = getAttr(child, ['archimateElement', 'elementRef', 'modelElement', 'conceptRef'])
+      || getChildElementRef(child, ['archimateElement', 'elementRef', 'modelElement']);
+
+    if (elementId && ctx.elementIds.has(elementId)) {
+      const key = `${ctx.viewId}::${elementId}`;
+      if (!ctx.viewNodeKeys.has(key)) {
+        ctx.viewNodes.push({
+          id: getAttr(child, ['identifier', 'id']) || key,
+          viewId: ctx.viewId,
+          elementId,
+          x: absX,
+          y: absY,
+          width,
+          height,
+        });
+        ctx.viewNodeKeys.add(key);
+        ctx.fallbackIndex += 1;
+      }
+    }
+
+    // Check if this node is a connection
+    const relId = getAttr(child, ['archimateRelationship', 'relationshipRef', 'relationship'])
+      || getChildElementRef(child, ['archimateRelationship', 'relationshipRef']);
+    if (relId && ctx.relationshipIds.has(relId)) {
+      const key = `${ctx.viewId}::${relId}`;
+      if (!ctx.viewConnectionKeys.has(key)) {
+        const rawBendpoints = parseRawBendpoints(child);
+        const rel = ctx.relationships.find(r => r.id === relId);
+        let sourceCenter: { x: number; y: number } | null = null;
+        let targetCenter: { x: number; y: number } | null = null;
+        if (rel) {
+          const srcNode = ctx.viewNodes.find(vn => vn.viewId === ctx.viewId && vn.elementId === rel.sourceId);
+          const tgtNode = ctx.viewNodes.find(vn => vn.viewId === ctx.viewId && vn.elementId === rel.targetId);
+          if (srcNode) sourceCenter = { x: srcNode.x + srcNode.width / 2, y: srcNode.y + srcNode.height / 2 };
+          if (tgtNode) targetCenter = { x: tgtNode.x + tgtNode.width / 2, y: tgtNode.y + tgtNode.height / 2 };
+        }
+
+        ctx.viewConnections.push({
+          id: getAttr(child, ['identifier', 'id']) || key,
+          viewId: ctx.viewId,
+          relationshipId: relId,
+          waypoints: resolveBendpoints(rawBendpoints, sourceCenter, targetCenter),
+          labelPosition: asNumber(getAttr(child, ['labelPos', 'labelPosition'])) ?? 0.5,
+        });
+        ctx.viewConnectionKeys.add(key);
+      }
+    }
+
+    // Recurse into nested children (they'll be offset relative to this node)
+    walkViewChildren(child, absX, absY, ctx);
+  }
+
+  // Also handle <sourceConnection> / <connection> elements at this level
+  const connectionNodes = Array.from(parentEl.children).filter(c => {
+    const tag = localName(c).toLowerCase();
+    return tag === 'sourceconnection' || tag === 'connection' || tag === 'connections';
+  });
+
+  for (const conn of connectionNodes) {
+    const relId = getAttr(conn, ['archimateRelationship', 'relationshipRef', 'relationship'])
+      || getChildElementRef(conn, ['archimateRelationship', 'relationshipRef']);
+    if (relId && ctx.relationshipIds.has(relId)) {
+      const key = `${ctx.viewId}::${relId}`;
+      if (!ctx.viewConnectionKeys.has(key)) {
+        const rawBendpoints = parseRawBendpoints(conn);
+        const rel = ctx.relationships.find(r => r.id === relId);
+        let sourceCenter: { x: number; y: number } | null = null;
+        let targetCenter: { x: number; y: number } | null = null;
+        if (rel) {
+          const srcNode = ctx.viewNodes.find(vn => vn.viewId === ctx.viewId && vn.elementId === rel.sourceId);
+          const tgtNode = ctx.viewNodes.find(vn => vn.viewId === ctx.viewId && vn.elementId === rel.targetId);
+          if (srcNode) sourceCenter = { x: srcNode.x + srcNode.width / 2, y: srcNode.y + srcNode.height / 2 };
+          if (tgtNode) targetCenter = { x: tgtNode.x + tgtNode.width / 2, y: tgtNode.y + tgtNode.height / 2 };
+        }
+
+        ctx.viewConnections.push({
+          id: getAttr(conn, ['identifier', 'id']) || key,
+          viewId: ctx.viewId,
+          relationshipId: relId,
+          waypoints: resolveBendpoints(rawBendpoints, sourceCenter, targetCenter),
+          labelPosition: asNumber(getAttr(conn, ['labelPos', 'labelPosition'])) ?? 0.5,
+        });
+        ctx.viewConnectionKeys.add(key);
+      }
+    }
+  }
+}
+
 function parseCoArchiXml(raw: string): ParseResult {
   if (typeof DOMParser === 'undefined') {
     return {
@@ -334,58 +463,19 @@ function parseCoArchiXml(raw: string): ParseResult {
     });
     viewIds.add(id);
 
-    let fallbackIndex = 0;
-    const descendants = Array.from(viewNode.querySelectorAll('*'));
-    for (const child of descendants) {
-      const elementId = getAttr(child, ['archimateElement', 'elementRef', 'modelElement', 'conceptRef'])
-        || getChildElementRef(child, ['archimateElement', 'elementRef', 'modelElement']);
-      if (elementId && elementIds.has(elementId)) {
-        const key = `${id}::${elementId}`;
-        if (!viewNodeKeys.has(key)) {
-          const bounds = parseBounds(child);
-          viewNodes.push({
-            id: getAttr(child, ['identifier', 'id']) || key,
-            viewId: id,
-            elementId,
-            x: bounds?.x ?? 140 + (fallbackIndex % 10) * 180,
-            y: bounds?.y ?? 100 + Math.floor(fallbackIndex / 10) * 120,
-            width: bounds?.width ?? 160,
-            height: bounds?.height ?? 72,
-          });
-          viewNodeKeys.add(key);
-          fallbackIndex += 1;
-        }
-      }
-
-      const relationshipId = getAttr(child, ['archimateRelationship', 'relationshipRef', 'relationship'])
-        || getChildElementRef(child, ['archimateRelationship', 'relationshipRef']);
-      if (relationshipId && relationshipIds.has(relationshipId)) {
-        const key = `${id}::${relationshipId}`;
-        if (!viewConnectionKeys.has(key)) {
-          const rawBendpoints = parseRawBendpoints(child);
-
-          // Resolve relative bendpoints using source/target element centers
-          const rel = semanticRelationships.find(r => r.id === relationshipId);
-          let sourceCenter: { x: number; y: number } | null = null;
-          let targetCenter: { x: number; y: number } | null = null;
-          if (rel) {
-            const srcNode = viewNodes.find(vn => vn.viewId === id && vn.elementId === rel.sourceId);
-            const tgtNode = viewNodes.find(vn => vn.viewId === id && vn.elementId === rel.targetId);
-            if (srcNode) sourceCenter = { x: srcNode.x + srcNode.width / 2, y: srcNode.y + srcNode.height / 2 };
-            if (tgtNode) targetCenter = { x: tgtNode.x + tgtNode.width / 2, y: tgtNode.y + tgtNode.height / 2 };
-          }
-
-          viewConnections.push({
-            id: getAttr(child, ['identifier', 'id']) || key,
-            viewId: id,
-            relationshipId,
-            waypoints: resolveBendpoints(rawBendpoints, sourceCenter, targetCenter),
-            labelPosition: asNumber(getAttr(child, ['labelPos', 'labelPosition'])) ?? 0.5,
-          });
-          viewConnectionKeys.add(key);
-        }
-      }
-    }
+    // Recursively walk the view tree, accumulating parent offsets for relative coordinates
+    const walkCtx: ViewWalkContext = {
+      viewId: id,
+      elementIds,
+      relationshipIds,
+      viewNodeKeys,
+      viewConnectionKeys,
+      viewNodes,
+      viewConnections,
+      relationships: semanticRelationships,
+      fallbackIndex: 0,
+    };
+    walkViewChildren(viewNode, 0, 0, walkCtx);
   }
 
   if (semanticElements.length === 0) {
@@ -540,59 +630,19 @@ export function parseCoArchiFragments(xmlContents: string[]): ParseResult {
         });
         viewIds.add(id);
 
-        // Extract view nodes and connections from this view
-        let fallbackIndex = 0;
-        const descendants = Array.from(node.querySelectorAll('*'));
-        for (const child of descendants) {
-          // Check both attribute and child element references for archimateElement
-          // coArchi GRAFICO uses: <archimateElement href="id-xxx"/> as child element
-          const elementId = getAttr(child, ['archimateElement', 'elementRef', 'modelElement', 'conceptRef'])
-            || getChildElementRef(child, ['archimateElement', 'elementRef', 'modelElement']);
-          if (elementId) {
-            const key = `${id}::${elementId}`;
-            if (!viewNodeKeys.has(key)) {
-              const bounds = parseBounds(child);
-              allViewNodes.push({
-                id: getAttr(child, ['identifier', 'id']) || key,
-                viewId: id,
-                elementId,
-                x: bounds?.x ?? 140 + (fallbackIndex % 10) * 180,
-                y: bounds?.y ?? 100 + Math.floor(fallbackIndex / 10) * 120,
-                width: bounds?.width ?? 160,
-                height: bounds?.height ?? 72,
-              });
-              viewNodeKeys.add(key);
-              fallbackIndex += 1;
-            }
-          }
-
-          const relId = getAttr(child, ['archimateRelationship', 'relationshipRef', 'relationship'])
-            || getChildElementRef(child, ['archimateRelationship', 'relationshipRef']);
-          if (relId) {
-            const key = `${id}::${relId}`;
-            if (!viewConnectionKeys.has(key)) {
-              const rawBendpoints = parseRawBendpoints(child);
-              const rel = allRelationships.find(r => r.id === relId);
-              let sourceCenter: { x: number; y: number } | null = null;
-              let targetCenter: { x: number; y: number } | null = null;
-              if (rel) {
-                const srcNode = allViewNodes.find(vn => vn.viewId === id && vn.elementId === rel.sourceId);
-                const tgtNode = allViewNodes.find(vn => vn.viewId === id && vn.elementId === rel.targetId);
-                if (srcNode) sourceCenter = { x: srcNode.x + srcNode.width / 2, y: srcNode.y + srcNode.height / 2 };
-                if (tgtNode) targetCenter = { x: tgtNode.x + tgtNode.width / 2, y: tgtNode.y + tgtNode.height / 2 };
-              }
-
-              allViewConnections.push({
-                id: getAttr(child, ['identifier', 'id']) || key,
-                viewId: id,
-                relationshipId: relId,
-                waypoints: resolveBendpoints(rawBendpoints, sourceCenter, targetCenter),
-                labelPosition: asNumber(getAttr(child, ['labelPos', 'labelPosition'])) ?? 0.5,
-              });
-              viewConnectionKeys.add(key);
-            }
-          }
-        }
+        // Recursively walk the view tree, accumulating parent offsets for relative coordinates
+        const walkCtx: ViewWalkContext = {
+          viewId: id,
+          elementIds,
+          relationshipIds,
+          viewNodeKeys,
+          viewConnectionKeys,
+          viewNodes: allViewNodes,
+          viewConnections: allViewConnections,
+          relationships: allRelationships,
+          fallbackIndex: 0,
+        };
+        walkViewChildren(node, 0, 0, walkCtx);
         continue;
       }
 

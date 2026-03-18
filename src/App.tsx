@@ -15,7 +15,7 @@ import {
   snapToElements, snapResizeToElements, type SnapGuide,
 } from './core';
 import { drawDotGrid, drawLineGrid, drawElement, drawRelationship, drawSnapGuides, getRelSegments, type RelSegments } from './canvas';
-import { RelPicker, CtxMenu, SearchPanel, ViewNav, PropertyPanel, Btn, CanvasIcon } from './components';
+import { RelPicker, CtxMenu, SearchPanel, ViewNav, PropertyPanel, Btn, CanvasIcon, FloatingToolbar } from './components';
 import {
   detectModelFormatByFileName,
   exportEditorModelToText,
@@ -143,7 +143,7 @@ export default function App() {
   const [ctxMenu, setCtxMenu] = useState<CtxMenuState | null>(null);
   const [showSearch, setShowSearch] = useState(false);
   const [ioFormatId, setIoFormatId] = useState<string>('auto');
-  const [leftPanel, setLeftPanel] = useState<LeftPanel>('palette');
+  const [leftPanel, setLeftPanel] = useState<LeftPanel>('views');
   const [leftPanelWidth, setLeftPanelWidth] = useState(244);
   const [propSide, setPropSide] = useState<'left' | 'right'>('left');
   const [openTabIds, setOpenTabIds] = useState<string[]>(['v1']);
@@ -381,6 +381,29 @@ export default function App() {
   const [cam, setCam] = useState<Camera>({ x: 0, y: 0, s: 1 });
   const [cSize, setCSize] = useState({ w: 800, h: 600 });
 
+  // rAF-throttled camera updates — avoids re-rendering more than once per frame
+  const camPendingRef = useRef<Camera | null>(null);
+  const camRafRef = useRef(0);
+  const setCamThrottled = useCallback((next: Camera | ((prev: Camera) => Camera)) => {
+    // Resolve the next value
+    if (typeof next === 'function') {
+      // Need current cam — use ref
+      const current = camPendingRef.current ?? cam;
+      camPendingRef.current = next(current);
+    } else {
+      camPendingRef.current = next;
+    }
+    if (!camRafRef.current) {
+      camRafRef.current = requestAnimationFrame(() => {
+        camRafRef.current = 0;
+        if (camPendingRef.current) {
+          setCam(camPendingRef.current);
+          camPendingRef.current = null;
+        }
+      });
+    }
+  }, [cam]);
+
   // Resize observer
   useEffect(() => {
     const c = containerRef.current;
@@ -397,16 +420,46 @@ export default function App() {
     y: (sy - cam.y) / cam.s,
   }), [cam]);
 
+  // Pre-compute parent IDs and sorted elements (only when elements change, not on pan/zoom)
+  const parentIds = useMemo(() => {
+    const ids = new Set<string>();
+    for (const outer of visibleElements) {
+      for (const inner of visibleElements) {
+        if (inner.id === outer.id) continue;
+        if (inner.x >= outer.x && inner.y >= outer.y &&
+            inner.x + inner.w <= outer.x + outer.w &&
+            inner.y + inner.h <= outer.y + outer.h) {
+          ids.add(outer.id);
+          break;
+        }
+      }
+    }
+    return ids;
+  }, [visibleElements]);
+
+  const sortedElements = useMemo(
+    () => [...visibleElements].sort((a, b) => (a.zIndex ?? 0) - (b.zIndex ?? 0)),
+    [visibleElements],
+  );
+
+  // Track canvas dimensions to avoid unnecessary reallocation
+  const canvasDimsRef = useRef({ w: 0, h: 0 });
+
   // ==================== RENDER LOOP ====================
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
     const ctx = canvas.getContext('2d')!;
     const dpr = window.devicePixelRatio || 1;
-    canvas.width = cSize.w * dpr;
-    canvas.height = cSize.h * dpr;
-    canvas.style.width = cSize.w + 'px';
-    canvas.style.height = cSize.h + 'px';
+    const pw = cSize.w * dpr, ph = cSize.h * dpr;
+    // Only resize canvas buffer when dimensions actually change (expensive operation)
+    if (canvasDimsRef.current.w !== pw || canvasDimsRef.current.h !== ph) {
+      canvas.width = pw;
+      canvas.height = ph;
+      canvas.style.width = cSize.w + 'px';
+      canvas.style.height = cSize.h + 'px';
+      canvasDimsRef.current = { w: pw, h: ph };
+    }
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
 
     ctx.fillStyle = '#f5f6f8';
@@ -418,23 +471,6 @@ export default function App() {
     // Grid
     if (gridType === 'dot') drawDotGrid(ctx, cSize.w, cSize.h, cam.x, cam.y, cam.s);
     else drawLineGrid(ctx, cSize.w, cSize.h, cam.x, cam.y, cam.s);
-
-    // Compute which elements contain other elements (hasChildren)
-    const parentIds = new Set<string>();
-    for (const outer of visibleElements) {
-      for (const inner of visibleElements) {
-        if (inner.id === outer.id) continue;
-        if (inner.x >= outer.x && inner.y >= outer.y &&
-            inner.x + inner.w <= outer.x + outer.w &&
-            inner.y + inner.h <= outer.y + outer.h) {
-          parentIds.add(outer.id);
-          break;
-        }
-      }
-    }
-
-    // Sort elements by z-order for rendering
-    const sortedElements = [...visibleElements].sort((a, b) => (a.zIndex ?? 0) - (b.zIndex ?? 0));
 
     // 1. Composite elements (background)
     sortedElements.filter(e => getLayer(e.type) === 'composite' && !isNote(e.type)).forEach(el => {
@@ -451,11 +487,11 @@ export default function App() {
       .map(r => getRelSegments(r, visibleElements))
       .filter((s): s is RelSegments => s !== null);
 
+    // Pre-build a flat list of all segments with their owning relId for fast exclusion
+    const allFlatSegs = allRelSegs.flatMap(s => s.segments.map(seg => ({ ...seg, relId: s.relId })));
+
     visibleRelationships.forEach(r => {
-      // Collect segments from OTHER relationships for crossing detection
-      const otherSegs = allRelSegs
-        .filter(s => s.relId !== r.id)
-        .flatMap(s => s.segments);
+      const otherSegs = allFlatSegs.filter(s => s.relId !== r.id);
       drawRelationship(ctx, r, visibleElements, selType === 'relationship' && selectedId === r.id, hovRelId === r.id, otherSegs);
     });
 
@@ -464,33 +500,47 @@ export default function App() {
       drawSnapGuides(ctx, snapGuides, cSize.w, cSize.h, cam.x, cam.y, cam.s);
     }
 
-    // 5. Drawing-in-progress relationship (with waypoints)
+    // 5. Drawing-in-progress relationship (with waypoints + arrowhead)
     if (drawingRel) {
       const src = visibleElements.find(e => e.id === drawingRel.sourceId);
       if (src) {
         const wps = drawingRel.waypoints;
         const startPt = wps.length > 0 ? wps[0] : null;
         const a = nearestAnchor(src, startPt?.x ?? drawingRel.mx, startPt?.y ?? drawingRel.my);
+        const col = '#3b82f6';
         ctx.save();
+        // Line
         ctx.beginPath();
         ctx.moveTo(a.x, a.y);
         for (const wp of wps) ctx.lineTo(wp.x, wp.y);
         ctx.lineTo(drawingRel.mx, drawingRel.my);
-        ctx.strokeStyle = '#3b82f6'; ctx.lineWidth = 2; ctx.setLineDash([6, 3]); ctx.stroke(); ctx.setLineDash([]);
+        ctx.strokeStyle = col; ctx.lineWidth = 1.6; ctx.setLineDash([6, 3]); ctx.stroke(); ctx.setLineDash([]);
+        // Arrowhead at cursor end (open chevron like serving arrow)
+        const prevPt = wps.length > 0 ? wps[wps.length - 1] : a;
+        const dx = drawingRel.mx - prevPt.x;
+        const dy = drawingRel.my - prevPt.y;
+        if (Math.abs(dx) > 1 || Math.abs(dy) > 1) {
+          const angle = Math.atan2(dy, dx);
+          const aLen = 11;
+          const aSpread = 0.45;
+          ctx.beginPath();
+          ctx.moveTo(drawingRel.mx - aLen * Math.cos(angle - aSpread), drawingRel.my - aLen * Math.sin(angle - aSpread));
+          ctx.lineTo(drawingRel.mx, drawingRel.my);
+          ctx.lineTo(drawingRel.mx - aLen * Math.cos(angle + aSpread), drawingRel.my - aLen * Math.sin(angle + aSpread));
+          ctx.strokeStyle = col; ctx.lineWidth = 1.8; ctx.lineJoin = 'round'; ctx.lineCap = 'round'; ctx.stroke();
+        }
         // Waypoint dots
         for (const wp of wps) {
           ctx.beginPath(); ctx.arc(wp.x, wp.y, 4, 0, Math.PI * 2);
           ctx.fillStyle = '#fff'; ctx.fill();
-          ctx.strokeStyle = '#3b82f6'; ctx.lineWidth = 1.5; ctx.stroke();
+          ctx.strokeStyle = col; ctx.lineWidth = 1.5; ctx.stroke();
         }
-        // Cursor dot
-        ctx.beginPath(); ctx.arc(drawingRel.mx, drawingRel.my, 4, 0, Math.PI * 2); ctx.fillStyle = '#3b82f6'; ctx.fill();
         ctx.restore();
       }
     }
 
     ctx.restore();
-  }, [visibleElements, visibleRelationships, selectedId, selType, cam, cSize, hovElId, hovRelId, drawingRel, gridType, snapGuides]);
+  }, [visibleElements, visibleRelationships, sortedElements, parentIds, selectedId, selType, cam, cSize, hovElId, hovRelId, drawingRel, gridType, snapGuides]);
 
   // ==================== MOUSE HANDLERS ====================
   const handleMouseDown = useCallback((e: React.MouseEvent) => {
@@ -608,7 +658,7 @@ export default function App() {
         setElements(prev => prev.map(el => el.id === dragging.id ? { ...el, x: result.x, y: result.y } : el));
       }
     } else if (panning) {
-      setCam(p => ({ ...p, x: panning.cx + e.clientX - panning.sx, y: panning.cy + e.clientY - panning.sy }));
+      setCamThrottled(p => ({ ...p, x: panning.cx + e.clientX - panning.sx, y: panning.cy + e.clientY - panning.sy }));
     } else {
       if (selType === 'element' && selectedId) {
         const selElHov = visibleElements.find(e => e.id === selectedId);
@@ -629,7 +679,7 @@ export default function App() {
       } else setHovRelId(null);
       canvasRef.current!.style.cursor = 'default';
     }
-  }, [s2w, dragging, panning, visibleElements, visibleRelationships, drawingRel, dragWP, dragEndpoint, dragLabel, resizing, selType, selectedId]);
+  }, [s2w, dragging, panning, visibleElements, visibleRelationships, drawingRel, dragWP, dragEndpoint, dragLabel, resizing, selType, selectedId, setCamThrottled]);
 
   const handleMouseUp = useCallback((e: React.MouseEvent) => {
     if (drawingRel) {
@@ -783,8 +833,8 @@ export default function App() {
     const f = e.deltaY < 0 ? 1.08 : 0.93;
     const ns = Math.min(3, Math.max(0.2, cam.s * f));
     const wx = (sx - cam.x) / cam.s, wy = (sy - cam.y) / cam.s;
-    setCam({ s: ns, x: sx - wx * ns, y: sy - wy * ns });
-  }, [cam]);
+    setCamThrottled({ s: ns, x: sx - wx * ns, y: sy - wy * ns });
+  }, [cam, setCamThrottled]);
 
   // ==================== INLINE EDITING ====================
   const commitEditing = useCallback(() => {
@@ -1061,12 +1111,6 @@ export default function App() {
     setRelationships(p => p.map(r => r.id === selectedId ? { ...r, [k]: v } : r));
   }, [selectedId, pushHistory]);
 
-  const palItems = useMemo(() => {
-    const items = Object.entries(ELEMENT_TYPES).filter(([, d]) => d.layer === activeLayer && !d.isNote);
-    items.push(['note', ELEMENT_TYPES.note]);
-    return items;
-  }, [activeLayer]);
-
   // Position for inline editing overlay
   const editingEl = editingElId ? elements.find(e => e.id === editingElId) : null;
   const editOverlay = editingEl ? {
@@ -1079,96 +1123,117 @@ export default function App() {
 
   const relPickerWaypoints = useRef<{ x: number; y: number }[]>([]);
 
-  // Left panel cycling
+  // Left panel cycling (views + changelog only — palette moved to toolbar)
   const cycleLeftPanel = useCallback(() => {
-    setLeftPanel(p => p === 'palette' ? 'views' : p === 'views' ? 'changelog' : 'palette');
+    setLeftPanel(p => p === 'views' ? 'changelog' : 'views');
   }, []);
 
-  const leftPanelLabel = leftPanel === 'palette' ? 'Views' : leftPanel === 'views' ? 'Changelog' : 'Palette';
+  const leftPanelLabel = leftPanel === 'views' ? 'Changelog' : 'Views';
 
   // ==================== RENDER ====================
   return (
     <div style={{ width: '100%', height: '100vh', display: 'flex', flexDirection: 'column', fontFamily: FONT, background: 'var(--bg, #f5f6f8)', color: 'var(--text-primary, #1a1a1a)' }}>
-      {/* Toolbar */}
-      <div style={{ height: 44, background: 'var(--surface, rgba(255,255,255,0.96))', borderBottom: '1px solid var(--border, rgba(0,0,0,0.07))', display: 'flex', alignItems: 'center', padding: '0 14px', gap: 6, flexShrink: 0 }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 7 }}>
-          <div style={{ width: 24, height: 24, background: '#2a2a2a', borderRadius: 5, display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 10, fontWeight: 600, color: '#fff', letterSpacing: '-0.3px' }}>OA</div>
-          <span style={{ fontWeight: 600, fontSize: 14, color: '#2a2a2a', letterSpacing: '-0.01em' }}>OpenArchi</span>
+      {/* Full-screen canvas area with floating UI */}
+      <div style={{ flex: 1, position: 'relative', overflow: 'hidden' }}>
+
+        {/* ====== Top-left: Logo + file info ====== */}
+        <div style={{
+          position: 'absolute', top: 10, left: 10, zIndex: 10,
+          display: 'flex', alignItems: 'center', gap: 8,
+          background: 'rgba(255,255,255,0.88)',
+          backdropFilter: 'blur(16px) saturate(1.6)',
+          WebkitBackdropFilter: 'blur(16px) saturate(1.6)',
+          border: '1px solid rgba(255,255,255,0.5)',
+          borderRadius: 10,
+          boxShadow: '0 2px 12px rgba(0,0,0,0.06)',
+          padding: '6px 12px',
+        }}>
+          <div style={{ width: 22, height: 22, background: '#2a2a2a', borderRadius: 5, display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 9, fontWeight: 600, color: '#fff', letterSpacing: '-0.3px' }}>OA</div>
+          <span style={{ fontWeight: 600, fontSize: 13, color: '#2a2a2a', letterSpacing: '-0.01em' }}>OpenArchi</span>
           {activeFileEntry && (
-            <span style={{ fontSize: 12, color: '#999', marginLeft: 2 }}>
-              — {dirState ? `${dirState.directoryName}/` : ''}{activeFileEntry.relativePath}{isDirty ? ' *' : ''}
+            <span style={{ fontSize: 11, color: '#999' }}>
+              {dirState ? `${dirState.directoryName}/` : ''}{activeFileEntry.relativePath}{isDirty ? ' *' : ''}
             </span>
           )}
         </div>
-        <div style={{ width: 1, height: 18, background: 'var(--border, rgba(0,0,0,0.07))', margin: '0 3px' }} />
-        <Btn onClick={goBack} disabled={!canGoBack}>{'\u25C0'}</Btn>
-        <Btn onClick={goForward} disabled={!canGoForward}>{'\u25B6'}</Btn>
-        <div style={{ width: 1, height: 18, background: 'var(--border, rgba(0,0,0,0.07))', margin: '0 2px' }} />
-        <Btn onClick={undo} disabled={historyIndexRef.current <= 0}>Undo</Btn>
-        <Btn onClick={redo} disabled={historyIndexRef.current >= historyRef.current.length - 1}>Redo</Btn>
-        <div style={{ width: 1, height: 18, background: 'var(--border, rgba(0,0,0,0.07))', margin: '0 2px' }} />
-        <Btn onClick={cycleLeftPanel}>{leftPanelLabel}</Btn>
-        <div style={{ width: 1, height: 18, background: 'var(--border, rgba(0,0,0,0.07))', margin: '0 2px' }} />
-        <Btn onClick={handleOpenDirectory}>Open Dir</Btn>
-        {dirState && dirState.files.length > 1 && (
-          <select
-            value={activeFileEntry?.relativePath || ''}
-            onChange={e => {
-              const entry = dirState.files.find(f => f.relativePath === e.target.value);
-              if (entry) loadFileEntry(entry);
-            }}
-            style={{ padding: '4px 8px', borderRadius: 5, border: '1px solid rgba(0,0,0,0.08)', background: '#fff', fontFamily: 'inherit', fontSize: 12, color: '#555', maxWidth: 280 }}
-            title="Files in directory"
-          >
-            {dirState.files.map(f => (
-              <option key={f.relativePath} value={f.relativePath}>{f.relativePath}</option>
-            ))}
-          </select>
-        )}
-        {activeFileEntry && (
-          <Btn onClick={handleSave}>
-            {isDirty ? 'Save *' : 'Save'}
-          </Btn>
-        )}
-        <Btn onClick={importModel}>Import</Btn>
-        <Btn onClick={exportModel}>Export</Btn>
-        <select
-          value={ioFormatId}
-          onChange={e => setIoFormatId(e.target.value)}
-          style={{
-            padding: '4px 8px',
-            borderRadius: 5,
-            border: '1px solid rgba(0,0,0,0.08)',
-            background: '#fff',
-            fontFamily: 'inherit',
-            fontSize: 12,
-            color: '#555',
-          }}
-          title="Model format for import/export"
-        >
-          <option value="auto">Format: Auto / JSON</option>
-          {modelFormats.map(format => (
-            <option key={format.id} value={format.id}>{format.label}</option>
-          ))}
-        </select>
-        <Btn onClick={deleteSelected} disabled={!selectedId}>Delete</Btn>
-        <div style={{ width: 1, height: 18, background: 'var(--border, rgba(0,0,0,0.07))', margin: '0 2px' }} />
-        <Btn onClick={() => setGridType(g => g === 'dot' ? 'line' : 'dot')}>{gridType === 'dot' ? 'Dots' : 'Grid'}</Btn>
-        <div style={{ flex: 1 }} />
-        <button onClick={() => setShowSearch(s => !s)} style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '4px 12px', borderRadius: 6, border: '1px solid rgba(0,0,0,0.08)', background: 'rgba(0,0,0,0.03)', cursor: 'pointer', fontFamily: 'inherit', fontSize: 12, color: '#888' }}>
-          Search <span style={{ fontSize: 10, color: '#bbb', marginLeft: 4, padding: '1px 5px', borderRadius: 3, border: '1px solid rgba(0,0,0,0.08)', fontWeight: 500 }}>{'\u2318'}K</span>
-        </button>
-        <span style={{ fontSize: 11, color: '#bbb', marginLeft: 6 }}>{visibleElements.length} el {'\u00B7'} {visibleRelationships.length} rel</span>
-      </div>
 
-      {/* Main area — canvas fills everything, panels float as islands */}
-      <div style={{ flex: 1, position: 'relative', overflow: 'hidden' }}>
-        {/* Left panel island */}
+        {/* ====== Top-right: Actions cluster ====== */}
         <div style={{
-          position: 'absolute', left: 8, top: 8, bottom: 8, width: leftPanelWidth, zIndex: 10,
-          background: 'var(--surface, rgba(255,255,255,0.96))',
-          borderRadius: 12, border: '1px solid var(--border, rgba(0,0,0,0.07))',
-          boxShadow: 'var(--shadow-md, 0 4px 20px rgba(0,0,0,0.06))',
+          position: 'absolute', top: 10, right: propSide === 'right' ? 270 : 10, zIndex: 10,
+          display: 'flex', alignItems: 'center', gap: 4,
+          background: 'rgba(255,255,255,0.88)',
+          backdropFilter: 'blur(16px) saturate(1.6)',
+          WebkitBackdropFilter: 'blur(16px) saturate(1.6)',
+          border: '1px solid rgba(255,255,255,0.5)',
+          borderRadius: 10,
+          boxShadow: '0 2px 12px rgba(0,0,0,0.06)',
+          padding: '4px 6px',
+        }}>
+          <Btn onClick={goBack} disabled={!canGoBack}>{'\u25C0'}</Btn>
+          <Btn onClick={goForward} disabled={!canGoForward}>{'\u25B6'}</Btn>
+          <div style={{ width: 1, height: 18, background: 'rgba(0,0,0,0.07)', margin: '0 2px' }} />
+          <Btn onClick={undo} disabled={historyIndexRef.current <= 0}>Undo</Btn>
+          <Btn onClick={redo} disabled={historyIndexRef.current >= historyRef.current.length - 1}>Redo</Btn>
+          <div style={{ width: 1, height: 18, background: 'rgba(0,0,0,0.07)', margin: '0 2px' }} />
+          <Btn onClick={cycleLeftPanel}>{leftPanelLabel}</Btn>
+        </div>
+
+        {/* ====== Tab bar island ====== */}
+        <div style={{
+          position: 'absolute', top: 10,
+          left: activeFileEntry ? 320 : 200,
+          right: propSide === 'right' ? 520 : 260,
+          zIndex: 10,
+          height: 32,
+          background: 'rgba(255,255,255,0.88)',
+          backdropFilter: 'blur(16px) saturate(1.6)',
+          WebkitBackdropFilter: 'blur(16px) saturate(1.6)',
+          border: '1px solid rgba(255,255,255,0.5)',
+          borderRadius: 10,
+          boxShadow: '0 2px 12px rgba(0,0,0,0.06)',
+          display: 'flex', alignItems: 'center', padding: '0 4px', gap: 1, overflow: 'auto',
+        }}>
+          {openTabIds.map(tid => {
+            const v = views.find(vv => vv.id === tid);
+            const isActive = tid === currentViewId;
+            return (
+              <div
+                key={tid}
+                onClick={() => navigateToView(tid)}
+                style={{
+                  display: 'flex', alignItems: 'center', gap: 5, padding: '4px 10px', fontSize: 12, fontFamily: 'inherit',
+                  cursor: 'pointer', userSelect: 'none', whiteSpace: 'nowrap',
+                  background: isActive ? 'var(--accent-bg, #eef2ff)' : 'transparent',
+                  color: isActive ? 'var(--accent-text, #1d4ed8)' : '#999',
+                  fontWeight: isActive ? 500 : 400,
+                  borderRadius: 5,
+                  border: 'none',
+                }}
+              >
+                <span>{v?.name || tid}</span>
+                {openTabIds.length > 1 && (
+                  <span
+                    onClick={e => { e.stopPropagation(); closeTab(tid); }}
+                    style={{ fontSize: 13, color: '#ccc', lineHeight: 1, padding: '0 2px', borderRadius: 3, cursor: 'pointer' }}
+                    onMouseEnter={e => { e.currentTarget.style.color = '#666'; e.currentTarget.style.background = 'rgba(0,0,0,0.06)'; }}
+                    onMouseLeave={e => { e.currentTarget.style.color = '#ccc'; e.currentTarget.style.background = 'transparent'; }}
+                  >
+                    {'\u00D7'}
+                  </span>
+                )}
+              </div>
+            );
+          })}
+        </div>
+
+        {/* ====== Left panel island (views + properties) ====== */}
+        <div style={{
+          position: 'absolute', left: 10, top: 52, bottom: 10, width: leftPanelWidth, zIndex: 10,
+          background: 'rgba(255,255,255,0.92)',
+          backdropFilter: 'blur(20px) saturate(1.6)',
+          WebkitBackdropFilter: 'blur(20px) saturate(1.6)',
+          borderRadius: 14, border: '1px solid rgba(255,255,255,0.5)',
+          boxShadow: '0 4px 24px rgba(0,0,0,0.08)',
           display: 'flex', flexDirection: 'column', overflow: 'hidden',
         }}>
           {/* Resize handle */}
@@ -1193,45 +1258,7 @@ export default function App() {
               window.addEventListener('mouseup', onUp);
             }}
           />
-          {leftPanel === 'palette' ? (
-            <div style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
-              <div style={{ padding: '14px 14px 7px', fontSize: 11, fontWeight: 500, color: '#a0a0a0', textTransform: 'uppercase', letterSpacing: '0.5px' }}>Layers</div>
-              <div style={{ display: 'flex', flexDirection: 'column', gap: 1, padding: '0 10px 10px' }}>
-                {Object.entries(LAYERS).map(([k, L]) => {
-                  const isA = activeLayer === k;
-                  return (
-                    <button key={k} onClick={() => setActiveLayer(k)}
-                      style={{ display: 'flex', alignItems: 'center', gap: 9, padding: '7px 10px', borderRadius: 6, border: 'none', cursor: 'pointer', fontFamily: 'inherit',
-                        background: isA ? (L.fill === 'transparent' ? 'rgba(0,0,0,0.04)' : L.fill) : 'transparent',
-                        borderLeft: isA ? `3px solid ${L.accent}` : '3px solid transparent' }}
-                      onMouseEnter={e => { if (!isA) e.currentTarget.style.background = 'rgba(0,0,0,0.03)'; }}
-                      onMouseLeave={e => { if (!isA) e.currentTarget.style.background = isA ? (L.fill === 'transparent' ? 'rgba(0,0,0,0.04)' : L.fill) : 'transparent'; }}>
-                      <div style={{ width: 14, height: 14, borderRadius: 3, background: L.fill === 'transparent' ? 'rgba(0,0,0,0.06)' : L.fill, border: `1.5px solid ${L.stroke}`, flexShrink: 0 }} />
-                      <span style={{ fontSize: 13, fontWeight: isA ? 500 : 400, color: isA ? L.text : '#666' }}>{L.label}</span>
-                    </button>
-                  );
-                })}
-              </div>
-              <div style={{ height: 1, background: 'rgba(0,0,0,0.05)', margin: '2px 14px' }} />
-              <div style={{ padding: '10px 14px 6px', fontSize: 11, fontWeight: 500, color: '#a0a0a0', textTransform: 'uppercase', letterSpacing: '0.5px' }}>Elements</div>
-              <div style={{ flex: 1, overflow: 'auto', padding: '0 8px 10px' }}>
-                {palItems.map(([k, d]) => {
-                  const isNoteItem = d.isNote;
-                  const L = isNoteItem ? { fill: '#F2F2F4', stroke: '#C0C0C4', accent: '#909098' } : LAYERS[d.layer];
-                  return (
-                    <button key={k} onClick={() => addElement(k)}
-                      title={d.desc || d.label}
-                      style={{ display: 'flex', alignItems: 'center', gap: 9, width: '100%', textAlign: 'left', padding: '6px 10px', borderRadius: 6, fontSize: 13, fontWeight: 400, background: 'transparent', color: '#606060', border: 'none', cursor: 'pointer', fontFamily: 'inherit', ...(isNoteItem ? { marginTop: 6, borderTop: '1px solid rgba(0,0,0,0.05)', paddingTop: 10 } : {}) }}
-                      onMouseEnter={e => (e.currentTarget.style.background = 'rgba(0,0,0,0.03)')}
-                      onMouseLeave={e => (e.currentTarget.style.background = 'transparent')}>
-                      <CanvasIcon type={k} size={20} color={L?.accent || '#888'} />
-                      {d.label}
-                    </button>
-                  );
-                })}
-              </div>
-            </div>
-          ) : leftPanel === 'views' ? (
+          {leftPanel === 'views' ? (
             <ViewNav views={views} currentViewId={currentViewId} onNavigate={navigateToView} />
           ) : (
             <div style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
@@ -1258,291 +1285,316 @@ export default function App() {
           )}
         </div>
 
-        {/* Tab bar island */}
-        <div style={{
-          position: 'absolute', top: 8, left: 262, right: propSide === 'right' ? 274 : 8, zIndex: 10,
-          height: 32,
-          background: 'var(--surface, rgba(255,255,255,0.96))',
-          borderRadius: 8, border: '1px solid var(--border, rgba(0,0,0,0.07))',
-          boxShadow: 'var(--shadow-sm, 0 1px 3px rgba(0,0,0,0.04))',
-          display: 'flex', alignItems: 'center', padding: '0 4px', gap: 1, overflow: 'auto',
-        }}>
-            {openTabIds.map(tid => {
-              const v = views.find(vv => vv.id === tid);
-              const isActive = tid === currentViewId;
-              return (
-                <div
-                  key={tid}
-                  onClick={() => navigateToView(tid)}
-                  style={{
-                    display: 'flex', alignItems: 'center', gap: 5, padding: '4px 10px', fontSize: 12, fontFamily: 'inherit',
-                    cursor: 'pointer', userSelect: 'none', whiteSpace: 'nowrap',
-                    background: isActive ? 'var(--accent-bg, #eef2ff)' : 'transparent',
-                    color: isActive ? 'var(--accent-text, #1d4ed8)' : '#999',
-                    fontWeight: isActive ? 500 : 400,
-                    borderRadius: 5,
-                    border: 'none',
-                  }}
-                >
-                  <span>{v?.name || tid}</span>
-                  {openTabIds.length > 1 && (
-                    <span
-                      onClick={e => { e.stopPropagation(); closeTab(tid); }}
-                      style={{ fontSize: 13, color: '#ccc', lineHeight: 1, padding: '0 2px', borderRadius: 3, cursor: 'pointer' }}
-                      onMouseEnter={e => { e.currentTarget.style.color = '#666'; e.currentTarget.style.background = 'rgba(0,0,0,0.06)'; }}
-                      onMouseLeave={e => { e.currentTarget.style.color = '#ccc'; e.currentTarget.style.background = 'transparent'; }}
-                    >
-                      {'\u00D7'}
-                    </span>
-                  )}
-                </div>
-              );
-            })}
-          </div>
-
-        {/* Canvas — fills entire main area */}
+        {/* ====== Canvas ====== */}
         <div ref={containerRef} style={{ position: 'absolute', inset: 0 }}>
-            <canvas
-              ref={canvasRef}
-              style={{ cursor: resizing ? HANDLE_CURSORS[resizing.handle] : drawingRel ? 'crosshair' : dragging ? 'grabbing' : panning ? 'grabbing' : dragLabel ? 'ew-resize' : undefined }}
-              onMouseDown={handleMouseDown}
-              onMouseMove={handleMouseMove}
-              onMouseUp={handleMouseUp}
-              onDoubleClick={handleDblClick}
-              onContextMenu={handleContextMenu}
-              onMouseLeave={() => { setDragging(null); setPanning(null); setDragWP(null); setDragEndpoint(null); setDragLabel(null); setResizing(null); setHovElId(null); setHovRelId(null); setSnapGuides([]); }}
-              onWheel={handleWheel}
+          <canvas
+            ref={canvasRef}
+            style={{ cursor: resizing ? HANDLE_CURSORS[resizing.handle] : drawingRel ? 'crosshair' : dragging ? 'grabbing' : panning ? 'grabbing' : dragLabel ? 'ew-resize' : undefined }}
+            onMouseDown={handleMouseDown}
+            onMouseMove={handleMouseMove}
+            onMouseUp={handleMouseUp}
+            onDoubleClick={handleDblClick}
+            onContextMenu={handleContextMenu}
+            onMouseLeave={() => { setDragging(null); setPanning(null); setDragWP(null); setDragEndpoint(null); setDragLabel(null); setResizing(null); setHovElId(null); setHovRelId(null); setSnapGuides([]); }}
+            onWheel={handleWheel}
+          />
+
+          {/* Inline element name editor */}
+          {editingEl && editOverlay && (
+            <div
+              style={{
+                position: 'absolute',
+                left: editOverlay.left,
+                top: editOverlay.top,
+                width: editOverlay.width,
+                height: editOverlay.height,
+                display: 'flex', alignItems: editIsNote ? 'stretch' : 'center', justifyContent: 'center',
+                pointerEvents: 'none',
+                padding: editIsNote ? 6 : 0,
+                boxSizing: 'border-box',
+              }}
+            >
+              {editIsNote ? (
+                <textarea
+                  autoFocus
+                  value={editingName}
+                  onChange={e => setEditingName(e.target.value)}
+                  onKeyDown={e => { if (e.key === 'Escape') cancelEditing(); }}
+                  onBlur={commitEditing}
+                  style={{
+                    pointerEvents: 'auto',
+                    width: '100%',
+                    height: '100%',
+                    padding: '8px 10px',
+                    fontSize: Math.max(12, 14 * cam.s),
+                    fontFamily: 'inherit',
+                    fontWeight: 400,
+                    textAlign: 'left',
+                    border: '2px solid #2563eb',
+                    borderRadius: 4,
+                    outline: 'none',
+                    background: '#fffffa',
+                    color: '#333',
+                    boxShadow: '0 2px 12px rgba(37,99,235,0.2)',
+                    resize: 'none',
+                    lineHeight: '1.4',
+                  }}
+                />
+              ) : (
+                <input
+                  autoFocus
+                  value={editingName}
+                  onChange={e => setEditingName(e.target.value)}
+                  onKeyDown={e => { if (e.key === 'Enter') commitEditing(); if (e.key === 'Escape') cancelEditing(); }}
+                  onBlur={commitEditing}
+                  style={{
+                    pointerEvents: 'auto',
+                    width: Math.max(80, editOverlay.width - 20),
+                    padding: '4px 8px',
+                    fontSize: Math.max(12, 14 * cam.s),
+                    fontFamily: 'inherit',
+                    fontWeight: 600,
+                    textAlign: 'center',
+                    border: '2px solid #2563eb',
+                    borderRadius: 6,
+                    outline: 'none',
+                    background: '#fff',
+                    color: '#333',
+                    boxShadow: '0 2px 12px rgba(37,99,235,0.2)',
+                  }}
+                />
+              )}
+            </div>
+          )}
+
+          {relPicker && (
+            <RelPicker
+              x={Math.min(relPicker.sx, cSize.w - 280)}
+              y={Math.min(relPicker.sy, cSize.h - 420)}
+              onSelect={t => {
+                pushHistory();
+                setRelationships(p => [...p, { id: uid(), type: t, sourceId: relPicker.srcId, targetId: relPicker.tgtId, name: '', waypoints: relPickerWaypoints.current, labelPos: 0.5 }]);
+                relPickerWaypoints.current = [];
+                setRelPicker(null);
+              }}
+              onCancel={() => { relPickerWaypoints.current = []; setRelPicker(null); }}
             />
+          )}
 
-            {/* Inline element name editor — textarea for notes, input for others */}
-            {editingEl && editOverlay && (
-              <div
-                style={{
-                  position: 'absolute',
-                  left: editOverlay.left,
-                  top: editOverlay.top,
-                  width: editOverlay.width,
-                  height: editOverlay.height,
-                  display: 'flex', alignItems: editIsNote ? 'stretch' : 'center', justifyContent: 'center',
-                  pointerEvents: 'none',
-                  padding: editIsNote ? 6 : 0,
-                  boxSizing: 'border-box',
-                }}
-              >
-                {editIsNote ? (
-                  <textarea
-                    autoFocus
-                    value={editingName}
-                    onChange={e => setEditingName(e.target.value)}
-                    onKeyDown={e => { if (e.key === 'Escape') cancelEditing(); }}
-                    onBlur={commitEditing}
-                    style={{
-                      pointerEvents: 'auto',
-                      width: '100%',
-                      height: '100%',
-                      padding: '8px 10px',
-                      fontSize: Math.max(12, 14 * cam.s),
-                      fontFamily: 'inherit',
-                      fontWeight: 400,
-                      textAlign: 'left',
-                      border: '2px solid #2563eb',
-                      borderRadius: 4,
-                      outline: 'none',
-                      background: '#fffffa',
-                      color: '#333',
-                      boxShadow: '0 2px 12px rgba(37,99,235,0.2)',
-                      resize: 'none',
-                      lineHeight: '1.4',
-                    }}
-                  />
-                ) : (
-                  <input
-                    autoFocus
-                    value={editingName}
-                    onChange={e => setEditingName(e.target.value)}
-                    onKeyDown={e => { if (e.key === 'Enter') commitEditing(); if (e.key === 'Escape') cancelEditing(); }}
-                    onBlur={commitEditing}
-                    style={{
-                      pointerEvents: 'auto',
-                      width: Math.max(80, editOverlay.width - 20),
-                      padding: '4px 8px',
-                      fontSize: Math.max(12, 14 * cam.s),
-                      fontFamily: 'inherit',
-                      fontWeight: 600,
-                      textAlign: 'center',
-                      border: '2px solid #2563eb',
-                      borderRadius: 6,
-                      outline: 'none',
-                      background: '#fff',
-                      color: '#333',
-                      boxShadow: '0 2px 12px rgba(37,99,235,0.2)',
-                    }}
-                  />
-                )}
-              </div>
-            )}
+          {ctxMenu && <CtxMenu x={ctxMenu.x} y={ctxMenu.y} items={ctxMenu.items} onClose={() => setCtxMenu(null)} />}
 
-            {relPicker && (
-              <RelPicker
-                x={Math.min(relPicker.sx, cSize.w - 280)}
-                y={Math.min(relPicker.sy, cSize.h - 420)}
-                onSelect={t => {
-                  pushHistory();
-                  setRelationships(p => [...p, { id: uid(), type: t, sourceId: relPicker.srcId, targetId: relPicker.tgtId, name: '', waypoints: relPickerWaypoints.current, labelPos: 0.5 }]);
-                  relPickerWaypoints.current = [];
-                  setRelPicker(null);
-                }}
-                onCancel={() => { relPickerWaypoints.current = []; setRelPicker(null); }}
-              />
-            )}
+          {showSearch && (
+            <SearchPanel
+              elements={elements}
+              views={views}
+              onSelectElement={id => {
+                setSelectedId(id);
+                setSelType('element');
+                const inView = visibleElements.find(element => element.id === id);
+                const el = inView || elements.find(element => element.id === id);
+                if (el) setCam(p => ({ ...p, x: cSize.w / 2 - el.x * p.s, y: cSize.h / 2 - el.y * p.s }));
+              }}
+              onSelectView={id => navigateToView(id)}
+              onClose={() => setShowSearch(false)}
+            />
+          )}
 
-            {ctxMenu && <CtxMenu x={ctxMenu.x} y={ctxMenu.y} items={ctxMenu.items} onClose={() => setCtxMenu(null)} />}
+          {/* Shift hint when drawing */}
+          {drawingRel && (
+            <div style={{
+              position: 'absolute', bottom: 120, left: '50%', transform: 'translateX(-50%)',
+              fontSize: 12, color: '#666', background: 'rgba(255,255,255,0.92)',
+              backdropFilter: 'blur(12px)',
+              WebkitBackdropFilter: 'blur(12px)',
+              padding: '6px 14px', borderRadius: 8,
+              border: '1px solid rgba(255,255,255,0.5)',
+              boxShadow: '0 2px 12px rgba(0,0,0,0.08)',
+              whiteSpace: 'nowrap',
+            }}>
+              Hold <strong>Shift + Click</strong> to add a waypoint bend
+            </div>
+          )}
+        </div>
 
-            {showSearch && (
-              <SearchPanel
-                elements={elements}
-                views={views}
-                onSelectElement={id => {
-                  setSelectedId(id);
-                  setSelType('element');
-                  const inView = visibleElements.find(element => element.id === id);
-                  const el = inView || elements.find(element => element.id === id);
-                  if (el) setCam(p => ({ ...p, x: cSize.w / 2 - el.x * p.s, y: cSize.h / 2 - el.y * p.s }));
-                }}
-                onSelectView={id => navigateToView(id)}
-                onClose={() => setShowSearch(false)}
-              />
-            )}
+        {/* ====== Floating toolbar (bottom center) ====== */}
+        <FloatingToolbar
+          activeLayer={activeLayer}
+          onLayerChange={setActiveLayer}
+          onAddElement={addElement}
+          onDeleteSelected={deleteSelected}
+          hasSelection={!!selectedId}
+          onOpenDir={handleOpenDirectory}
+          onImport={importModel}
+          onExport={exportModel}
+          onSave={handleSave}
+          canSave={!!activeFileEntry}
+          isDirty={isDirty}
+          dirState={!!dirState}
+          dirFiles={dirState?.files || []}
+          activeFilePath={activeFileEntry?.relativePath || ''}
+          onSelectFile={path => {
+            const entry = dirState?.files.find(f => f.relativePath === path);
+            if (entry) loadFileEntry(entry);
+          }}
+          ioFormatId={ioFormatId}
+          onFormatChange={setIoFormatId}
+          modelFormats={modelFormats}
+          gridType={gridType}
+          onToggleGrid={() => setGridType(g => g === 'dot' ? 'line' : 'dot')}
+          onSearch={() => setShowSearch(s => !s)}
+        />
 
-            {/* Shift hint when drawing */}
-            {drawingRel && (
-              <div style={{ position: 'absolute', bottom: 36, left: '50%', transform: 'translateX(-50%)', fontSize: 12, color: '#666', background: '#fff', padding: '5px 12px', borderRadius: 6, border: '1px solid rgba(0,0,0,0.07)', boxShadow: 'var(--shadow-sm, 0 1px 3px rgba(0,0,0,0.04))', whiteSpace: 'nowrap' }}>
-                Hold <strong>Shift + Click</strong> to add a waypoint bend
-              </div>
-            )}
+        {/* ====== Legend toggle + panel (bottom-right) ====== */}
+        <button
+          onClick={() => setShowLegend(l => !l)}
+          style={{
+            position: 'absolute', bottom: 14, right: propSide === 'right' ? 274 : 12, zIndex: 50,
+            width: 32, height: 32, borderRadius: 8, border: '1px solid rgba(0,0,0,0.06)',
+            background: showLegend ? 'rgba(37,99,235,0.1)' : 'rgba(245,246,248,0.8)',
+            backdropFilter: 'blur(12px)', WebkitBackdropFilter: 'blur(12px)',
+            boxShadow: '0 2px 8px rgba(0,0,0,0.06)',
+            cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center',
+            color: showLegend ? '#1d4ed8' : '#8a8a90', fontSize: 11, fontWeight: 600, fontFamily: FONT,
+            padding: 0,
+          }}
+          title={showLegend ? 'Hide Legend' : 'Show Legend'}
+        >
+          <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><rect x="2" y="2" width="12" height="12" rx="1.5" stroke="currentColor" strokeWidth="1.2" /><line x1="5" y1="6" x2="7.5" y2="6" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" /><line x1="9" y1="6" x2="11" y2="6" stroke="currentColor" strokeWidth="0.8" strokeLinecap="round" opacity="0.4" /><line x1="5" y1="8.5" x2="7.5" y2="8.5" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" /><line x1="9" y1="8.5" x2="11" y2="8.5" stroke="currentColor" strokeWidth="0.8" strokeLinecap="round" opacity="0.4" /><line x1="5" y1="11" x2="7.5" y2="11" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" /><line x1="9" y1="11" x2="11" y2="11" stroke="currentColor" strokeWidth="0.8" strokeLinecap="round" opacity="0.4" /></svg>
+        </button>
+        {showLegend && (() => {
+          const usedElTypes = new Set<string>();
+          for (const el of visibleElements) {
+            if (ELEMENT_TYPES[el.type] && !ELEMENT_TYPES[el.type].isNote) usedElTypes.add(el.type);
+          }
+          const usedRelTypes = new Set<string>();
+          for (const r of visibleRelationships) {
+            usedRelTypes.add(r.type);
+          }
+          const activeElTypes = Object.entries(ELEMENT_TYPES).filter(([k]) => usedElTypes.has(k));
+          const activeRelTypes = Object.entries(RELATIONSHIP_TYPES).filter(([k]) => usedRelTypes.has(k));
 
-            {/* Legend island (bottom-right) */}
-            <div style={{ position: 'absolute', bottom: 8, right: propSide === 'right' ? 274 : 8, zIndex: 50 }}>
-              <button
-                onClick={() => setShowLegend(l => !l)}
-                style={{
-                  padding: '3px 8px', borderRadius: 5, border: '1px solid var(--border, rgba(0,0,0,0.07))',
-                  background: 'var(--surface, rgba(255,255,255,0.96))', fontSize: 11, color: '#999', cursor: 'pointer',
-                  fontFamily: 'inherit', fontWeight: 500,
-                }}
-              >
-                {showLegend ? 'Hide Legend' : 'Legend'}
-              </button>
-              {showLegend && (() => {
-                const usedElTypes = new Set<string>();
-                for (const el of visibleElements) {
-                  if (ELEMENT_TYPES[el.type] && !ELEMENT_TYPES[el.type].isNote) usedElTypes.add(el.type);
-                }
-                const usedRelTypes = new Set<string>();
-                for (const r of visibleRelationships) {
-                  usedRelTypes.add(r.type);
-                }
-                const activeElTypes = Object.entries(ELEMENT_TYPES).filter(([k]) => usedElTypes.has(k));
-                const activeRelTypes = Object.entries(RELATIONSHIP_TYPES).filter(([k]) => usedRelTypes.has(k));
+          const relLineW = 44;
+          const relLineH = 16;
 
-                const relLineW = 44;
-                const relLineH = 16;
+          const renderRelSvg = (rd: { dash: boolean; head: string }) => {
+            const y = relLineH / 2;
+            const x1 = 2, x2 = relLineW - 2;
+            const col = '#777';
+            const aL = 7;
+            const aS = 0.5;
 
-                const renderRelSvg = (rd: { dash: boolean; head: string }) => {
-                  const y = relLineH / 2;
-                  const x1 = 2, x2 = relLineW - 2;
-                  const col = '#777';
-                  const aL = 7;
-                  const aS = 0.5;
+            const linePath = `M${x1},${y} L${x2},${y}`;
+            const dashArray = rd.dash ? '4,2.5' : undefined;
 
-                  const linePath = `M${x1},${y} L${x2},${y}`;
-                  const dashArray = rd.dash ? '4,2.5' : undefined;
+            let headMarkup = null;
+            if (rd.head === 'filled_arrow') {
+              const hw = aL * Math.sin(aS);
+              headMarkup = <polygon points={`${x2},${y} ${x2 - aL},${y - hw} ${x2 - aL},${y + hw}`} fill={col} />;
+            } else if (rd.head === 'open_arrow') {
+              const hw = aL * Math.sin(aS);
+              headMarkup = <polyline points={`${x2 - aL},${y - hw} ${x2},${y} ${x2 - aL},${y + hw}`} fill="none" stroke={col} strokeWidth="1.3" strokeLinejoin="round" />;
+            } else if (rd.head === 'hollow_arrow') {
+              const hw = aL * Math.sin(aS);
+              headMarkup = <polygon points={`${x2},${y} ${x2 - aL},${y - hw} ${x2 - aL},${y + hw}`} fill="#fff" stroke={col} strokeWidth="1.1" />;
+            } else if (rd.head === 'diamond_filled' || rd.head === 'diamond') {
+              const dL = 8, dW = 3.5;
+              headMarkup = <polygon points={`${x1},${y} ${x1 + dL / 2},${y - dW} ${x1 + dL},${y} ${x1 + dL / 2},${y + dW}`} fill={rd.head === 'diamond_filled' ? col : '#fff'} stroke={col} strokeWidth="0.9" />;
+            } else if (rd.head === 'filled_dot') {
+              headMarkup = <circle cx={x1 + 4} cy={y} r={3} fill={col} />;
+            }
 
-                  let headMarkup = null;
-                  if (rd.head === 'filled_arrow') {
-                    const hw = aL * Math.sin(aS);
-                    headMarkup = <polygon points={`${x2},${y} ${x2 - aL},${y - hw} ${x2 - aL},${y + hw}`} fill={col} />;
-                  } else if (rd.head === 'open_arrow') {
-                    const hw = aL * Math.sin(aS);
-                    headMarkup = <polyline points={`${x2 - aL},${y - hw} ${x2},${y} ${x2 - aL},${y + hw}`} fill="none" stroke={col} strokeWidth="1.3" strokeLinejoin="round" />;
-                  } else if (rd.head === 'hollow_arrow') {
-                    const hw = aL * Math.sin(aS);
-                    headMarkup = <polygon points={`${x2},${y} ${x2 - aL},${y - hw} ${x2 - aL},${y + hw}`} fill="#fff" stroke={col} strokeWidth="1.1" />;
-                  } else if (rd.head === 'diamond_filled' || rd.head === 'diamond') {
-                    const dL = 8, dW = 3.5;
-                    headMarkup = <polygon points={`${x1},${y} ${x1 + dL / 2},${y - dW} ${x1 + dL},${y} ${x1 + dL / 2},${y + dW}`} fill={rd.head === 'diamond_filled' ? col : '#fff'} stroke={col} strokeWidth="0.9" />;
-                  } else if (rd.head === 'filled_dot') {
-                    headMarkup = <circle cx={x1 + 4} cy={y} r={3} fill={col} />;
-                  }
+            return (
+              <svg width={relLineW} height={relLineH} style={{ flexShrink: 0 }}>
+                <path d={linePath} stroke={col} strokeWidth="1.1" fill="none" strokeDasharray={dashArray} />
+                {headMarkup}
+              </svg>
+            );
+          };
 
-                  return (
-                    <svg width={relLineW} height={relLineH} style={{ flexShrink: 0 }}>
-                      <path d={linePath} stroke={col} strokeWidth="1.1" fill="none" strokeDasharray={dashArray} />
-                      {headMarkup}
-                    </svg>
-                  );
-                };
-
-                return (
-                  <div style={{
-                    position: 'absolute', bottom: 28, right: 0,
-                    background: '#fff', border: '1px solid var(--border, rgba(0,0,0,0.07))', borderRadius: 10,
-                    boxShadow: 'var(--shadow-md, 0 4px 20px rgba(0,0,0,0.06))', padding: '12px 16px',
-                    width: 300, fontSize: 12, fontFamily: FONT, maxHeight: 440, overflow: 'auto',
-                  }}>
-                    {activeElTypes.length > 0 && (
-                      <>
-                        <div style={{ fontSize: 10, fontWeight: 600, color: '#a0a0a0', textTransform: 'uppercase', marginBottom: 8, letterSpacing: '0.5px' }}>Elements</div>
-                        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '4px 12px' }}>
-                          {activeElTypes.map(([k, def]) => {
-                            const L = LAYERS[def.layer];
-                            return (
-                              <div key={k} style={{ display: 'flex', alignItems: 'center', gap: 7, padding: '2px 0' }}>
-                                <CanvasIcon type={k} size={16} color={L?.accent || '#888'} />
-                                <span style={{ color: '#444', fontSize: 12 }}>{def.label}</span>
-                              </div>
-                            );
-                          })}
+          return (
+            <div style={{
+              position: 'absolute', bottom: 110, right: propSide === 'right' ? 274 : 12, zIndex: 50,
+              background: 'rgba(255,255,255,0.94)',
+              backdropFilter: 'blur(20px) saturate(1.6)',
+              WebkitBackdropFilter: 'blur(20px) saturate(1.6)',
+              border: '1px solid rgba(255,255,255,0.5)',
+              borderRadius: 12,
+              boxShadow: '0 4px 24px rgba(0,0,0,0.1)', padding: '12px 16px',
+              width: 300, fontSize: 12, fontFamily: FONT, maxHeight: 440, overflow: 'auto',
+            }}>
+              {activeElTypes.length > 0 && (
+                <>
+                  <div style={{ fontSize: 10, fontWeight: 600, color: '#a0a0a0', textTransform: 'uppercase', marginBottom: 8, letterSpacing: '0.5px' }}>Elements</div>
+                  <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '4px 12px' }}>
+                    {activeElTypes.map(([k, def]) => {
+                      const L = LAYERS[def.layer];
+                      return (
+                        <div key={k} style={{ display: 'flex', alignItems: 'center', gap: 7, padding: '2px 0' }}>
+                          <CanvasIcon type={k} size={16} color={L?.accent || '#888'} />
+                          <span style={{ color: '#444', fontSize: 12 }}>{def.label}</span>
                         </div>
-                      </>
-                    )}
-                    {activeElTypes.length > 0 && activeRelTypes.length > 0 && (
-                      <div style={{ height: 1, background: 'rgba(0,0,0,0.06)', margin: '10px 0' }} />
-                    )}
-                    {activeRelTypes.length > 0 && (
-                      <>
-                        <div style={{ fontSize: 10, fontWeight: 600, color: '#a0a0a0', textTransform: 'uppercase', marginBottom: 8, letterSpacing: '0.5px' }}>Relationships</div>
-                        {activeRelTypes.map(([, rd]) => (
-                          <div key={rd.label} style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 2 }}>
-                            {renderRelSvg(rd)}
-                            <div style={{ display: 'flex', flexDirection: 'column' }}>
-                              <span style={{ color: '#444', fontSize: 12, fontWeight: 500 }}>{rd.label}</span>
-                              <span style={{ color: '#aaa', fontSize: 10 }}>{rd.desc}</span>
-                            </div>
-                          </div>
-                        ))}
-                      </>
-                    )}
-                    {activeElTypes.length === 0 && activeRelTypes.length === 0 && (
-                      <div style={{ color: '#bbb', fontSize: 12, padding: '4px 0' }}>No elements or relationships yet.</div>
-                    )}
+                      );
+                    })}
                   </div>
-                );
-              })()}
+                </>
+              )}
+              {activeElTypes.length > 0 && activeRelTypes.length > 0 && (
+                <div style={{ height: 1, background: 'rgba(0,0,0,0.06)', margin: '10px 0' }} />
+              )}
+              {activeRelTypes.length > 0 && (
+                <>
+                  <div style={{ fontSize: 10, fontWeight: 600, color: '#a0a0a0', textTransform: 'uppercase', marginBottom: 8, letterSpacing: '0.5px' }}>Relationships</div>
+                  {activeRelTypes.map(([, rd]) => (
+                    <div key={rd.label} style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 2 }}>
+                      {renderRelSvg(rd)}
+                      <div style={{ display: 'flex', flexDirection: 'column' }}>
+                        <span style={{ color: '#444', fontSize: 12, fontWeight: 500 }}>{rd.label}</span>
+                        <span style={{ color: '#aaa', fontSize: 10 }}>{rd.desc}</span>
+                      </div>
+                    </div>
+                  ))}
+                </>
+              )}
+              {activeElTypes.length === 0 && activeRelTypes.length === 0 && (
+                <div style={{ color: '#bbb', fontSize: 12, padding: '4px 0' }}>No elements or relationships yet.</div>
+              )}
             </div>
+          );
+        })()}
 
-            <div style={{ position: 'absolute', bottom: 8, left: 262, fontSize: 11, color: '#aaa', background: 'var(--surface, rgba(255,255,255,0.96))', padding: '2px 7px', borderRadius: 5, border: '1px solid var(--border, rgba(0,0,0,0.07))', fontWeight: 500 }}>
-              {Math.round(cam.s * 100)}%
-            </div>
-          </div>
+        {/* ====== Zoom indicator (bottom-left) ====== */}
+        <div style={{
+          position: 'absolute', bottom: 12, left: leftPanelWidth + 24, zIndex: 10,
+          fontSize: 11, color: '#aaa',
+          background: 'rgba(255,255,255,0.85)',
+          backdropFilter: 'blur(12px)',
+          WebkitBackdropFilter: 'blur(12px)',
+          padding: '3px 8px', borderRadius: 6,
+          border: '1px solid rgba(255,255,255,0.5)',
+          boxShadow: '0 1px 4px rgba(0,0,0,0.04)',
+          fontWeight: 500,
+        }}>
+          {Math.round(cam.s * 100)}%
+        </div>
 
-        {/* Property panel on right side — island */}
+        {/* ====== Stats (bottom-left, next to zoom) ====== */}
+        <div style={{
+          position: 'absolute', bottom: 12, left: leftPanelWidth + 80, zIndex: 10,
+          fontSize: 11, color: '#bbb',
+          fontWeight: 400,
+        }}>
+          {visibleElements.length} el {'\u00B7'} {visibleRelationships.length} rel
+        </div>
+
+        {/* ====== Property panel on right side ====== */}
         {propSide === 'right' && (
           <div style={{
-            position: 'absolute', right: 8, top: 8, bottom: 8, width: 252, zIndex: 10,
-            background: 'var(--surface, rgba(255,255,255,0.96))',
-            borderRadius: 12, border: '1px solid var(--border, rgba(0,0,0,0.07))',
-            boxShadow: 'var(--shadow-md, 0 4px 20px rgba(0,0,0,0.06))',
+            position: 'absolute', right: 10, top: 52, bottom: 10, width: 252, zIndex: 10,
+            background: 'rgba(255,255,255,0.92)',
+            backdropFilter: 'blur(20px) saturate(1.6)',
+            WebkitBackdropFilter: 'blur(20px) saturate(1.6)',
+            borderRadius: 14, border: '1px solid rgba(255,255,255,0.5)',
+            boxShadow: '0 4px 24px rgba(0,0,0,0.08)',
             display: 'flex', flexDirection: 'column', overflow: 'hidden',
           }}>
             <PropertyPanel

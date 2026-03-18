@@ -14,17 +14,17 @@ export function Btn({ onClick, children, disabled }: BtnProps) {
         borderRadius: 6,
         fontSize: 12,
         fontWeight: 400,
-        background: disabled ? 'transparent' : 'rgba(0,0,0,0.04)',
-        color: disabled ? '#c0c0c4' : '#666',
-        border: '1px solid rgba(0,0,0,0.08)',
+        background: disabled ? 'transparent' : 'transparent',
+        color: disabled ? '#cdcdd0' : '#8a8a90',
+        border: 'none',
         cursor: disabled ? 'default' : 'pointer',
         fontFamily: 'inherit',
         lineHeight: '1.5',
         letterSpacing: '-0.01em',
-        transition: 'background 0.1s',
+        transition: 'background 0.1s, color 0.1s',
       }}
-      onMouseEnter={e => { if (!disabled) e.currentTarget.style.background = 'rgba(0,0,0,0.07)'; }}
-      onMouseLeave={e => { if (!disabled) e.currentTarget.style.background = 'rgba(0,0,0,0.04)'; }}
+      onMouseEnter={e => { if (!disabled) { e.currentTarget.style.background = 'rgba(0,0,0,0.05)'; e.currentTarget.style.color = '#555'; } }}
+      onMouseLeave={e => { if (!disabled) { e.currentTarget.style.background = 'transparent'; e.currentTarget.style.color = '#8a8a90'; } }}
     >
       {children}
     </button>

@@ -29,28 +29,42 @@ export function rrect(ctx: CanvasRenderingContext2D, x: number, y: number, w: nu
 // ============================================================
 
 export function drawDotGrid(ctx: CanvasRenderingContext2D, w: number, h: number, ox: number, oy: number, sc: number) {
-  const gap = GRID;
+  // Adaptive gap: when zoomed out enough that dots become dense, skip dots
+  let gap = GRID;
+  const screenGap = gap * sc;
+  if (screenGap < 6) gap *= Math.ceil(6 / screenGap);  // keep dots at least 6 screen-px apart
+
   const sx = Math.floor(-ox / sc / gap) * gap;
   const sy = Math.floor(-oy / sc / gap) * gap;
   const ex = sx + w / sc + gap * 2;
   const ey = sy + h / sc + gap * 2;
-  ctx.fillStyle = 'rgba(0,0,0,0.1)';
+
+  // Batch all dots into a single path for one fill() call
+  ctx.fillStyle = 'rgba(0,0,0,0.18)';
+  ctx.beginPath();
   for (let x = sx; x < ex; x += gap) {
     for (let y = sy; y < ey; y += gap) {
-      ctx.beginPath(); ctx.arc(x, y, 0.6, 0, Math.PI * 2); ctx.fill();
+      ctx.moveTo(x + 0.8, y);
+      ctx.arc(x, y, 0.8, 0, Math.PI * 2);
     }
   }
+  ctx.fill();
 }
 
 export function drawLineGrid(ctx: CanvasRenderingContext2D, w: number, h: number, ox: number, oy: number, sc: number) {
-  const gap = GRID;
+  let gap = GRID;
+  const screenGap = gap * sc;
+  if (screenGap < 6) gap *= Math.ceil(6 / screenGap);
+
   ctx.strokeStyle = 'rgba(0,0,0,0.06)'; ctx.lineWidth = 0.5;
   const sx = Math.floor(-ox / sc / gap) * gap;
   const sy = Math.floor(-oy / sc / gap) * gap;
   const ex = sx + w / sc + gap * 2;
   const ey = sy + h / sc + gap * 2;
-  for (let x = sx; x < ex; x += gap) { ctx.beginPath(); ctx.moveTo(x, sy); ctx.lineTo(x, ey); ctx.stroke(); }
-  for (let y = sy; y < ey; y += gap) { ctx.beginPath(); ctx.moveTo(sx, y); ctx.lineTo(ex, y); ctx.stroke(); }
+  ctx.beginPath();
+  for (let x = sx; x < ex; x += gap) { ctx.moveTo(x, sy); ctx.lineTo(x, ey); }
+  for (let y = sy; y < ey; y += gap) { ctx.moveTo(sx, y); ctx.lineTo(ex, y); }
+  ctx.stroke();
 }
 
 // ============================================================

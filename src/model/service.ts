@@ -75,18 +75,13 @@ export function isFragmentedModelDirectory(files: OpenFileEntry[]): boolean {
   const xmlFiles = files.filter(f => f.relativePath.toLowerCase().endsWith('.xml'));
   if (xmlFiles.length < 2) return false;
 
-  // Check for typical coArchi directory structure patterns
+  // Check for typical coArchi/GRAFICO directory structure patterns
+  // The "model" folder can appear at any depth (root, or nested under project name)
+  const graficoFolders = new Set(['model', 'relations', 'views']);
   const hasModelSubdir = xmlFiles.some(f => {
     const parts = f.relativePath.toLowerCase().split('/');
-    return parts.length >= 2 && (
-      parts[0] === 'model' ||
-      parts[0] === 'relations' ||
-      parts[0] === 'views' ||
-      // Also check one level deeper: e.g. project/model/business/...
-      parts[1] === 'model' ||
-      parts[1] === 'relations' ||
-      parts[1] === 'views'
-    );
+    // Check the first few path segments for typical GRAFICO folder names
+    return parts.length >= 2 && parts.slice(0, -1).some(p => graficoFolders.has(p));
   });
 
   if (hasModelSubdir) return true;
@@ -105,7 +100,8 @@ export function isFragmentedModelDirectory(files: OpenFileEntry[]): boolean {
 
 /**
  * Import a fragmented coArchi model by reading all XML files in the directory
- * and merging them into a single model.
+ * and merging them into a single model. Reads files in batches to avoid
+ * overwhelming browser memory on large models.
  */
 export async function importFragmentedModel(files: OpenFileEntry[]): Promise<ModelImportResult> {
   const xmlFiles = files.filter(f => f.relativePath.toLowerCase().endsWith('.xml'));
@@ -120,23 +116,29 @@ export async function importFragmentedModel(files: OpenFileEntry[]): Promise<Mod
     };
   }
 
-  // Read all XML files in parallel
+  // Read files in batches to avoid memory pressure
+  const BATCH_SIZE = 50;
   const contents: string[] = [];
   const errors: string[] = [];
 
-  const results = await Promise.allSettled(
-    xmlFiles.map(async f => {
-      const text = await f.readText();
-      return text;
-    }),
-  );
+  for (let i = 0; i < xmlFiles.length; i += BATCH_SIZE) {
+    const batch = xmlFiles.slice(i, i + BATCH_SIZE);
+    const results = await Promise.allSettled(
+      batch.map(f => f.readText()),
+    );
 
-  for (let i = 0; i < results.length; i++) {
-    const result = results[i];
-    if (result.status === 'fulfilled') {
-      contents.push(result.value);
-    } else {
-      errors.push(`Failed to read ${xmlFiles[i].relativePath}: ${result.reason}`);
+    for (let j = 0; j < results.length; j++) {
+      const result = results[j];
+      if (result.status === 'fulfilled') {
+        contents.push(result.value);
+      } else {
+        errors.push(`Failed to read ${batch[j].relativePath}: ${result.reason}`);
+      }
+    }
+
+    // Yield to the event loop between batches to avoid blocking the UI
+    if (i + BATCH_SIZE < xmlFiles.length) {
+      await new Promise(r => setTimeout(r, 0));
     }
   }
 

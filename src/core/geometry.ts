@@ -126,9 +126,9 @@ function snapToEdge(el: ModelElement, p: Point): Anchor {
   return { x: candidates[0].x, y: candidates[0].y, side: candidates[0].side };
 }
 
-export function getRelPoints(rel: ModelRelationship, elements: ModelElement[]): RelPath | null {
-  const src = elements.find(e => e.id === rel.sourceId);
-  const tgt = elements.find(e => e.id === rel.targetId);
+export function getRelPoints(rel: ModelRelationship, elements: ModelElement[], elementMap?: Map<string, ModelElement>): RelPath | null {
+  const src = elementMap ? elementMap.get(rel.sourceId) : elements.find(e => e.id === rel.sourceId);
+  const tgt = elementMap ? elementMap.get(rel.targetId) : elements.find(e => e.id === rel.targetId);
   if (!src || !tgt) return null;
 
   const sc = { x: src.x + src.w / 2, y: src.y + src.h / 2 };

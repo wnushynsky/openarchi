@@ -256,6 +256,12 @@ export default function App() {
     [relationships, visibleElementIds],
   );
 
+  // Element lookup map for O(1) access in getRelPoints/drawRelationship
+  const visibleElementMap = useMemo(
+    () => new Map(visibleElements.map(e => [e.id, e])),
+    [visibleElements],
+  );
+
   const saveViewLayoutSnapshot = useCallback((viewId: string) => {
     const view = views.find(candidate => candidate.id === viewId);
     if (!view) return;
@@ -422,17 +428,36 @@ export default function App() {
     y: (sy - cam.y) / cam.s,
   }), [cam]);
 
-  // Pre-compute parent IDs and sorted elements (only when elements change, not on pan/zoom)
+  // Pre-compute parent IDs using spatial index for large models (avoid O(n²))
   const parentIds = useMemo(() => {
     const ids = new Set<string>();
-    for (const outer of visibleElements) {
-      for (const inner of visibleElements) {
-        if (inner.id === outer.id) continue;
-        if (inner.x >= outer.x && inner.y >= outer.y &&
-            inner.x + inner.w <= outer.x + outer.w &&
-            inner.y + inner.h <= outer.y + outer.h) {
-          ids.add(outer.id);
-          break;
+    const n = visibleElements.length;
+    // For small sets, brute force is fine. For larger sets, use sorted-edge approach.
+    if (n < 200) {
+      for (const outer of visibleElements) {
+        for (const inner of visibleElements) {
+          if (inner.id === outer.id) continue;
+          if (inner.x >= outer.x && inner.y >= outer.y &&
+              inner.x + inner.w <= outer.x + outer.w &&
+              inner.y + inner.h <= outer.y + outer.h) {
+            ids.add(outer.id);
+            break;
+          }
+        }
+      }
+    } else {
+      // Sort by area descending — larger elements are more likely parents
+      const byArea = [...visibleElements].sort((a, b) => (b.w * b.h) - (a.w * a.h));
+      for (let i = 0; i < byArea.length && !ids.has(byArea[i].id); i++) {
+        const outer = byArea[i];
+        for (let j = i + 1; j < byArea.length; j++) {
+          const inner = byArea[j];
+          if (inner.x >= outer.x && inner.y >= outer.y &&
+              inner.x + inner.w <= outer.x + outer.w &&
+              inner.y + inner.h <= outer.y + outer.h) {
+            ids.add(outer.id);
+            break;
+          }
         }
       }
     }
@@ -474,28 +499,53 @@ export default function App() {
     if (gridType === 'dot') drawDotGrid(ctx, cSize.w, cSize.h, cam.x, cam.y, cam.s);
     else drawLineGrid(ctx, cSize.w, cSize.h, cam.x, cam.y, cam.s);
 
+    // Viewport culling — only draw elements/relationships visible on screen
+    const vpMargin = 100; // extra margin in world coords to avoid pop-in
+    const vpLeft = -cam.x / cam.s - vpMargin;
+    const vpTop = -cam.y / cam.s - vpMargin;
+    const vpRight = vpLeft + cSize.w / cam.s + vpMargin * 2;
+    const vpBottom = vpTop + cSize.h / cam.s + vpMargin * 2;
+
+    const inViewport = (el: { x: number; y: number; w: number; h: number }) =>
+      el.x + el.w >= vpLeft && el.x <= vpRight && el.y + el.h >= vpTop && el.y <= vpBottom;
+
+    const culledElements = sortedElements.filter(inViewport);
+
     // 1. Composite elements (background)
-    sortedElements.filter(e => getLayer(e.type) === 'composite' && !isNote(e.type)).forEach(el => {
-      drawElement(ctx, el, selType === 'element' && selectedId === el.id, hovElId === el.id, (selType === 'element' && selectedId === el.id) || hovElId === el.id, parentIds.has(el.id));
-    });
+    for (const el of culledElements) {
+      if (getLayer(el.type) === 'composite' && !isNote(el.type)) {
+        drawElement(ctx, el, selType === 'element' && selectedId === el.id, hovElId === el.id, (selType === 'element' && selectedId === el.id) || hovElId === el.id, parentIds.has(el.id));
+      }
+    }
 
     // 2. Non-composite elements + notes
-    sortedElements.filter(e => getLayer(e.type) !== 'composite' || isNote(e.type)).forEach(el => {
-      drawElement(ctx, el, selType === 'element' && selectedId === el.id, hovElId === el.id, (selType === 'element' && selectedId === el.id) || hovElId === el.id, parentIds.has(el.id));
-    });
+    for (const el of culledElements) {
+      if (getLayer(el.type) !== 'composite' || isNote(el.type)) {
+        drawElement(ctx, el, selType === 'element' && selectedId === el.id, hovElId === el.id, (selType === 'element' && selectedId === el.id) || hovElId === el.id, parentIds.has(el.id));
+      }
+    }
 
     // 3. Relationships (always on top of elements) — with crossing hops
-    const allRelSegs: RelSegments[] = visibleRelationships
-      .map(r => getRelSegments(r, visibleElements))
-      .filter((s): s is RelSegments => s !== null);
+    // For large models, skip crossing detection (expensive O(n²))
+    const skipCrossings = visibleRelationships.length > 200;
 
-    // Pre-build a flat list of all segments with their owning relId for fast exclusion
-    const allFlatSegs = allRelSegs.flatMap(s => s.segments.map(seg => ({ ...seg, relId: s.relId })));
+    if (skipCrossings) {
+      for (const r of visibleRelationships) {
+        drawRelationship(ctx, r, visibleElements, selType === 'relationship' && selectedId === r.id, hovRelId === r.id, [], visibleElementMap);
+      }
+    } else {
+      const allRelSegs: RelSegments[] = visibleRelationships
+        .map(r => getRelSegments(r, visibleElements, visibleElementMap))
+        .filter((s): s is RelSegments => s !== null);
 
-    visibleRelationships.forEach(r => {
-      const otherSegs = allFlatSegs.filter(s => s.relId !== r.id);
-      drawRelationship(ctx, r, visibleElements, selType === 'relationship' && selectedId === r.id, hovRelId === r.id, otherSegs);
-    });
+      // Pre-build a flat list of all segments with their owning relId for fast exclusion
+      const allFlatSegs = allRelSegs.flatMap(s => s.segments.map(seg => ({ ...seg, relId: s.relId })));
+
+      for (const r of visibleRelationships) {
+        const otherSegs = allFlatSegs.filter(s => s.relId !== r.id);
+        drawRelationship(ctx, r, visibleElements, selType === 'relationship' && selectedId === r.id, hovRelId === r.id, otherSegs, visibleElementMap);
+      }
+    }
 
     // 4. Snap guide lines
     if (snapGuides.length > 0) {
@@ -542,7 +592,7 @@ export default function App() {
     }
 
     ctx.restore();
-  }, [visibleElements, visibleRelationships, sortedElements, parentIds, selectedId, selType, cam, cSize, hovElId, hovRelId, drawingRel, gridType, snapGuides]);
+  }, [visibleElements, visibleElementMap, visibleRelationships, sortedElements, parentIds, selectedId, selType, cam, cSize, hovElId, hovRelId, drawingRel, gridType, snapGuides]);
 
   // ==================== MOUSE HANDLERS ====================
   const handleMouseDown = useCallback((e: React.MouseEvent) => {

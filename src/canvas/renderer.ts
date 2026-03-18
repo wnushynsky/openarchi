@@ -286,8 +286,8 @@ function segIntersect(a: Seg, b: Seg): { x: number; y: number } | null {
 export interface RelSegments { relId: string; segments: Seg[] }
 
 /** Extract segments from a relationship's resolved points */
-export function getRelSegments(rel: ModelRelationship, elements: ModelElement[]): RelSegments | null {
-  const pts = getRelPoints(rel, elements);
+export function getRelSegments(rel: ModelRelationship, elements: ModelElement[], elementMap?: Map<string, ModelElement>): RelSegments | null {
+  const pts = getRelPoints(rel, elements, elementMap);
   if (!pts) return null;
   const allPts = [pts.start, ...pts.waypoints, pts.end];
   const segments: Seg[] = [];
@@ -353,8 +353,8 @@ function drawPathWithHops(
   ctx.stroke();
 }
 
-export function drawRelationship(ctx: CanvasRenderingContext2D, rel: ModelRelationship, elements: ModelElement[], isSel: boolean, isHov: boolean, otherSegments?: Seg[]) {
-  const pts = getRelPoints(rel, elements);
+export function drawRelationship(ctx: CanvasRenderingContext2D, rel: ModelRelationship, elements: ModelElement[], isSel: boolean, isHov: boolean, otherSegments?: Seg[], elementMap?: Map<string, ModelElement>) {
+  const pts = getRelPoints(rel, elements, elementMap);
   if (!pts) return;
   const { start, end, waypoints } = pts;
   const rd = RELATIONSHIP_TYPES[rel.type] || RELATIONSHIP_TYPES.association;

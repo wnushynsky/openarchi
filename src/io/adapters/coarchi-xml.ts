@@ -30,6 +30,26 @@ function getAttr(node: Element, names: string[]): string | undefined {
   return undefined;
 }
 
+/**
+ * Get a referenced element ID from a child element (GRAFICO format).
+ * e.g. <archimateElement href="id-xxx"/> or <archimateElement xsi:type="..." href="id-xxx"/>
+ */
+function getChildElementRef(node: Element, childNames: string[]): string | undefined {
+  for (const child of Array.from(node.children)) {
+    const childTag = localName(child).toLowerCase();
+    if (childNames.some(n => n.toLowerCase() === childTag)) {
+      // Try href attribute first, then xlink:href
+      const href = child.getAttribute('href') || child.getAttribute('xlink:href');
+      if (href) {
+        // Strip leading # or path prefix if present
+        const cleaned = href.replace(/^.*#/, '').trim();
+        return cleaned || undefined;
+      }
+    }
+  }
+  return undefined;
+}
+
 function getName(node: Element): string {
   const byAttr = getAttr(node, ['name']);
   if (byAttr) return byAttr;
@@ -72,6 +92,8 @@ function mapElementType(rawType: string | undefined): string | undefined {
   const base = extractTypeName(rawType).replace(/Element$/, '');
   if (!base || /relationship$/i.test(base)) return undefined;
   if (/diagrammodel|diagramobject|diagramconnection|diagramreference/i.test(base)) return undefined;
+  // Skip structural/non-element tags that appear in coArchi files
+  if (/^(folder|property|feature|metadata|model|children|child|connection|bounds|bendpoint|point|documentation|name|purpose|content|label|source|target)$/i.test(base)) return undefined;
 
   const candidate = toCamelLower(base);
   if (ELEMENT_TYPE_KEYS.has(candidate)) return candidate;
@@ -230,11 +252,14 @@ function parseCoArchiXml(raw: string): ParseResult {
     const id = getAttr(node, ['identifier', 'id']);
     if (!id) continue;
 
-    const tag = localName(node).toLowerCase();
-    const rawType = getAttr(node, ['xsi:type', 'type']);
+    const tag = localName(node);
+    const tagLower = tag.toLowerCase();
+    // Use xsi:type or type attribute, falling back to the tag name itself
+    // (coArchi fragments use the tag name as type, e.g. <archimate:BusinessActor>)
+    const rawType = getAttr(node, ['xsi:type', 'type']) || tag;
     const typeName = extractTypeName(rawType).toLowerCase();
 
-    const isRelationshipByTag = tag === 'relationship';
+    const isRelationshipByTag = tagLower === 'relationship';
     const isRelationshipByType = typeName.endsWith('relationship');
 
     if (isRelationshipByTag || isRelationshipByType) {
@@ -290,11 +315,12 @@ function parseCoArchiXml(raw: string): ParseResult {
     const id = getAttr(node, ['identifier', 'id']);
     if (!id) return false;
 
-    const tag = localName(node).toLowerCase();
-    const rawType = getAttr(node, ['xsi:type', 'type']);
+    const tag = localName(node);
+    const tagLower = tag.toLowerCase();
+    const rawType = getAttr(node, ['xsi:type', 'type']) || tag;
     const typeName = extractTypeName(rawType);
 
-    return tag === 'view' || /diagrammodel/i.test(typeName);
+    return tagLower === 'view' || /diagrammodel/i.test(typeName) || /diagrammodel/i.test(tag);
   });
 
   for (const viewNode of viewCandidates) {
@@ -311,7 +337,8 @@ function parseCoArchiXml(raw: string): ParseResult {
     let fallbackIndex = 0;
     const descendants = Array.from(viewNode.querySelectorAll('*'));
     for (const child of descendants) {
-      const elementId = getAttr(child, ['archimateElement', 'elementRef', 'modelElement', 'conceptRef']);
+      const elementId = getAttr(child, ['archimateElement', 'elementRef', 'modelElement', 'conceptRef'])
+        || getChildElementRef(child, ['archimateElement', 'elementRef', 'modelElement']);
       if (elementId && elementIds.has(elementId)) {
         const key = `${id}::${elementId}`;
         if (!viewNodeKeys.has(key)) {
@@ -330,7 +357,8 @@ function parseCoArchiXml(raw: string): ParseResult {
         }
       }
 
-      const relationshipId = getAttr(child, ['archimateRelationship', 'relationshipRef', 'relationship']);
+      const relationshipId = getAttr(child, ['archimateRelationship', 'relationshipRef', 'relationship'])
+        || getChildElementRef(child, ['archimateRelationship', 'relationshipRef']);
       if (relationshipId && relationshipIds.has(relationshipId)) {
         const key = `${id}::${relationshipId}`;
         if (!viewConnectionKeys.has(key)) {
@@ -463,11 +491,14 @@ export function parseCoArchiFragments(xmlContents: string[]): ParseResult {
       const id = getAttr(node, ['identifier', 'id']);
       if (!id) continue;
 
-      const tag = localName(node).toLowerCase();
-      const rawType = getAttr(node, ['xsi:type', 'type']);
+      const tag = localName(node);
+      const tagLower = tag.toLowerCase();
+      // Use xsi:type or type attribute, falling back to the tag name itself
+      // (coArchi fragments use the tag name as type, e.g. <archimate:BusinessActor>)
+      const rawType = getAttr(node, ['xsi:type', 'type']) || tag;
       const typeName = extractTypeName(rawType).toLowerCase();
 
-      const isRelationshipByTag = tag === 'relationship';
+      const isRelationshipByTag = tagLower === 'relationship';
       const isRelationshipByType = typeName.endsWith('relationship');
 
       if (isRelationshipByTag || isRelationshipByType) {
@@ -499,7 +530,7 @@ export function parseCoArchiFragments(xmlContents: string[]): ParseResult {
       }
 
       // Check if it's a view/diagram
-      if (tag === 'view' || /diagrammodel/i.test(typeName)) {
+      if (tagLower === 'view' || /diagrammodel/i.test(typeName) || /diagrammodel/i.test(tag)) {
         if (viewIds.has(id)) continue;
 
         allViews.push({
@@ -513,7 +544,10 @@ export function parseCoArchiFragments(xmlContents: string[]): ParseResult {
         let fallbackIndex = 0;
         const descendants = Array.from(node.querySelectorAll('*'));
         for (const child of descendants) {
-          const elementId = getAttr(child, ['archimateElement', 'elementRef', 'modelElement', 'conceptRef']);
+          // Check both attribute and child element references for archimateElement
+          // coArchi GRAFICO uses: <archimateElement href="id-xxx"/> as child element
+          const elementId = getAttr(child, ['archimateElement', 'elementRef', 'modelElement', 'conceptRef'])
+            || getChildElementRef(child, ['archimateElement', 'elementRef', 'modelElement']);
           if (elementId) {
             const key = `${id}::${elementId}`;
             if (!viewNodeKeys.has(key)) {
@@ -532,7 +566,8 @@ export function parseCoArchiFragments(xmlContents: string[]): ParseResult {
             }
           }
 
-          const relId = getAttr(child, ['archimateRelationship', 'relationshipRef', 'relationship']);
+          const relId = getAttr(child, ['archimateRelationship', 'relationshipRef', 'relationship'])
+            || getChildElementRef(child, ['archimateRelationship', 'relationshipRef']);
           if (relId) {
             const key = `${id}::${relId}`;
             if (!viewConnectionKeys.has(key)) {

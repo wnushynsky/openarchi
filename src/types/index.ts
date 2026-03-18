@@ -44,6 +44,7 @@ export interface ModelElement {
   h: number;
   documentation: string;
   linkedViewId?: string;
+  zIndex?: number;
 }
 
 export interface Waypoint {
@@ -59,6 +60,10 @@ export interface ModelRelationship {
   name: string;
   waypoints: Waypoint[];
   labelPos: number;
+  /** Manual anchor point on source element boundary (absolute coords, snapped to edge on render) */
+  sourceAnchor?: Point;
+  /** Manual anchor point on target element boundary (absolute coords, snapped to edge on render) */
+  targetAnchor?: Point;
 }
 
 export interface ModelView {
@@ -110,6 +115,11 @@ export interface DragWPState {
   wpIdx: number;
   startX: number;
   startY: number;
+}
+
+export interface DragEndpointState {
+  relId: string;
+  endpoint: 'source' | 'target';
 }
 
 export interface DragLabelState {

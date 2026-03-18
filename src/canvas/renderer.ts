@@ -251,10 +251,95 @@ export function drawElement(ctx: CanvasRenderingContext2D, el: ModelElement, isS
 }
 
 // ============================================================
-// Relationship rendering
+// Relationship rendering — line crossing hops
 // ============================================================
 
-export function drawRelationship(ctx: CanvasRenderingContext2D, rel: ModelRelationship, elements: ModelElement[], isSel: boolean, isHov: boolean) {
+interface Seg { x1: number; y1: number; x2: number; y2: number }
+
+/** Find the parameter t where two segments cross (or null) */
+function segIntersect(a: Seg, b: Seg): { x: number; y: number } | null {
+  const dx1 = a.x2 - a.x1, dy1 = a.y2 - a.y1;
+  const dx2 = b.x2 - b.x1, dy2 = b.y2 - b.y1;
+  const denom = dx1 * dy2 - dy1 * dx2;
+  if (Math.abs(denom) < 0.001) return null; // parallel or collinear
+  const t = ((b.x1 - a.x1) * dy2 - (b.y1 - a.y1) * dx2) / denom;
+  const u = ((b.x1 - a.x1) * dy1 - (b.y1 - a.y1) * dx1) / denom;
+  if (t <= 0.01 || t >= 0.99 || u <= 0.01 || u >= 0.99) return null;
+  return { x: a.x1 + t * dx1, y: a.y1 + t * dy1 };
+}
+
+/** Pre-computed segments for all relationships, used for crossing detection */
+export interface RelSegments { relId: string; segments: Seg[] }
+
+/** Extract segments from a relationship's resolved points */
+export function getRelSegments(rel: ModelRelationship, elements: ModelElement[]): RelSegments | null {
+  const pts = getRelPoints(rel, elements);
+  if (!pts) return null;
+  const allPts = [pts.start, ...pts.waypoints, pts.end];
+  const segments: Seg[] = [];
+  for (let i = 0; i < allPts.length - 1; i++) {
+    segments.push({ x1: allPts[i].x, y1: allPts[i].y, x2: allPts[i + 1].x, y2: allPts[i + 1].y });
+  }
+  return { relId: rel.id, segments };
+}
+
+const HOP_RADIUS = 6;
+
+/** Draw a polyline path with small arc hops at crossing points */
+function drawPathWithHops(
+  ctx: CanvasRenderingContext2D,
+  allPts: { x: number; y: number }[],
+  otherSegments: Seg[],
+) {
+  // Collect all crossing points per segment
+  const mySegments: Seg[] = [];
+  for (let i = 0; i < allPts.length - 1; i++) {
+    mySegments.push({ x1: allPts[i].x, y1: allPts[i].y, x2: allPts[i + 1].x, y2: allPts[i + 1].y });
+  }
+
+  ctx.beginPath();
+  ctx.moveTo(allPts[0].x, allPts[0].y);
+
+  for (let i = 0; i < mySegments.length; i++) {
+    const seg = mySegments[i];
+    const dx = seg.x2 - seg.x1, dy = seg.y2 - seg.y1;
+    const segLen = Math.sqrt(dx * dx + dy * dy);
+    if (segLen < 0.1) { ctx.lineTo(seg.x2, seg.y2); continue; }
+
+    // Find crossings on this segment
+    const crossings: number[] = []; // parameter t values
+    for (const other of otherSegments) {
+      const hit = segIntersect(seg, other);
+      if (!hit) continue;
+      const t = ((hit.x - seg.x1) * dx + (hit.y - seg.y1) * dy) / (segLen * segLen);
+      crossings.push(t);
+    }
+    crossings.sort((a, b) => a - b);
+
+    if (crossings.length === 0) {
+      ctx.lineTo(seg.x2, seg.y2);
+    } else {
+      // Unit normal perpendicular to segment (pointing "up" in screen space)
+      const nx = -dy / segLen, ny = dx / segLen;
+      const hopT = HOP_RADIUS / segLen;
+
+      for (const t of crossings) {
+        const tBefore = Math.max(0, t - hopT);
+        const tAfter = Math.min(1, t + hopT);
+        // Draw to just before the crossing
+        ctx.lineTo(seg.x1 + tBefore * dx, seg.y1 + tBefore * dy);
+        // Draw arc hop (semicircle above the line)
+        const cx = seg.x1 + t * dx, cy = seg.y1 + t * dy;
+        const startAngle = Math.atan2(-nx, -ny);
+        ctx.arc(cx, cy, HOP_RADIUS, startAngle, startAngle + Math.PI);
+      }
+      ctx.lineTo(seg.x2, seg.y2);
+    }
+  }
+  ctx.stroke();
+}
+
+export function drawRelationship(ctx: CanvasRenderingContext2D, rel: ModelRelationship, elements: ModelElement[], isSel: boolean, isHov: boolean, otherSegments?: Seg[]) {
   const pts = getRelPoints(rel, elements);
   if (!pts) return;
   const { start, end, waypoints } = pts;
@@ -268,10 +353,14 @@ export function drawRelationship(ctx: CanvasRenderingContext2D, rel: ModelRelati
   if (rd.dash) ctx.setLineDash([6, 4]);
 
   const allPts = [start, ...waypoints, end];
-  ctx.beginPath();
-  ctx.moveTo(allPts[0].x, allPts[0].y);
-  for (let i = 1; i < allPts.length; i++) ctx.lineTo(allPts[i].x, allPts[i].y);
-  ctx.stroke();
+  if (otherSegments && otherSegments.length > 0) {
+    drawPathWithHops(ctx, allPts, otherSegments);
+  } else {
+    ctx.beginPath();
+    ctx.moveTo(allPts[0].x, allPts[0].y);
+    for (let i = 1; i < allPts.length; i++) ctx.lineTo(allPts[i].x, allPts[i].y);
+    ctx.stroke();
+  }
   ctx.setLineDash([]);
 
   // Arrowheads — wider spread (0.5 rad ≈ 29°) for clear visual distinction
@@ -330,6 +419,12 @@ export function drawRelationship(ctx: CanvasRenderingContext2D, rel: ModelRelati
       ctx.beginPath(); ctx.arc(wp.x, wp.y, 4.5, 0, Math.PI * 2);
       ctx.fillStyle = '#fff'; ctx.fill();
       ctx.lineWidth = 1.6; ctx.strokeStyle = '#2563eb'; ctx.stroke();
+    });
+    // Endpoint handles (start & end)
+    [start, end].forEach(pt => {
+      ctx.beginPath(); ctx.arc(pt.x, pt.y, 5, 0, Math.PI * 2);
+      ctx.fillStyle = '#2563eb'; ctx.fill();
+      ctx.lineWidth = 1.6; ctx.strokeStyle = '#fff'; ctx.stroke();
     });
   }
 

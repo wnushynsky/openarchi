@@ -121,20 +121,81 @@ function parseBounds(node: Element): { x: number; y: number; width: number; heig
   return null;
 }
 
-function parseBendpoints(node: Element): { x: number; y: number }[] {
-  const bendpoints: { x: number; y: number }[] = [];
+interface RawBendpoint {
+  /** Absolute x (ArchiMate Exchange format) */
+  x?: number;
+  /** Absolute y (ArchiMate Exchange format) */
+  y?: number;
+  /** Offset from source center (Archi native format) */
+  startX?: number;
+  startY?: number;
+  /** Offset from target center (Archi native format) */
+  endX?: number;
+  endY?: number;
+}
+
+function parseRawBendpoints(node: Element): RawBendpoint[] {
+  const bendpoints: RawBendpoint[] = [];
 
   for (const child of Array.from(node.querySelectorAll('*'))) {
     const childName = localName(child).toLowerCase();
     if (!childName.includes('bendpoint') && childName !== 'point') continue;
 
-    const x = asNumber(getAttr(child, ['x', 'startX']));
-    const y = asNumber(getAttr(child, ['y', 'startY']));
-    if (x === undefined || y === undefined) continue;
-    bendpoints.push({ x, y });
+    const bp: RawBendpoint = {};
+
+    // Check absolute coords first (Exchange format)
+    const absX = asNumber(child.getAttribute('x') ?? undefined);
+    const absY = asNumber(child.getAttribute('y') ?? undefined);
+
+    // Check relative coords (Archi native format)
+    const sX = asNumber(child.getAttribute('startX') ?? undefined);
+    const sY = asNumber(child.getAttribute('startY') ?? undefined);
+    const eX = asNumber(child.getAttribute('endX') ?? undefined);
+    const eY = asNumber(child.getAttribute('endY') ?? undefined);
+
+    const hasRelative = sX !== undefined || sY !== undefined || eX !== undefined || eY !== undefined;
+
+    if (hasRelative) {
+      // Archi native format — store relative offsets
+      bp.startX = sX ?? 0;
+      bp.startY = sY ?? 0;
+      bp.endX = eX ?? 0;
+      bp.endY = eY ?? 0;
+    } else if (absX !== undefined && absY !== undefined) {
+      // Exchange format — absolute coordinates
+      bp.x = absX;
+      bp.y = absY;
+    } else {
+      continue;
+    }
+
+    bendpoints.push(bp);
   }
 
   return bendpoints;
+}
+
+/** Resolve raw bendpoints to absolute coordinates */
+function resolveBendpoints(
+  raw: RawBendpoint[],
+  sourceCenter: { x: number; y: number } | null,
+  targetCenter: { x: number; y: number } | null,
+): { x: number; y: number }[] {
+  return raw.flatMap(bp => {
+    if (bp.x !== undefined && bp.y !== undefined) {
+      return [{ x: bp.x, y: bp.y }];
+    }
+
+    // Relative bendpoints — resolve using source/target centers
+    if (sourceCenter && targetCenter) {
+      const fromSource = { x: sourceCenter.x + (bp.startX ?? 0), y: sourceCenter.y + (bp.startY ?? 0) };
+      const fromTarget = { x: targetCenter.x + (bp.endX ?? 0), y: targetCenter.y + (bp.endY ?? 0) };
+      return [{ x: (fromSource.x + fromTarget.x) / 2, y: (fromSource.y + fromTarget.y) / 2 }];
+    }
+
+    // Can't resolve — skip
+    return [];
+  });
 }
 
 function isDiagramObjectNode(node: Element): boolean {
@@ -163,6 +224,19 @@ function isDiagramReferenceNode(node: Element): boolean {
   return rawType.includes('diagrammodelreference');
 }
 
+/** Pending connection collected during tree walk, resolved after all nodes are known */
+interface PendingConnection {
+  id: string;
+  viewId: string;
+  relationshipId: string;
+  /** Diagram object ID of source (from connection's source attribute) */
+  sourceDiagramId: string;
+  /** Diagram object ID of target (from connection's target attribute) */
+  targetDiagramId: string;
+  rawBendpoints: RawBendpoint[];
+  labelPosition: number;
+}
+
 interface ViewWalkState {
   viewId: string;
   elements: CanonicalElement[];
@@ -173,6 +247,10 @@ interface ViewWalkState {
   viewConnectionKeys: Set<string>;
   viewNodes: CanonicalViewNode[];
   viewConnections: CanonicalViewConnection[];
+  /** Map from diagram object ID → absolute center position */
+  diagramObjectCenters: Map<string, { x: number; y: number }>;
+  /** Connections deferred until all nodes are collected */
+  pendingConnections: PendingConnection[];
   fallbackIndex: number;
 }
 
@@ -188,6 +266,8 @@ function walkViewTree(node: Element, offsetX: number, offsetY: number, state: Vi
       nextOffsetY = offsetY + bounds.y;
     }
 
+    const diagramObjectId = getAttr(node, ['identifier', 'id']);
+
     const elementId = getAttr(node, ['elementRef', 'archimateElement', 'modelElement', 'conceptRef']);
     if (elementId && state.elementIds.has(elementId)) {
       const key = `${state.viewId}::${elementId}`;
@@ -198,7 +278,7 @@ function walkViewTree(node: Element, offsetX: number, offsetY: number, state: Vi
         const height = bounds?.height ?? 72;
 
         state.viewNodes.push({
-          id: getAttr(node, ['identifier', 'id']) || key,
+          id: diagramObjectId || key,
           viewId: state.viewId,
           elementId,
           x,
@@ -209,6 +289,11 @@ function walkViewTree(node: Element, offsetX: number, offsetY: number, state: Vi
         state.viewNodeKeys.add(key);
         state.fallbackIndex += 1;
 
+        // Record absolute center for bendpoint resolution
+        if (diagramObjectId) {
+          state.diagramObjectCenters.set(diagramObjectId, { x: x + width / 2, y: y + height / 2 });
+        }
+
         nextOffsetX = x;
         nextOffsetY = y;
       } else {
@@ -218,13 +303,21 @@ function walkViewTree(node: Element, offsetX: number, offsetY: number, state: Vi
           nextOffsetY = existing.y;
         }
       }
+    } else if (diagramObjectId && hasBounds) {
+      // Non-element diagram objects (e.g. groupings without archimateElement) — still track position for bendpoint resolution
+      const x = nextOffsetX;
+      const y = nextOffsetY;
+      const width = bounds?.width ?? 160;
+      const height = bounds?.height ?? 72;
+      state.diagramObjectCenters.set(diagramObjectId, { x: x + width / 2, y: y + height / 2 });
     }
   }
 
   if (isDiagramReferenceNode(node)) {
+    const diagramObjectId = getAttr(node, ['identifier', 'id']);
     const targetViewId = getAttr(node, ['model', 'viewRef', 'targetView']);
     if (targetViewId) {
-      const referenceId = getAttr(node, ['identifier', 'id']) || `${state.viewId}::viewref::${targetViewId}`;
+      const referenceId = diagramObjectId || `${state.viewId}::viewref::${targetViewId}`;
       if (!state.elementIds.has(referenceId)) {
         const targetName = state.viewNameById.get(targetViewId) || 'View';
         state.elements.push({
@@ -241,6 +334,8 @@ function walkViewTree(node: Element, offsetX: number, offsetY: number, state: Vi
         const bounds = parseBounds(node);
         const x = (bounds?.x ?? 140 + (state.fallbackIndex % 10) * 180) + offsetX;
         const y = (bounds?.y ?? 100 + Math.floor(state.fallbackIndex / 10) * 120) + offsetY;
+        const width = bounds?.width ?? 180;
+        const height = bounds?.height ?? 60;
 
         state.viewNodes.push({
           id: referenceId,
@@ -248,12 +343,16 @@ function walkViewTree(node: Element, offsetX: number, offsetY: number, state: Vi
           elementId: referenceId,
           x,
           y,
-          width: bounds?.width ?? 180,
-          height: bounds?.height ?? 60,
+          width,
+          height,
           linkedViewId: targetViewId,
         });
         state.viewNodeKeys.add(key);
         state.fallbackIndex += 1;
+
+        if (diagramObjectId) {
+          state.diagramObjectCenters.set(diagramObjectId, { x: x + width / 2, y: y + height / 2 });
+        }
       }
     }
   }
@@ -263,11 +362,16 @@ function walkViewTree(node: Element, offsetX: number, offsetY: number, state: Vi
     if (relationshipId && state.relationshipIds.has(relationshipId)) {
       const key = `${state.viewId}::${relationshipId}`;
       if (!state.viewConnectionKeys.has(key)) {
-        state.viewConnections.push({
+        const sourceDiagramId = getAttr(node, ['source']) || '';
+        const targetDiagramId = getAttr(node, ['target']) || '';
+
+        state.pendingConnections.push({
           id: getAttr(node, ['identifier', 'id']) || key,
           viewId: state.viewId,
           relationshipId,
-          waypoints: parseBendpoints(node),
+          sourceDiagramId,
+          targetDiagramId,
+          rawBendpoints: parseRawBendpoints(node),
           labelPosition: asNumber(getAttr(node, ['labelPos', 'labelPosition'])) ?? 0.5,
         });
         state.viewConnectionKeys.add(key);
@@ -277,6 +381,22 @@ function walkViewTree(node: Element, offsetX: number, offsetY: number, state: Vi
 
   for (const child of Array.from(node.children)) {
     walkViewTree(child, nextOffsetX, nextOffsetY, state);
+  }
+}
+
+/** Resolve all pending connections now that every diagram object position is known */
+function resolvePendingConnections(state: ViewWalkState): void {
+  for (const conn of state.pendingConnections) {
+    const sourceCenter = state.diagramObjectCenters.get(conn.sourceDiagramId) || null;
+    const targetCenter = state.diagramObjectCenters.get(conn.targetDiagramId) || null;
+
+    state.viewConnections.push({
+      id: conn.id,
+      viewId: conn.viewId,
+      relationshipId: conn.relationshipId,
+      waypoints: resolveBendpoints(conn.rawBendpoints, sourceCenter, targetCenter),
+      labelPosition: conn.labelPosition,
+    });
   }
 }
 
@@ -423,12 +543,18 @@ function parseArchiMateExchangeXml(raw: string): ParseResult {
       viewConnectionKeys,
       viewNodes,
       viewConnections,
+      diagramObjectCenters: new Map(),
+      pendingConnections: [],
       fallbackIndex: 0,
     };
 
+    // Pass 1: collect all nodes and diagram object positions
     for (const child of Array.from(viewNode.children)) {
       walkViewTree(child, 0, 0, state);
     }
+
+    // Pass 2: resolve connections now that all positions are known
+    resolvePendingConnections(state);
   }
 
   if (elements.length === 0) {

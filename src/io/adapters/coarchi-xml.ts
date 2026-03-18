@@ -125,21 +125,66 @@ function parseBounds(node: Element): { x: number; y: number; width: number; heig
   return null;
 }
 
-function parseBendpoints(node: Element): { x: number; y: number }[] {
-  const bendpoints: { x: number; y: number }[] = [];
+interface RawBendpoint {
+  x?: number;
+  y?: number;
+  startX?: number;
+  startY?: number;
+  endX?: number;
+  endY?: number;
+}
+
+function parseRawBendpoints(node: Element): RawBendpoint[] {
+  const bendpoints: RawBendpoint[] = [];
 
   for (const child of Array.from(node.querySelectorAll('*'))) {
     const childName = localName(child).toLowerCase();
     if (!childName.includes('bendpoint') && childName !== 'point') continue;
 
-    const x = asNumber(getAttr(child, ['x', 'startX']));
-    const y = asNumber(getAttr(child, ['y', 'startY']));
-    if (x === undefined || y === undefined) continue;
+    const bp: RawBendpoint = {};
+    const absX = asNumber(child.getAttribute('x') ?? undefined);
+    const absY = asNumber(child.getAttribute('y') ?? undefined);
+    const sX = asNumber(child.getAttribute('startX') ?? undefined);
+    const sY = asNumber(child.getAttribute('startY') ?? undefined);
+    const eX = asNumber(child.getAttribute('endX') ?? undefined);
+    const eY = asNumber(child.getAttribute('endY') ?? undefined);
 
-    bendpoints.push({ x, y });
+    const hasRelative = sX !== undefined || sY !== undefined || eX !== undefined || eY !== undefined;
+
+    if (hasRelative) {
+      bp.startX = sX ?? 0;
+      bp.startY = sY ?? 0;
+      bp.endX = eX ?? 0;
+      bp.endY = eY ?? 0;
+    } else if (absX !== undefined && absY !== undefined) {
+      bp.x = absX;
+      bp.y = absY;
+    } else {
+      continue;
+    }
+
+    bendpoints.push(bp);
   }
 
   return bendpoints;
+}
+
+function resolveBendpoints(
+  raw: RawBendpoint[],
+  sourceCenter: { x: number; y: number } | null,
+  targetCenter: { x: number; y: number } | null,
+): { x: number; y: number }[] {
+  return raw.flatMap(bp => {
+    if (bp.x !== undefined && bp.y !== undefined) {
+      return [{ x: bp.x, y: bp.y }];
+    }
+    if (sourceCenter && targetCenter) {
+      const fromSource = { x: sourceCenter.x + (bp.startX ?? 0), y: sourceCenter.y + (bp.startY ?? 0) };
+      const fromTarget = { x: targetCenter.x + (bp.endX ?? 0), y: targetCenter.y + (bp.endY ?? 0) };
+      return [{ x: (fromSource.x + fromTarget.x) / 2, y: (fromSource.y + fromTarget.y) / 2 }];
+    }
+    return [];
+  });
 }
 
 function parseCoArchiXml(raw: string): ParseResult {
@@ -289,11 +334,24 @@ function parseCoArchiXml(raw: string): ParseResult {
       if (relationshipId && relationshipIds.has(relationshipId)) {
         const key = `${id}::${relationshipId}`;
         if (!viewConnectionKeys.has(key)) {
+          const rawBendpoints = parseRawBendpoints(child);
+
+          // Resolve relative bendpoints using source/target element centers
+          const rel = semanticRelationships.find(r => r.id === relationshipId);
+          let sourceCenter: { x: number; y: number } | null = null;
+          let targetCenter: { x: number; y: number } | null = null;
+          if (rel) {
+            const srcNode = viewNodes.find(vn => vn.viewId === id && vn.elementId === rel.sourceId);
+            const tgtNode = viewNodes.find(vn => vn.viewId === id && vn.elementId === rel.targetId);
+            if (srcNode) sourceCenter = { x: srcNode.x + srcNode.width / 2, y: srcNode.y + srcNode.height / 2 };
+            if (tgtNode) targetCenter = { x: tgtNode.x + tgtNode.width / 2, y: tgtNode.y + tgtNode.height / 2 };
+          }
+
           viewConnections.push({
             id: getAttr(child, ['identifier', 'id']) || key,
             viewId: id,
             relationshipId,
-            waypoints: parseBendpoints(child),
+            waypoints: resolveBendpoints(rawBendpoints, sourceCenter, targetCenter),
             labelPosition: asNumber(getAttr(child, ['labelPos', 'labelPosition'])) ?? 0.5,
           });
           viewConnectionKeys.add(key);

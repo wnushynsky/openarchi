@@ -50,6 +50,82 @@ export interface RelPath {
 
 const STRAIGHT_THRESH = 40;
 
+/**
+ * Compute the point where a ray from the center of a rect toward a target
+ * intersects the rect boundary. Keeps lines straight regardless of element position.
+ *
+ * When the direction is nearly diagonal, we bias toward the edge that aligns
+ * with the dominant axis so connections don't flip sides unexpectedly.
+ */
+function rectEdgeIntersect(
+  el: ModelElement,
+  target: Point,
+): Anchor {
+  const cx = el.x + el.w / 2, cy = el.y + el.h / 2;
+  const dx = target.x - cx, dy = target.y - cy;
+
+  // Degenerate case: target is at center
+  if (Math.abs(dx) < 0.01 && Math.abs(dy) < 0.01) {
+    return { x: cx, y: el.y, side: 'tc' };
+  }
+
+  const hw = el.w / 2, hh = el.h / 2;
+  const adx = Math.abs(dx), ady = Math.abs(dy);
+
+  // Decide which edge the line should exit from.
+  // Use the angle of the direction relative to the rect's aspect ratio.
+  // Bias toward top/bottom to match typical top-to-bottom ArchiMate flow:
+  // we only pick left/right when the direction is strongly horizontal.
+  const angle = Math.atan2(ady, adx); // 0 = horizontal, PI/2 = vertical
+  const aspectAngle = Math.atan2(hh, hw); // angle of the rect diagonal
+
+  let ix: number, iy: number, side: string;
+
+  if (angle >= aspectAngle) {
+    // Dominant vertical — exit through top or bottom, x follows the line
+    const t = hh / ady;
+    ix = cx + dx * t;
+    iy = dy > 0 ? el.y + el.h : el.y;
+    // Clamp x to stay within the element bounds
+    ix = Math.max(el.x, Math.min(el.x + el.w, ix));
+    side = dy > 0 ? 'bc' : 'tc';
+  } else {
+    // Dominant horizontal — exit through left or right, y follows the line
+    const t = hw / adx;
+    iy = cy + dy * t;
+    ix = dx > 0 ? el.x + el.w : el.x;
+    // Clamp y to stay within the element bounds
+    iy = Math.max(el.y, Math.min(el.y + el.h, iy));
+    side = dx > 0 ? 'mr' : 'ml';
+  }
+
+  return { x: ix, y: iy, side };
+}
+
+/**
+ * Snap an arbitrary point to the nearest point on an element's boundary.
+ */
+function snapToEdge(el: ModelElement, p: Point): Anchor {
+  const cx = el.x + el.w / 2, cy = el.y + el.h / 2;
+  // Candidates: project onto each of the 4 edges, pick closest
+  const candidates: { x: number; y: number; side: string; d: number }[] = [];
+  // Top edge
+  const tx = Math.max(el.x, Math.min(el.x + el.w, p.x));
+  candidates.push({ x: tx, y: el.y, side: 'tc', d: Math.hypot(p.x - tx, p.y - el.y) });
+  // Bottom edge
+  const bx = Math.max(el.x, Math.min(el.x + el.w, p.x));
+  candidates.push({ x: bx, y: el.y + el.h, side: 'bc', d: Math.hypot(p.x - bx, p.y - (el.y + el.h)) });
+  // Left edge
+  const ly = Math.max(el.y, Math.min(el.y + el.h, p.y));
+  candidates.push({ x: el.x, y: ly, side: 'ml', d: Math.hypot(p.x - el.x, p.y - ly) });
+  // Right edge
+  const ry = Math.max(el.y, Math.min(el.y + el.h, p.y));
+  candidates.push({ x: el.x + el.w, y: ry, side: 'mr', d: Math.hypot(p.x - (el.x + el.w), p.y - ry) });
+
+  candidates.sort((a, b) => a.d - b.d);
+  return { x: candidates[0].x, y: candidates[0].y, side: candidates[0].side };
+}
+
 export function getRelPoints(rel: ModelRelationship, elements: ModelElement[]): RelPath | null {
   const src = elements.find(e => e.id === rel.sourceId);
   const tgt = elements.find(e => e.id === rel.targetId);
@@ -57,37 +133,25 @@ export function getRelPoints(rel: ModelRelationship, elements: ModelElement[]): 
 
   const sc = { x: src.x + src.w / 2, y: src.y + src.h / 2 };
   const tc = { x: tgt.x + tgt.w / 2, y: tgt.y + tgt.h / 2 };
-  const dx = tc.x - sc.x, dy = tc.y - sc.y;
+  const waypoints = (rel.waypoints || []).map(wp => ({ x: wp.x, y: wp.y }));
 
   let sA: Anchor, tA: Anchor;
 
-  // Prefer straight (axis-aligned) connections when elements are roughly aligned
-  if (Math.abs(dx) < STRAIGHT_THRESH && Math.abs(dy) > STRAIGHT_THRESH) {
-    // Vertically aligned — use top/bottom center anchors
-    const cx = (sc.x + tc.x) / 2;
-    if (dy > 0) {
-      sA = { x: cx, y: src.y + src.h, side: 'bc' };
-      tA = { x: cx, y: tgt.y, side: 'tc' };
-    } else {
-      sA = { x: cx, y: src.y, side: 'tc' };
-      tA = { x: cx, y: tgt.y + tgt.h, side: 'bc' };
-    }
-  } else if (Math.abs(dy) < STRAIGHT_THRESH && Math.abs(dx) > STRAIGHT_THRESH) {
-    // Horizontally aligned — use left/right center anchors
-    const cy = (sc.y + tc.y) / 2;
-    if (dx > 0) {
-      sA = { x: src.x + src.w, y: cy, side: 'mr' };
-      tA = { x: tgt.x, y: cy, side: 'ml' };
-    } else {
-      sA = { x: src.x, y: cy, side: 'ml' };
-      tA = { x: tgt.x + tgt.w, y: cy, side: 'mr' };
-    }
+  if (rel.sourceAnchor) {
+    // Manual anchor — snap to nearest edge point
+    sA = snapToEdge(src, rel.sourceAnchor);
   } else {
-    sA = nearestAnchor(src, tc.x, tc.y);
-    tA = nearestAnchor(tgt, sc.x, sc.y);
+    const srcTarget = waypoints.length > 0 ? waypoints[0] : tc;
+    sA = rectEdgeIntersect(src, srcTarget);
   }
 
-  const waypoints = (rel.waypoints || []).map(wp => ({ x: wp.x, y: wp.y }));
+  if (rel.targetAnchor) {
+    tA = snapToEdge(tgt, rel.targetAnchor);
+  } else {
+    const tgtTarget = waypoints.length > 0 ? waypoints[waypoints.length - 1] : sc;
+    tA = rectEdgeIntersect(tgt, tgtTarget);
+  }
+
   return { start: sA, end: tA, waypoints };
 }
 
@@ -179,6 +243,15 @@ export function hitTestAnchor(elements: ModelElement[], wx: number, wy: number, 
       if (Math.hypot(a.x - wx, a.y - wy) < 8) return { elId: el.id, side: a.side };
     }
   }
+  return null;
+}
+
+/** Hit test start/end endpoint of a relationship. Only checks the given rel (should be the selected one). */
+export function hitTestEndpoint(rel: ModelRelationship, elements: ModelElement[], wx: number, wy: number): 'source' | 'target' | null {
+  const pts = getRelPoints(rel, elements);
+  if (!pts) return null;
+  if (Math.hypot(pts.start.x - wx, pts.start.y - wy) < 10) return 'source';
+  if (Math.hypot(pts.end.x - wx, pts.end.y - wy) < 10) return 'target';
   return null;
 }
 

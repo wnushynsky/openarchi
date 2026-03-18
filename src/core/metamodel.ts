@@ -426,13 +426,13 @@ export const ICONS: Record<string, IconDrawFn> = {
     c.lineTo(x + w / 2, y);
   },
   valueStream: (c, x, y, s) => {
-    const w = s * 1.6, h = s * 1.0, notch = s * 0.3;
-    c.moveTo(x - w / 2 + notch, y - h / 2);
-    c.lineTo(x + w / 2 - notch, y - h / 2);
+    // Right-pointing chevron (flat left, arrow right) matching Archi
+    const w = s * 1.8, h = s * 1.2, arrow = s * 0.4;
+    c.moveTo(x - w / 2, y - h / 2);
+    c.lineTo(x + w / 2 - arrow, y - h / 2);
     c.lineTo(x + w / 2, y);
-    c.lineTo(x + w / 2 - notch, y + h / 2);
-    c.lineTo(x - w / 2 + notch, y + h / 2);
-    c.lineTo(x - w / 2, y);
+    c.lineTo(x + w / 2 - arrow, y + h / 2);
+    c.lineTo(x - w / 2, y + h / 2);
     c.closePath();
   },
   courseOfAction: (c, x, y, s) => {

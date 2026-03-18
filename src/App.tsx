@@ -1,7 +1,7 @@
 import { useState, useRef, useCallback, useEffect, useMemo } from 'react';
 import type {
   ModelElement, ModelRelationship, ModelView,
-  Camera, DragState, PanState, DrawingRelState, DragWPState, DragLabelState,
+  Camera, DragState, PanState, DrawingRelState, DragWPState, DragEndpointState, DragLabelState,
   RelPickerState, CtxMenuState, GridType, LeftPanel, SelectionType, ResizeState,
 } from './types';
 import type { CanonicalModelDocument } from './model/canonical';
@@ -9,12 +9,12 @@ import {
   LAYERS, ELEMENT_TYPES, RELATIONSHIP_TYPES, FONT,
   snap, uid, GRID,
   nearestAnchor, getRelPoints, nearestTOnPath,
-  hitTestElement, hitTestAnchor, hitTestWaypoint, hitTestRelationship, hitTestLabel, hitTestPopout,
+  hitTestElement, hitTestAnchor, hitTestWaypoint, hitTestEndpoint, hitTestRelationship, hitTestLabel, hitTestPopout,
   hitTestResizeHandle, HANDLE_CURSORS,
   SAMPLE_ELEMENTS, SAMPLE_RELATIONSHIPS, SAMPLE_VIEWS,
   snapToElements, snapResizeToElements, type SnapGuide,
 } from './core';
-import { drawDotGrid, drawLineGrid, drawElement, drawRelationship, drawSnapGuides } from './canvas';
+import { drawDotGrid, drawLineGrid, drawElement, drawRelationship, drawSnapGuides, getRelSegments, type RelSegments } from './canvas';
 import { RelPicker, CtxMenu, SearchPanel, ViewNav, PropertyPanel, Btn, CanvasIcon } from './components';
 import {
   detectModelFormatByFileName,
@@ -23,10 +23,7 @@ import {
   listModelFormats,
 } from './model/service';
 import {
-  isFileSystemAccessSupported,
   openDirectory,
-  readFileHandle,
-  writeFileHandle,
   type DirectoryState,
   type OpenFileEntry,
 } from './io/filesystem';
@@ -139,6 +136,7 @@ export default function App() {
   const [hovRelId, setHovRelId] = useState<string | null>(null);
   const [drawingRel, setDrawingRel] = useState<DrawingRelState | null>(null);
   const [dragWP, setDragWP] = useState<DragWPState | null>(null);
+  const [dragEndpoint, setDragEndpoint] = useState<DragEndpointState | null>(null);
   const [dragLabel, setDragLabel] = useState<DragLabelState | null>(null);
   const [resizing, setResizing] = useState<ResizeState | null>(null);
   const [relPicker, setRelPicker] = useState<RelPickerState | null>(null);
@@ -146,6 +144,7 @@ export default function App() {
   const [showSearch, setShowSearch] = useState(false);
   const [ioFormatId, setIoFormatId] = useState<string>('auto');
   const [leftPanel, setLeftPanel] = useState<LeftPanel>('palette');
+  const [leftPanelWidth, setLeftPanelWidth] = useState(244);
   const [propSide, setPropSide] = useState<'left' | 'right'>('left');
   const [openTabIds, setOpenTabIds] = useState<string[]>(['v1']);
   const [editingElId, setEditingElId] = useState<string | null>(null);
@@ -155,7 +154,7 @@ export default function App() {
 
   // Filesystem state
   const [dirState, setDirState] = useState<DirectoryState | null>(null);
-  const [activeFileHandle, setActiveFileHandle] = useState<FileSystemFileHandle | null>(null);
+  const [activeFileEntry, setActiveFileEntry] = useState<OpenFileEntry | null>(null);
   const [activeFormatId, setActiveFormatId] = useState<string | null>(null);
   const [isDirty, setIsDirty] = useState(false);
 
@@ -434,18 +433,31 @@ export default function App() {
       }
     }
 
+    // Sort elements by z-order for rendering
+    const sortedElements = [...visibleElements].sort((a, b) => (a.zIndex ?? 0) - (b.zIndex ?? 0));
+
     // 1. Composite elements (background)
-    visibleElements.filter(e => getLayer(e.type) === 'composite' && !isNote(e.type)).forEach(el => {
+    sortedElements.filter(e => getLayer(e.type) === 'composite' && !isNote(e.type)).forEach(el => {
       drawElement(ctx, el, selType === 'element' && selectedId === el.id, hovElId === el.id, (selType === 'element' && selectedId === el.id) || hovElId === el.id, parentIds.has(el.id));
     });
 
     // 2. Non-composite elements + notes
-    visibleElements.filter(e => getLayer(e.type) !== 'composite' || isNote(e.type)).forEach(el => {
+    sortedElements.filter(e => getLayer(e.type) !== 'composite' || isNote(e.type)).forEach(el => {
       drawElement(ctx, el, selType === 'element' && selectedId === el.id, hovElId === el.id, (selType === 'element' && selectedId === el.id) || hovElId === el.id, parentIds.has(el.id));
     });
 
-    // 3. Relationships (always on top of elements)
-    visibleRelationships.forEach(r => drawRelationship(ctx, r, visibleElements, selType === 'relationship' && selectedId === r.id, hovRelId === r.id));
+    // 3. Relationships (always on top of elements) — with crossing hops
+    const allRelSegs: RelSegments[] = visibleRelationships
+      .map(r => getRelSegments(r, visibleElements))
+      .filter((s): s is RelSegments => s !== null);
+
+    visibleRelationships.forEach(r => {
+      // Collect segments from OTHER relationships for crossing detection
+      const otherSegs = allRelSegs
+        .filter(s => s.relId !== r.id)
+        .flatMap(s => s.segments);
+      drawRelationship(ctx, r, visibleElements, selType === 'relationship' && selectedId === r.id, hovRelId === r.id, otherSegs);
+    });
 
     // 4. Snap guide lines
     if (snapGuides.length > 0) {
@@ -498,6 +510,15 @@ export default function App() {
 
     const anch = hitTestAnchor(visibleElements, wx, wy, getLayer, isNote);
     if (anch) { setDrawingRel({ sourceId: anch.elId, mx: wx, my: wy, waypoints: [] }); return; }
+
+    // Endpoint dragging — only when a relationship is selected
+    if (selType === 'relationship' && selectedId) {
+      const selRel = visibleRelationships.find(r => r.id === selectedId);
+      if (selRel) {
+        const ep = hitTestEndpoint(selRel, visibleElements, wx, wy);
+        if (ep) { pushHistory(); setDragEndpoint({ relId: selRel.id, endpoint: ep }); return; }
+      }
+    }
 
     const wp = hitTestWaypoint(visibleRelationships, wx, wy);
     if (wp) { pushHistory(); setDragWP({ ...wp, startX: wx, startY: wy }); return; }
@@ -559,6 +580,11 @@ export default function App() {
       setRelationships(prev => prev.map(r => r.id === dragWP.relId ? { ...r, waypoints: r.waypoints.map((w, i) => i === dragWP.wpIdx ? { x: snap(wx), y: snap(wy) } : w) } : r));
       return;
     }
+    if (dragEndpoint) {
+      const key = dragEndpoint.endpoint === 'source' ? 'sourceAnchor' : 'targetAnchor';
+      setRelationships(prev => prev.map(r => r.id === dragEndpoint.relId ? { ...r, [key]: { x: snap(wx), y: snap(wy) } } : r));
+      return;
+    }
     if (dragLabel) {
       const rel = visibleRelationships.find(r => r.id === dragLabel.relId);
       if (rel) {
@@ -603,7 +629,7 @@ export default function App() {
       } else setHovRelId(null);
       canvasRef.current!.style.cursor = 'default';
     }
-  }, [s2w, dragging, panning, visibleElements, visibleRelationships, drawingRel, dragWP, dragLabel, resizing, selType, selectedId]);
+  }, [s2w, dragging, panning, visibleElements, visibleRelationships, drawingRel, dragWP, dragEndpoint, dragLabel, resizing, selType, selectedId]);
 
   const handleMouseUp = useCallback((e: React.MouseEvent) => {
     if (drawingRel) {
@@ -616,7 +642,7 @@ export default function App() {
       }
       setDrawingRel(null); return;
     }
-    setDragging(null); setPanning(null); setDragWP(null); setDragLabel(null); setResizing(null);
+    setDragging(null); setPanning(null); setDragWP(null); setDragEndpoint(null); setDragLabel(null); setResizing(null);
     setSnapGuides([]);
   }, [drawingRel, s2w, visibleElements]);
 
@@ -693,6 +719,23 @@ export default function App() {
         { label: 'Change type', children: changeTypeChildren },
         { label: '', separator: true },
         {
+          label: 'Bring to front',
+          action: () => {
+            pushHistory();
+            const maxZ = Math.max(0, ...elements.map(e => e.zIndex ?? 0));
+            setElements(prev => prev.map(e => e.id === el.id ? { ...e, zIndex: maxZ + 1 } : e));
+          },
+        },
+        {
+          label: 'Send to back',
+          action: () => {
+            pushHistory();
+            const minZ = Math.min(0, ...elements.map(e => e.zIndex ?? 0));
+            setElements(prev => prev.map(e => e.id === el.id ? { ...e, zIndex: minZ - 1 } : e));
+          },
+        },
+        { label: '', separator: true },
+        {
           label: 'Delete',
           action: () => {
             pushHistory();
@@ -720,6 +763,7 @@ export default function App() {
           { label: 'Add waypoint here', action: () => { pushHistory(); setRelationships(prev => prev.map(r => { if (r.id !== rh.rel.id) return r; const wps = [...(r.waypoints || [])]; wps.splice(rh.segIdx, 0, { x: snap(wx), y: snap(wy) }); return { ...r, waypoints: wps }; })); } },
           { label: 'Edit label', action: () => { pushHistory(); const name = prompt('Label:', rh.rel.name || ''); if (name !== null) setRelationships(prev => prev.map(r => r.id === rh.rel.id ? { ...r, name } : r)); } },
           ...(rh.rel.waypoints?.length > 0 ? [{ label: 'Remove all waypoints', action: () => { pushHistory(); setRelationships(prev => prev.map(r => r.id === rh.rel.id ? { ...r, waypoints: [] } : r)); } }] : []),
+          ...((rh.rel.sourceAnchor || rh.rel.targetAnchor) ? [{ label: 'Reset endpoints to auto', action: () => { pushHistory(); setRelationships(prev => prev.map(r => r.id === rh.rel.id ? { ...r, sourceAnchor: undefined, targetAnchor: undefined } : r)); } }] : []),
           { label: 'Delete relationship', action: () => { pushHistory(); setRelationships(prev => prev.filter(r => r.id !== rh.rel.id)); if (selectedId === rh.rel.id) { setSelectedId(null); setSelType(null); } } },
         ],
       });
@@ -864,7 +908,7 @@ export default function App() {
 
   const loadFileEntry = useCallback(async (entry: OpenFileEntry) => {
     try {
-      const content = await readFileHandle(entry.handle);
+      const content = await entry.readText();
       const detectedFormat = detectModelFormatByFileName(entry.name);
       const formatId = detectedFormat?.id;
       if (!formatId) { alert(`Unsupported format: ${entry.name}`); return; }
@@ -893,7 +937,7 @@ export default function App() {
       }
       setSelectedId(null); setSelType(null);
 
-      setActiveFileHandle(entry.handle);
+      setActiveFileEntry(entry);
       setActiveFormatId(formatId);
       setIsDirty(false);
     } catch (err) {
@@ -902,10 +946,6 @@ export default function App() {
   }, [applyViewLayout]);
 
   const handleOpenDirectory = useCallback(async () => {
-    if (!isFileSystemAccessSupported()) {
-      alert('Your browser does not support the File System Access API. Use Chrome or Edge.');
-      return;
-    }
     try {
       const state = await openDirectory();
       setDirState(state);
@@ -921,7 +961,7 @@ export default function App() {
   }, [loadFileEntry]);
 
   const handleSave = useCallback(async () => {
-    if (!activeFileHandle || !activeFormatId) {
+    if (!activeFileEntry || !activeFormatId) {
       // Fallback to download export
       exportModel();
       return;
@@ -933,20 +973,32 @@ export default function App() {
       alert(firstError?.message || 'Save failed');
       return;
     }
-    try {
-      await writeFileHandle(activeFileHandle, result.content);
+    if (activeFileEntry.writeText) {
+      try {
+        await activeFileEntry.writeText(result.content);
+        setIsDirty(false);
+      } catch (err) {
+        alert(`Save failed: ${err}`);
+      }
+    } else {
+      // No write access (fallback browser) – download instead
+      const blob = new Blob([result.content], { type: result.mimeType });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = activeFileEntry.name;
+      a.click();
+      URL.revokeObjectURL(url);
       setIsDirty(false);
-    } catch (err) {
-      alert(`Save failed: ${err}`);
     }
-  }, [activeFileHandle, activeFormatId, elements, relationships, views, exportModel]);
+  }, [activeFileEntry, activeFormatId, elements, relationships, views, exportModel]);
 
   // Mark dirty on model changes (skip initial render)
   const isInitialRender = useRef(true);
   useEffect(() => {
     if (isInitialRender.current) { isInitialRender.current = false; return; }
-    if (activeFileHandle) setIsDirty(true);
-  }, [elements, relationships, views, activeFileHandle]);
+    if (activeFileEntry) setIsDirty(true);
+  }, [elements, relationships, views, activeFileEntry]);
 
   // Keyboard
   useEffect(() => {
@@ -1042,9 +1094,9 @@ export default function App() {
         <div style={{ display: 'flex', alignItems: 'center', gap: 7 }}>
           <div style={{ width: 24, height: 24, background: '#2a2a2a', borderRadius: 5, display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 10, fontWeight: 600, color: '#fff', letterSpacing: '-0.3px' }}>OA</div>
           <span style={{ fontWeight: 600, fontSize: 14, color: '#2a2a2a', letterSpacing: '-0.01em' }}>OpenArchi</span>
-          {activeFileHandle && (
+          {activeFileEntry && (
             <span style={{ fontSize: 12, color: '#999', marginLeft: 2 }}>
-              — {activeFileHandle.name}{isDirty ? ' *' : ''}
+              — {dirState ? `${dirState.directoryName}/` : ''}{activeFileEntry.relativePath}{isDirty ? ' *' : ''}
             </span>
           )}
         </div>
@@ -1060,20 +1112,20 @@ export default function App() {
         <Btn onClick={handleOpenDirectory}>Open Dir</Btn>
         {dirState && dirState.files.length > 1 && (
           <select
-            value={activeFileHandle?.name || ''}
+            value={activeFileEntry?.relativePath || ''}
             onChange={e => {
-              const entry = dirState.files.find(f => f.name === e.target.value);
+              const entry = dirState.files.find(f => f.relativePath === e.target.value);
               if (entry) loadFileEntry(entry);
             }}
-            style={{ padding: '4px 8px', borderRadius: 5, border: '1px solid rgba(0,0,0,0.08)', background: '#fff', fontFamily: 'inherit', fontSize: 12, color: '#555' }}
+            style={{ padding: '4px 8px', borderRadius: 5, border: '1px solid rgba(0,0,0,0.08)', background: '#fff', fontFamily: 'inherit', fontSize: 12, color: '#555', maxWidth: 280 }}
             title="Files in directory"
           >
             {dirState.files.map(f => (
-              <option key={f.name} value={f.name}>{f.name}</option>
+              <option key={f.relativePath} value={f.relativePath}>{f.relativePath}</option>
             ))}
           </select>
         )}
-        {activeFileHandle && (
+        {activeFileEntry && (
           <Btn onClick={handleSave}>
             {isDirty ? 'Save *' : 'Save'}
           </Btn>
@@ -1113,12 +1165,34 @@ export default function App() {
       <div style={{ flex: 1, position: 'relative', overflow: 'hidden' }}>
         {/* Left panel island */}
         <div style={{
-          position: 'absolute', left: 8, top: 8, bottom: 8, width: 244, zIndex: 10,
+          position: 'absolute', left: 8, top: 8, bottom: 8, width: leftPanelWidth, zIndex: 10,
           background: 'var(--surface, rgba(255,255,255,0.96))',
           borderRadius: 12, border: '1px solid var(--border, rgba(0,0,0,0.07))',
           boxShadow: 'var(--shadow-md, 0 4px 20px rgba(0,0,0,0.06))',
           display: 'flex', flexDirection: 'column', overflow: 'hidden',
         }}>
+          {/* Resize handle */}
+          <div
+            style={{
+              position: 'absolute', right: -3, top: 0, bottom: 0, width: 6,
+              cursor: 'col-resize', zIndex: 20,
+            }}
+            onMouseDown={e => {
+              e.preventDefault();
+              const startX = e.clientX;
+              const startWidth = leftPanelWidth;
+              const onMove = (ev: MouseEvent) => {
+                const newWidth = Math.min(600, Math.max(180, startWidth + ev.clientX - startX));
+                setLeftPanelWidth(newWidth);
+              };
+              const onUp = () => {
+                window.removeEventListener('mousemove', onMove);
+                window.removeEventListener('mouseup', onUp);
+              };
+              window.addEventListener('mousemove', onMove);
+              window.addEventListener('mouseup', onUp);
+            }}
+          />
           {leftPanel === 'palette' ? (
             <div style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
               <div style={{ padding: '14px 14px 7px', fontSize: 11, fontWeight: 500, color: '#a0a0a0', textTransform: 'uppercase', letterSpacing: '0.5px' }}>Layers</div>
@@ -1236,7 +1310,7 @@ export default function App() {
               onMouseUp={handleMouseUp}
               onDoubleClick={handleDblClick}
               onContextMenu={handleContextMenu}
-              onMouseLeave={() => { setDragging(null); setPanning(null); setDragWP(null); setDragLabel(null); setResizing(null); setHovElId(null); setHovRelId(null); setSnapGuides([]); }}
+              onMouseLeave={() => { setDragging(null); setPanning(null); setDragWP(null); setDragEndpoint(null); setDragLabel(null); setResizing(null); setHovElId(null); setHovRelId(null); setSnapGuides([]); }}
               onWheel={handleWheel}
             />
 
@@ -1371,46 +1445,86 @@ export default function App() {
                 const activeElTypes = Object.entries(ELEMENT_TYPES).filter(([k]) => usedElTypes.has(k));
                 const activeRelTypes = Object.entries(RELATIONSHIP_TYPES).filter(([k]) => usedRelTypes.has(k));
 
+                const relLineW = 44;
+                const relLineH = 16;
+
+                const renderRelSvg = (rd: { dash: boolean; head: string }) => {
+                  const y = relLineH / 2;
+                  const x1 = 2, x2 = relLineW - 2;
+                  const col = '#777';
+                  const aL = 7;
+                  const aS = 0.5;
+
+                  const linePath = `M${x1},${y} L${x2},${y}`;
+                  const dashArray = rd.dash ? '4,2.5' : undefined;
+
+                  let headMarkup = null;
+                  if (rd.head === 'filled_arrow') {
+                    const hw = aL * Math.sin(aS);
+                    headMarkup = <polygon points={`${x2},${y} ${x2 - aL},${y - hw} ${x2 - aL},${y + hw}`} fill={col} />;
+                  } else if (rd.head === 'open_arrow') {
+                    const hw = aL * Math.sin(aS);
+                    headMarkup = <polyline points={`${x2 - aL},${y - hw} ${x2},${y} ${x2 - aL},${y + hw}`} fill="none" stroke={col} strokeWidth="1.3" strokeLinejoin="round" />;
+                  } else if (rd.head === 'hollow_arrow') {
+                    const hw = aL * Math.sin(aS);
+                    headMarkup = <polygon points={`${x2},${y} ${x2 - aL},${y - hw} ${x2 - aL},${y + hw}`} fill="#fff" stroke={col} strokeWidth="1.1" />;
+                  } else if (rd.head === 'diamond_filled' || rd.head === 'diamond') {
+                    const dL = 8, dW = 3.5;
+                    headMarkup = <polygon points={`${x1},${y} ${x1 + dL / 2},${y - dW} ${x1 + dL},${y} ${x1 + dL / 2},${y + dW}`} fill={rd.head === 'diamond_filled' ? col : '#fff'} stroke={col} strokeWidth="0.9" />;
+                  } else if (rd.head === 'filled_dot') {
+                    headMarkup = <circle cx={x1 + 4} cy={y} r={3} fill={col} />;
+                  }
+
+                  return (
+                    <svg width={relLineW} height={relLineH} style={{ flexShrink: 0 }}>
+                      <path d={linePath} stroke={col} strokeWidth="1.1" fill="none" strokeDasharray={dashArray} />
+                      {headMarkup}
+                    </svg>
+                  );
+                };
+
                 return (
                   <div style={{
                     position: 'absolute', bottom: 28, right: 0,
-                    background: '#fff', border: '1px solid var(--border, rgba(0,0,0,0.07))', borderRadius: 8,
-                    boxShadow: 'var(--shadow-md, 0 4px 20px rgba(0,0,0,0.06))', padding: '8px 12px',
-                    width: 210, fontSize: 11, fontFamily: FONT, maxHeight: 340, overflow: 'auto',
+                    background: '#fff', border: '1px solid var(--border, rgba(0,0,0,0.07))', borderRadius: 10,
+                    boxShadow: 'var(--shadow-md, 0 4px 20px rgba(0,0,0,0.06))', padding: '12px 16px',
+                    width: 300, fontSize: 12, fontFamily: FONT, maxHeight: 440, overflow: 'auto',
                   }}>
                     {activeElTypes.length > 0 && (
                       <>
-                        <div style={{ fontSize: 10, fontWeight: 500, color: '#a0a0a0', textTransform: 'uppercase', marginBottom: 6, letterSpacing: '0.4px' }}>Elements</div>
-                        {activeElTypes.map(([k, def]) => {
-                          const L = LAYERS[def.layer];
-                          return (
-                            <div key={k} style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 4 }}>
-                              <CanvasIcon type={k} size={14} color={L?.accent || '#888'} />
-                              <span style={{ color: '#555', fontSize: 11 }}>{def.label}</span>
-                            </div>
-                          );
-                        })}
+                        <div style={{ fontSize: 10, fontWeight: 600, color: '#a0a0a0', textTransform: 'uppercase', marginBottom: 8, letterSpacing: '0.5px' }}>Elements</div>
+                        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '4px 12px' }}>
+                          {activeElTypes.map(([k, def]) => {
+                            const L = LAYERS[def.layer];
+                            return (
+                              <div key={k} style={{ display: 'flex', alignItems: 'center', gap: 7, padding: '2px 0' }}>
+                                <CanvasIcon type={k} size={16} color={L?.accent || '#888'} />
+                                <span style={{ color: '#444', fontSize: 12 }}>{def.label}</span>
+                              </div>
+                            );
+                          })}
+                        </div>
                       </>
                     )}
                     {activeElTypes.length > 0 && activeRelTypes.length > 0 && (
-                      <div style={{ height: 1, background: 'rgba(0,0,0,0.05)', margin: '6px 0' }} />
+                      <div style={{ height: 1, background: 'rgba(0,0,0,0.06)', margin: '10px 0' }} />
                     )}
                     {activeRelTypes.length > 0 && (
                       <>
-                        <div style={{ fontSize: 10, fontWeight: 500, color: '#a0a0a0', textTransform: 'uppercase', marginBottom: 6, letterSpacing: '0.4px' }}>Relationships</div>
+                        <div style={{ fontSize: 10, fontWeight: 600, color: '#a0a0a0', textTransform: 'uppercase', marginBottom: 8, letterSpacing: '0.5px' }}>Relationships</div>
                         {activeRelTypes.map(([, rd]) => (
-                          <div key={rd.label} style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 3 }}>
-                            <span style={{ width: 20, color: '#999', fontSize: 10, textAlign: 'center', flexShrink: 0, fontFamily: 'monospace' }}>
-                              {rd.dash ? '\u2504\u25B8' : '\u2500\u25B8'}
-                            </span>
-                            <span style={{ color: '#555' }}>{rd.label}</span>
-                            <span style={{ marginLeft: 'auto', color: '#bbb', fontSize: 10 }}>{rd.desc}</span>
+                          <div key={rd.label} style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 2 }}>
+                            {renderRelSvg(rd)}
+                            <div style={{ display: 'flex', flexDirection: 'column' }}>
+                              <span style={{ color: '#444', fontSize: 12, fontWeight: 500 }}>{rd.label}</span>
+                              <span style={{ color: '#aaa', fontSize: 10 }}>{rd.desc}</span>
+                            </div>
                           </div>
                         ))}
                       </>
                     )}
                     {activeElTypes.length === 0 && activeRelTypes.length === 0 && (
-                      <div style={{ color: '#bbb', fontSize: 11, padding: '4px 0' }}>No elements or relationships yet.</div>
+                      <div style={{ color: '#bbb', fontSize: 12, padding: '4px 0' }}>No elements or relationships yet.</div>
                     )}
                   </div>
                 );

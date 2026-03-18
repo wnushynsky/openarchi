@@ -372,13 +372,25 @@ function parseCoArchiXml(raw: string): ParseResult {
     };
   }
 
+  return finalizeCoArchiModel(semanticElements, semanticRelationships, views, viewNodes, viewConnections, diagnostics);
+}
+
+/** Finalize a coArchi model with fallback view/layout generation */
+function finalizeCoArchiModel(
+  elements: CanonicalElement[],
+  relationships: CanonicalRelationship[],
+  views: CanonicalView[],
+  viewNodes: CanonicalViewNode[],
+  viewConnections: CanonicalViewConnection[],
+  diagnostics: ModelDiagnostic[],
+): ParseResult {
   if (views.length === 0) {
     views.push({ id: 'v1', name: 'Imported View', childViewIds: [] });
   }
 
   if (viewNodes.length === 0) {
     const defaultViewId = views[0].id;
-    semanticElements.forEach((element, index) => {
+    elements.forEach((element, index) => {
       viewNodes.push({
         id: `${defaultViewId}::${element.id}`,
         viewId: defaultViewId,
@@ -399,8 +411,8 @@ function parseCoArchiXml(raw: string): ParseResult {
 
   const model: CanonicalModelDocument = {
     version: 'openarchi-0.1',
-    elements: semanticElements,
-    relationships: semanticRelationships,
+    elements,
+    relationships,
     views,
     viewNodes,
     viewConnections,
@@ -410,6 +422,171 @@ function parseCoArchiXml(raw: string): ParseResult {
   };
 
   return { model, diagnostics };
+}
+
+/**
+ * Parse a fragmented coArchi directory where each element/relationship/view
+ * is stored as an individual XML file (e.g. model/business/*.xml, model/relations/*.xml).
+ */
+export function parseCoArchiFragments(xmlContents: string[]): ParseResult {
+  if (typeof DOMParser === 'undefined') {
+    return {
+      diagnostics: [{
+        severity: 'error',
+        code: 'XML_PARSER_UNAVAILABLE',
+        message: 'XML parser is not available in this runtime.',
+      }],
+    };
+  }
+
+  const diagnostics: ModelDiagnostic[] = [];
+  const allElements: CanonicalElement[] = [];
+  const allRelationships: CanonicalRelationship[] = [];
+  const allViews: CanonicalView[] = [];
+  const allViewNodes: CanonicalViewNode[] = [];
+  const allViewConnections: CanonicalViewConnection[] = [];
+
+  const elementIds = new Set<string>();
+  const relationshipIds = new Set<string>();
+  const viewIds = new Set<string>();
+  const viewNodeKeys = new Set<string>();
+  const viewConnectionKeys = new Set<string>();
+
+  for (const raw of xmlContents) {
+    const doc = new DOMParser().parseFromString(raw, 'application/xml');
+    if (doc.querySelector('parsererror')) continue;
+
+    const allNodes = Array.from(doc.querySelectorAll('*'));
+
+    // Extract elements and relationships
+    for (const node of allNodes) {
+      const id = getAttr(node, ['identifier', 'id']);
+      if (!id) continue;
+
+      const tag = localName(node).toLowerCase();
+      const rawType = getAttr(node, ['xsi:type', 'type']);
+      const typeName = extractTypeName(rawType).toLowerCase();
+
+      const isRelationshipByTag = tag === 'relationship';
+      const isRelationshipByType = typeName.endsWith('relationship');
+
+      if (isRelationshipByTag || isRelationshipByType) {
+        if (relationshipIds.has(id)) continue;
+
+        const sourceId = getAttr(node, ['source', 'sourceRef']);
+        const targetId = getAttr(node, ['target', 'targetRef']);
+        if (!sourceId || !targetId) continue;
+
+        const mappedType = mapRelationshipType(rawType);
+        if (!mappedType) {
+          diagnostics.push({
+            severity: 'warning',
+            code: 'COARCHI_RELATIONSHIP_TYPE_FALLBACK',
+            message: `Relationship '${id}' uses unknown type '${rawType || 'unknown'}'; mapped to association.`,
+            path: id,
+          });
+        }
+
+        allRelationships.push({
+          id,
+          type: mappedType || 'association',
+          sourceId,
+          targetId,
+          name: getName(node),
+        });
+        relationshipIds.add(id);
+        continue;
+      }
+
+      // Check if it's a view/diagram
+      if (tag === 'view' || /diagrammodel/i.test(typeName)) {
+        if (viewIds.has(id)) continue;
+
+        allViews.push({
+          id,
+          name: getName(node) || id,
+          childViewIds: [],
+        });
+        viewIds.add(id);
+
+        // Extract view nodes and connections from this view
+        let fallbackIndex = 0;
+        const descendants = Array.from(node.querySelectorAll('*'));
+        for (const child of descendants) {
+          const elementId = getAttr(child, ['archimateElement', 'elementRef', 'modelElement', 'conceptRef']);
+          if (elementId) {
+            const key = `${id}::${elementId}`;
+            if (!viewNodeKeys.has(key)) {
+              const bounds = parseBounds(child);
+              allViewNodes.push({
+                id: getAttr(child, ['identifier', 'id']) || key,
+                viewId: id,
+                elementId,
+                x: bounds?.x ?? 140 + (fallbackIndex % 10) * 180,
+                y: bounds?.y ?? 100 + Math.floor(fallbackIndex / 10) * 120,
+                width: bounds?.width ?? 160,
+                height: bounds?.height ?? 72,
+              });
+              viewNodeKeys.add(key);
+              fallbackIndex += 1;
+            }
+          }
+
+          const relId = getAttr(child, ['archimateRelationship', 'relationshipRef', 'relationship']);
+          if (relId) {
+            const key = `${id}::${relId}`;
+            if (!viewConnectionKeys.has(key)) {
+              const rawBendpoints = parseRawBendpoints(child);
+              const rel = allRelationships.find(r => r.id === relId);
+              let sourceCenter: { x: number; y: number } | null = null;
+              let targetCenter: { x: number; y: number } | null = null;
+              if (rel) {
+                const srcNode = allViewNodes.find(vn => vn.viewId === id && vn.elementId === rel.sourceId);
+                const tgtNode = allViewNodes.find(vn => vn.viewId === id && vn.elementId === rel.targetId);
+                if (srcNode) sourceCenter = { x: srcNode.x + srcNode.width / 2, y: srcNode.y + srcNode.height / 2 };
+                if (tgtNode) targetCenter = { x: tgtNode.x + tgtNode.width / 2, y: tgtNode.y + tgtNode.height / 2 };
+              }
+
+              allViewConnections.push({
+                id: getAttr(child, ['identifier', 'id']) || key,
+                viewId: id,
+                relationshipId: relId,
+                waypoints: resolveBendpoints(rawBendpoints, sourceCenter, targetCenter),
+                labelPosition: asNumber(getAttr(child, ['labelPos', 'labelPosition'])) ?? 0.5,
+              });
+              viewConnectionKeys.add(key);
+            }
+          }
+        }
+        continue;
+      }
+
+      // Regular element
+      const mappedType = mapElementType(rawType);
+      if (!mappedType) continue;
+      if (elementIds.has(id)) continue;
+
+      allElements.push({
+        id,
+        type: mappedType,
+        name: getName(node) || id,
+        documentation: getDocumentation(node),
+      });
+      elementIds.add(id);
+    }
+  }
+
+  if (allElements.length === 0) {
+    return {
+      diagnostics: [{
+        severity: 'error',
+        code: 'COARCHI_NO_ELEMENTS_FOUND',
+        message: 'No ArchiMate elements were found in the directory.',
+      }],
+    };
+  }
+
+  return finalizeCoArchiModel(allElements, allRelationships, allViews, allViewNodes, allViewConnections, diagnostics);
 }
 
 function serializeCoArchiXml(): SerializeResult {

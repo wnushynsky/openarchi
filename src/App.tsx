@@ -20,6 +20,8 @@ import {
   detectModelFormatByFileName,
   exportEditorModelToText,
   importEditorModelFromText,
+  importFragmentedModel,
+  isFragmentedModelDirectory,
   listModelFormats,
 } from './model/service';
 import {
@@ -995,10 +997,49 @@ export default function App() {
     }
   }, [applyViewLayout]);
 
+  const loadFragmentedModel = useCallback(async (files: OpenFileEntry[]) => {
+    try {
+      const result = await importFragmentedModel(files);
+      if (!result.model) {
+        const firstError = result.diagnostics.find(d => d.severity === 'error');
+        alert(firstError?.message || 'Failed to import fragmented model');
+        return;
+      }
+      if (result.diagnostics.length > 0) console.warn('Import diagnostics', result.diagnostics);
+
+      const importedLayouts = result.document
+        ? buildLayoutsFromCanonicalDocument(result.document)
+        : buildLayoutsFromEditorModel(result.model.elements, result.model.relationships, result.model.views);
+      elementLayoutsByViewRef.current = importedLayouts.elementLayouts;
+      relationshipLayoutsByViewRef.current = importedLayouts.relationshipLayouts;
+
+      setElements(result.model.elements);
+      setRelationships(result.model.relationships);
+      setViews(result.model.views);
+      if (result.model.views.length > 0) {
+        setCurrentViewId(result.model.views[0].id);
+        setOpenTabIds([result.model.views[0].id]);
+        applyViewLayout(result.model.views[0].id);
+      }
+      setSelectedId(null); setSelType(null);
+      setActiveFormatId('coarchi-xml');
+      setIsDirty(false);
+    } catch (err) {
+      alert(`Failed to import fragmented model: ${err}`);
+    }
+  }, [applyViewLayout]);
+
   const handleOpenDirectory = useCallback(async () => {
     try {
       const state = await openDirectory();
       setDirState(state);
+
+      // Detect fragmented coArchi directory (individual XML files per element)
+      if (isFragmentedModelDirectory(state.files)) {
+        await loadFragmentedModel(state.files);
+        return;
+      }
+
       // Auto-open the first archimate/xml/json file
       if (state.files.length > 0) {
         await loadFileEntry(state.files[0]);
@@ -1008,7 +1049,7 @@ export default function App() {
       if (err instanceof DOMException && err.name === 'AbortError') return;
       alert(`Failed to open directory: ${err}`);
     }
-  }, [loadFileEntry]);
+  }, [loadFileEntry, loadFragmentedModel]);
 
   const handleSave = useCallback(async () => {
     if (!activeFileEntry || !activeFormatId) {

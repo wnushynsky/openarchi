@@ -1,0 +1,1705 @@
+import { useState, useRef, useCallback, useEffect, useMemo } from 'react';
+import type {
+  ModelElement, ModelRelationship, ModelView,
+  Camera, DragState, PanState, DrawingRelState, DragWPState, DragEndpointState, DragLabelState,
+  RelPickerState, CtxMenuState, GridType, LeftPanel, SelectionType, ResizeState,
+} from './types';
+import type { CanonicalModelDocument } from './model/canonical';
+import {
+  LAYERS, ELEMENT_TYPES, RELATIONSHIP_TYPES, FONT,
+  snap, uid, GRID,
+  nearestAnchor, getRelPoints, nearestTOnPath,
+  hitTestElement, hitTestAnchor, hitTestWaypoint, hitTestEndpoint, hitTestRelationship, hitTestLabel, hitTestPopout,
+  hitTestResizeHandle, HANDLE_CURSORS,
+  SAMPLE_ELEMENTS, SAMPLE_RELATIONSHIPS, SAMPLE_VIEWS,
+  snapToElements, snapResizeToElements, type SnapGuide,
+} from './core';
+import { drawDotGrid, drawLineGrid, drawElement, drawRelationship, drawSnapGuides, getRelSegments, type RelSegments } from './canvas';
+import { RelPicker, CtxMenu, SearchPanel, ViewNav, PropertyPanel, Btn, CanvasIcon, FloatingToolbar } from './components';
+import {
+  detectModelFormatByFileName,
+  exportEditorModelToText,
+  importEditorModelFromText,
+  importFragmentedModel,
+  isFragmentedModelDirectory,
+  listModelFormats,
+} from './model/service';
+import {
+  openDirectory,
+  type DirectoryState,
+  type OpenFileEntry,
+} from './io/filesystem';
+
+const getLayer = (type: string) => ELEMENT_TYPES[type]?.layer;
+const isNote = (type: string) => !!ELEMENT_TYPES[type]?.isNote;
+
+interface ElementViewLayout {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  linkedViewId?: string;
+}
+
+interface RelationshipViewLayout {
+  waypoints: { x: number; y: number }[];
+  labelPos: number;
+}
+
+type ElementLayoutsByView = Record<string, Record<string, ElementViewLayout>>;
+type RelationshipLayoutsByView = Record<string, Record<string, RelationshipViewLayout>>;
+
+function buildLayoutsFromEditorModel(
+  elements: ModelElement[],
+  relationships: ModelRelationship[],
+  views: ModelView[],
+): { elementLayouts: ElementLayoutsByView; relationshipLayouts: RelationshipLayoutsByView } {
+  const elementLayouts: ElementLayoutsByView = {};
+  const relationshipLayouts: RelationshipLayoutsByView = {};
+
+  for (const view of views) {
+    const memberIds = new Set(view.elementIds || []);
+    elementLayouts[view.id] = {};
+    relationshipLayouts[view.id] = {};
+
+    for (const element of elements) {
+      if (!memberIds.has(element.id)) continue;
+      elementLayouts[view.id][element.id] = {
+        x: element.x,
+        y: element.y,
+        w: element.w,
+        h: element.h,
+        linkedViewId: element.linkedViewId,
+      };
+    }
+
+    for (const relationship of relationships) {
+      if (!memberIds.has(relationship.sourceId) || !memberIds.has(relationship.targetId)) continue;
+      relationshipLayouts[view.id][relationship.id] = {
+        waypoints: relationship.waypoints || [],
+        labelPos: relationship.labelPos ?? 0.5,
+      };
+    }
+  }
+
+  return { elementLayouts, relationshipLayouts };
+}
+
+function buildLayoutsFromCanonicalDocument(
+  document: CanonicalModelDocument,
+): { elementLayouts: ElementLayoutsByView; relationshipLayouts: RelationshipLayoutsByView } {
+  const elementLayouts: ElementLayoutsByView = {};
+  const relationshipLayouts: RelationshipLayoutsByView = {};
+
+  for (const view of document.views) {
+    elementLayouts[view.id] = {};
+    relationshipLayouts[view.id] = {};
+  }
+
+  for (const node of document.viewNodes) {
+    if (!elementLayouts[node.viewId]) elementLayouts[node.viewId] = {};
+    elementLayouts[node.viewId][node.elementId] = {
+      x: node.x,
+      y: node.y,
+      w: node.width,
+      h: node.height,
+      linkedViewId: node.linkedViewId,
+    };
+  }
+
+  for (const connection of document.viewConnections) {
+    if (!relationshipLayouts[connection.viewId]) relationshipLayouts[connection.viewId] = {};
+    relationshipLayouts[connection.viewId][connection.relationshipId] = {
+      waypoints: connection.waypoints || [],
+      labelPos: connection.labelPosition ?? 0.5,
+    };
+  }
+
+  return { elementLayouts, relationshipLayouts };
+}
+
+export default function App() {
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const containerRef = useRef<HTMLDivElement>(null);
+
+  const [views, setViews] = useState<ModelView[]>(SAMPLE_VIEWS);
+  const [currentViewId, setCurrentViewId] = useState('v1');
+  const [elements, setElements] = useState<ModelElement[]>(SAMPLE_ELEMENTS);
+  const [relationships, setRelationships] = useState<ModelRelationship[]>(SAMPLE_RELATIONSHIPS);
+
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [selType, setSelType] = useState<SelectionType>(null);
+  const [activeLayer, setActiveLayer] = useState('business');
+  const [gridType, setGridType] = useState<GridType>('dot');
+
+  const [dragging, setDragging] = useState<DragState | null>(null);
+  const [panning, setPanning] = useState<PanState | null>(null);
+  const [hovElId, setHovElId] = useState<string | null>(null);
+  const [hovRelId, setHovRelId] = useState<string | null>(null);
+  const [drawingRel, setDrawingRel] = useState<DrawingRelState | null>(null);
+  const [dragWP, setDragWP] = useState<DragWPState | null>(null);
+  const [dragEndpoint, setDragEndpoint] = useState<DragEndpointState | null>(null);
+  const [dragLabel, setDragLabel] = useState<DragLabelState | null>(null);
+  const [resizing, setResizing] = useState<ResizeState | null>(null);
+  const [relPicker, setRelPicker] = useState<RelPickerState | null>(null);
+  const [ctxMenu, setCtxMenu] = useState<CtxMenuState | null>(null);
+  const [showSearch, setShowSearch] = useState(false);
+  const [ioFormatId, setIoFormatId] = useState<string>('auto');
+  const [leftPanel, setLeftPanel] = useState<LeftPanel>('views');
+  const [leftPanelWidth, setLeftPanelWidth] = useState(244);
+  const [propSide, setPropSide] = useState<'left' | 'right'>('left');
+  const [openTabIds, setOpenTabIds] = useState<string[]>(['v1']);
+  const [editingElId, setEditingElId] = useState<string | null>(null);
+  const [editingName, setEditingName] = useState('');
+  const [showLegend, setShowLegend] = useState(false);
+  const [snapGuides, setSnapGuides] = useState<SnapGuide[]>([]);
+
+  // Filesystem state
+  const [dirState, setDirState] = useState<DirectoryState | null>(null);
+  const [activeFileEntry, setActiveFileEntry] = useState<OpenFileEntry | null>(null);
+  const [activeFormatId, setActiveFormatId] = useState<string | null>(null);
+  const [isDirty, setIsDirty] = useState(false);
+
+  // Undo/Redo history — snapshots are pushed explicitly at interaction boundaries
+  interface HistorySnapshot { elements: ModelElement[]; relationships: ModelRelationship[]; views: ModelView[] }
+  const historyRef = useRef<HistorySnapshot[]>([{
+    elements: SAMPLE_ELEMENTS.map(e => ({ ...e })),
+    relationships: SAMPLE_RELATIONSHIPS.map(r => ({ ...r, waypoints: [...r.waypoints] })),
+    views: SAMPLE_VIEWS.map(v => ({ ...v, elementIds: [...v.elementIds], childViewIds: [...v.childViewIds] })),
+  }]);
+  const historyIndexRef = useRef(0);
+
+  // Snapshot the current state into the refs so pushHistory can read it synchronously
+  const elementsRef = useRef(elements);
+  const relationshipsRef = useRef(relationships);
+  const viewsRef = useRef(views);
+  useEffect(() => { elementsRef.current = elements; }, [elements]);
+  useEffect(() => { relationshipsRef.current = relationships; }, [relationships]);
+  useEffect(() => { viewsRef.current = views; }, [views]);
+
+  /** Call BEFORE a mutation to save the current state as an undo point */
+  const pushHistory = useCallback(() => {
+    const snapshot: HistorySnapshot = {
+      elements: elementsRef.current.map(e => ({ ...e })),
+      relationships: relationshipsRef.current.map(r => ({ ...r, waypoints: [...r.waypoints] })),
+      views: viewsRef.current.map(v => ({ ...v, elementIds: [...v.elementIds], childViewIds: [...v.childViewIds] })),
+    };
+    // Trim forward history
+    historyRef.current = historyRef.current.slice(0, historyIndexRef.current + 1);
+    historyRef.current.push(snapshot);
+    historyIndexRef.current = historyRef.current.length - 1;
+    // Bound history
+    if (historyRef.current.length > 100) {
+      historyRef.current = historyRef.current.slice(-80);
+      historyIndexRef.current = historyRef.current.length - 1;
+    }
+  }, []);
+
+  const applySnapshot = useCallback((snap: HistorySnapshot) => {
+    setElements(snap.elements.map(e => ({ ...e })));
+    setRelationships(snap.relationships.map(r => ({ ...r, waypoints: [...r.waypoints] })));
+    setViews(snap.views.map(v => ({ ...v, elementIds: [...v.elementIds], childViewIds: [...v.childViewIds] })));
+  }, []);
+
+  const undo = useCallback(() => {
+    if (historyIndexRef.current <= 0) return;
+    // Save current state as the "redo" point if we're at the tip
+    if (historyIndexRef.current === historyRef.current.length - 1) {
+      const current: HistorySnapshot = {
+        elements: elementsRef.current.map(e => ({ ...e })),
+        relationships: relationshipsRef.current.map(r => ({ ...r, waypoints: [...r.waypoints] })),
+        views: viewsRef.current.map(v => ({ ...v, elementIds: [...v.elementIds], childViewIds: [...v.childViewIds] })),
+      };
+      historyRef.current.push(current);
+    }
+    historyIndexRef.current -= 1;
+    applySnapshot(historyRef.current[historyIndexRef.current]);
+  }, [applySnapshot]);
+
+  const redo = useCallback(() => {
+    if (historyIndexRef.current >= historyRef.current.length - 1) return;
+    historyIndexRef.current += 1;
+    applySnapshot(historyRef.current[historyIndexRef.current]);
+  }, [applySnapshot]);
+
+  const initialLayouts = useMemo(
+    () => buildLayoutsFromEditorModel(SAMPLE_ELEMENTS, SAMPLE_RELATIONSHIPS, SAMPLE_VIEWS),
+    [],
+  );
+  const elementLayoutsByViewRef = useRef<ElementLayoutsByView>(initialLayouts.elementLayouts);
+  const relationshipLayoutsByViewRef = useRef<RelationshipLayoutsByView>(initialLayouts.relationshipLayouts);
+
+  const modelFormats = useMemo(() => listModelFormats(), []);
+
+  const selectedFormatId = ioFormatId === 'auto' ? 'openarchi-json' : ioFormatId;
+  const activeView = useMemo(() => {
+    if (views.length === 0) return null;
+    return views.find(view => view.id === currentViewId) || views[0];
+  }, [views, currentViewId]);
+
+  const visibleElementIds = useMemo(() => {
+    if (!activeView) {
+      return new Set(elements.map(element => element.id));
+    }
+    return new Set(activeView.elementIds || []);
+  }, [activeView, elements]);
+
+  const visibleElements = useMemo(
+    () => elements.filter(element => visibleElementIds.has(element.id)),
+    [elements, visibleElementIds],
+  );
+
+  const visibleRelationships = useMemo(
+    () => relationships.filter(relationship =>
+      visibleElementIds.has(relationship.sourceId) && visibleElementIds.has(relationship.targetId),
+    ),
+    [relationships, visibleElementIds],
+  );
+
+  // Element lookup map for O(1) access in getRelPoints/drawRelationship
+  const visibleElementMap = useMemo(
+    () => new Map(visibleElements.map(e => [e.id, e])),
+    [visibleElements],
+  );
+
+  const saveViewLayoutSnapshot = useCallback((viewId: string) => {
+    const view = views.find(candidate => candidate.id === viewId);
+    if (!view) return;
+
+    const memberIds = new Set(view.elementIds || []);
+    const elementLayout: Record<string, ElementViewLayout> = {
+      ...(elementLayoutsByViewRef.current[viewId] || {}),
+    };
+    const relationshipLayout: Record<string, RelationshipViewLayout> = {
+      ...(relationshipLayoutsByViewRef.current[viewId] || {}),
+    };
+
+    for (const element of elements) {
+      if (!memberIds.has(element.id)) continue;
+      elementLayout[element.id] = {
+        x: element.x,
+        y: element.y,
+        w: element.w,
+        h: element.h,
+        linkedViewId: element.linkedViewId,
+      };
+    }
+
+    for (const relationship of relationships) {
+      if (!memberIds.has(relationship.sourceId) || !memberIds.has(relationship.targetId)) continue;
+      relationshipLayout[relationship.id] = {
+        waypoints: relationship.waypoints || [],
+        labelPos: relationship.labelPos ?? 0.5,
+      };
+    }
+
+    elementLayoutsByViewRef.current = {
+      ...elementLayoutsByViewRef.current,
+      [viewId]: elementLayout,
+    };
+    relationshipLayoutsByViewRef.current = {
+      ...relationshipLayoutsByViewRef.current,
+      [viewId]: relationshipLayout,
+    };
+  }, [views, elements, relationships]);
+
+  const applyViewLayout = useCallback((viewId: string) => {
+    const elementLayout = elementLayoutsByViewRef.current[viewId] || {};
+    const relationshipLayout = relationshipLayoutsByViewRef.current[viewId] || {};
+
+    setElements(prev => prev.map(element => {
+      const layout = elementLayout[element.id];
+      if (!layout) return element;
+      return {
+        ...element,
+        x: layout.x,
+        y: layout.y,
+        w: layout.w,
+        h: layout.h,
+        linkedViewId: layout.linkedViewId,
+      };
+    }));
+
+    setRelationships(prev => prev.map(relationship => {
+      const layout = relationshipLayout[relationship.id];
+      if (!layout) return relationship;
+      return {
+        ...relationship,
+        waypoints: layout.waypoints,
+        labelPos: layout.labelPos,
+      };
+    }));
+  }, []);
+
+  // ==================== BACK / FORWARD NAVIGATION ====================
+  const viewHistory = useRef<string[]>(['v1']);
+  const historyIdx = useRef(0);
+  const isNavAction = useRef(false);
+
+  const navigateToView = useCallback((id: string) => {
+    if (id !== currentViewId) {
+      saveViewLayoutSnapshot(currentViewId);
+      applyViewLayout(id);
+    }
+
+    if (!isNavAction.current) {
+      // Trim forward history and push
+      viewHistory.current = viewHistory.current.slice(0, historyIdx.current + 1);
+      viewHistory.current.push(id);
+      historyIdx.current = viewHistory.current.length - 1;
+    }
+    isNavAction.current = false;
+    setCurrentViewId(id);
+    setOpenTabIds(prev => prev.includes(id) ? prev : [...prev, id]);
+  }, [currentViewId, saveViewLayoutSnapshot, applyViewLayout]);
+
+  const canGoBack = historyIdx.current > 0;
+  const canGoForward = historyIdx.current < viewHistory.current.length - 1;
+
+  const goBack = useCallback(() => {
+    if (historyIdx.current > 0) {
+      historyIdx.current--;
+      isNavAction.current = true;
+      navigateToView(viewHistory.current[historyIdx.current]);
+    }
+  }, [navigateToView]);
+
+  const goForward = useCallback(() => {
+    if (historyIdx.current < viewHistory.current.length - 1) {
+      historyIdx.current++;
+      isNavAction.current = true;
+      navigateToView(viewHistory.current[historyIdx.current]);
+    }
+  }, [navigateToView]);
+
+  const closeTab = useCallback((id: string) => {
+    setOpenTabIds(prev => {
+      const next = prev.filter(t => t !== id);
+      if (next.length === 0) return prev;
+      if (id === currentViewId) {
+        const nextViewId = next[next.length - 1];
+        saveViewLayoutSnapshot(currentViewId);
+        applyViewLayout(nextViewId);
+        setCurrentViewId(nextViewId);
+      }
+      return next;
+    });
+  }, [currentViewId, saveViewLayoutSnapshot, applyViewLayout]);
+
+  const [cam, setCam] = useState<Camera>({ x: 0, y: 0, s: 1 });
+  const [cSize, setCSize] = useState({ w: 800, h: 600 });
+
+  // rAF-throttled camera updates — avoids re-rendering more than once per frame
+  const camPendingRef = useRef<Camera | null>(null);
+  const camRafRef = useRef(0);
+  const setCamThrottled = useCallback((next: Camera | ((prev: Camera) => Camera)) => {
+    // Resolve the next value
+    if (typeof next === 'function') {
+      // Need current cam — use ref
+      const current = camPendingRef.current ?? cam;
+      camPendingRef.current = next(current);
+    } else {
+      camPendingRef.current = next;
+    }
+    if (!camRafRef.current) {
+      camRafRef.current = requestAnimationFrame(() => {
+        camRafRef.current = 0;
+        if (camPendingRef.current) {
+          setCam(camPendingRef.current);
+          camPendingRef.current = null;
+        }
+      });
+    }
+  }, [cam]);
+
+  // Resize observer
+  useEffect(() => {
+    const c = containerRef.current;
+    if (!c) return;
+    const ro = new ResizeObserver(entries => {
+      for (const e of entries) setCSize({ w: e.contentRect.width, h: e.contentRect.height });
+    });
+    ro.observe(c);
+    return () => ro.disconnect();
+  }, []);
+
+  const s2w = useCallback((sx: number, sy: number) => ({
+    x: (sx - cam.x) / cam.s,
+    y: (sy - cam.y) / cam.s,
+  }), [cam]);
+
+  // Pre-compute parent IDs using spatial index for large models (avoid O(n²))
+  const parentIds = useMemo(() => {
+    const ids = new Set<string>();
+    const n = visibleElements.length;
+    // For small sets, brute force is fine. For larger sets, use sorted-edge approach.
+    if (n < 200) {
+      for (const outer of visibleElements) {
+        for (const inner of visibleElements) {
+          if (inner.id === outer.id) continue;
+          if (inner.x >= outer.x && inner.y >= outer.y &&
+              inner.x + inner.w <= outer.x + outer.w &&
+              inner.y + inner.h <= outer.y + outer.h) {
+            ids.add(outer.id);
+            break;
+          }
+        }
+      }
+    } else {
+      // Sort by area descending — larger elements are more likely parents
+      const byArea = [...visibleElements].sort((a, b) => (b.w * b.h) - (a.w * a.h));
+      for (let i = 0; i < byArea.length && !ids.has(byArea[i].id); i++) {
+        const outer = byArea[i];
+        for (let j = i + 1; j < byArea.length; j++) {
+          const inner = byArea[j];
+          if (inner.x >= outer.x && inner.y >= outer.y &&
+              inner.x + inner.w <= outer.x + outer.w &&
+              inner.y + inner.h <= outer.y + outer.h) {
+            ids.add(outer.id);
+            break;
+          }
+        }
+      }
+    }
+    return ids;
+  }, [visibleElements]);
+
+  const sortedElements = useMemo(
+    () => [...visibleElements].sort((a, b) => (a.zIndex ?? 0) - (b.zIndex ?? 0)),
+    [visibleElements],
+  );
+
+  // Track canvas dimensions to avoid unnecessary reallocation
+  const canvasDimsRef = useRef({ w: 0, h: 0 });
+
+  // ==================== RENDER LOOP ====================
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d')!;
+    const dpr = window.devicePixelRatio || 1;
+    const pw = cSize.w * dpr, ph = cSize.h * dpr;
+    // Only resize canvas buffer when dimensions actually change (expensive operation)
+    if (canvasDimsRef.current.w !== pw || canvasDimsRef.current.h !== ph) {
+      canvas.width = pw;
+      canvas.height = ph;
+      canvas.style.width = cSize.w + 'px';
+      canvas.style.height = cSize.h + 'px';
+      canvasDimsRef.current = { w: pw, h: ph };
+    }
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+    ctx.fillStyle = '#f5f6f8';
+    ctx.fillRect(0, 0, cSize.w, cSize.h);
+    ctx.save();
+    ctx.translate(cam.x, cam.y);
+    ctx.scale(cam.s, cam.s);
+
+    // Grid
+    if (gridType === 'dot') drawDotGrid(ctx, cSize.w, cSize.h, cam.x, cam.y, cam.s);
+    else drawLineGrid(ctx, cSize.w, cSize.h, cam.x, cam.y, cam.s);
+
+    // Viewport culling — only draw elements/relationships visible on screen
+    const vpMargin = 100; // extra margin in world coords to avoid pop-in
+    const vpLeft = -cam.x / cam.s - vpMargin;
+    const vpTop = -cam.y / cam.s - vpMargin;
+    const vpRight = vpLeft + cSize.w / cam.s + vpMargin * 2;
+    const vpBottom = vpTop + cSize.h / cam.s + vpMargin * 2;
+
+    const inViewport = (el: { x: number; y: number; w: number; h: number }) =>
+      el.x + el.w >= vpLeft && el.x <= vpRight && el.y + el.h >= vpTop && el.y <= vpBottom;
+
+    const culledElements = sortedElements.filter(inViewport);
+
+    // 1. Composite elements (background)
+    for (const el of culledElements) {
+      if (getLayer(el.type) === 'composite' && !isNote(el.type)) {
+        drawElement(ctx, el, selType === 'element' && selectedId === el.id, hovElId === el.id, (selType === 'element' && selectedId === el.id) || hovElId === el.id, parentIds.has(el.id));
+      }
+    }
+
+    // 2. Non-composite elements + notes
+    for (const el of culledElements) {
+      if (getLayer(el.type) !== 'composite' || isNote(el.type)) {
+        drawElement(ctx, el, selType === 'element' && selectedId === el.id, hovElId === el.id, (selType === 'element' && selectedId === el.id) || hovElId === el.id, parentIds.has(el.id));
+      }
+    }
+
+    // 3. Relationships (always on top of elements) — with crossing hops
+    // For large models, skip crossing detection (expensive O(n²))
+    const skipCrossings = visibleRelationships.length > 200;
+
+    if (skipCrossings) {
+      for (const r of visibleRelationships) {
+        drawRelationship(ctx, r, visibleElements, selType === 'relationship' && selectedId === r.id, hovRelId === r.id, [], visibleElementMap);
+      }
+    } else {
+      const allRelSegs: RelSegments[] = visibleRelationships
+        .map(r => getRelSegments(r, visibleElements, visibleElementMap))
+        .filter((s): s is RelSegments => s !== null);
+
+      // Pre-build a flat list of all segments with their owning relId for fast exclusion
+      const allFlatSegs = allRelSegs.flatMap(s => s.segments.map(seg => ({ ...seg, relId: s.relId })));
+
+      for (const r of visibleRelationships) {
+        const otherSegs = allFlatSegs.filter(s => s.relId !== r.id);
+        drawRelationship(ctx, r, visibleElements, selType === 'relationship' && selectedId === r.id, hovRelId === r.id, otherSegs, visibleElementMap);
+      }
+    }
+
+    // 4. Snap guide lines
+    if (snapGuides.length > 0) {
+      drawSnapGuides(ctx, snapGuides, cSize.w, cSize.h, cam.x, cam.y, cam.s);
+    }
+
+    // 5. Drawing-in-progress relationship (with waypoints + arrowhead)
+    if (drawingRel) {
+      const src = visibleElements.find(e => e.id === drawingRel.sourceId);
+      if (src) {
+        const wps = drawingRel.waypoints;
+        const startPt = wps.length > 0 ? wps[0] : null;
+        const a = nearestAnchor(src, startPt?.x ?? drawingRel.mx, startPt?.y ?? drawingRel.my);
+        const col = '#3b82f6';
+        ctx.save();
+        // Line
+        ctx.beginPath();
+        ctx.moveTo(a.x, a.y);
+        for (const wp of wps) ctx.lineTo(wp.x, wp.y);
+        ctx.lineTo(drawingRel.mx, drawingRel.my);
+        ctx.strokeStyle = col; ctx.lineWidth = 1.6; ctx.setLineDash([6, 3]); ctx.stroke(); ctx.setLineDash([]);
+        // Arrowhead at cursor end (open chevron like serving arrow)
+        const prevPt = wps.length > 0 ? wps[wps.length - 1] : a;
+        const dx = drawingRel.mx - prevPt.x;
+        const dy = drawingRel.my - prevPt.y;
+        if (Math.abs(dx) > 1 || Math.abs(dy) > 1) {
+          const angle = Math.atan2(dy, dx);
+          const aLen = 11;
+          const aSpread = 0.45;
+          ctx.beginPath();
+          ctx.moveTo(drawingRel.mx - aLen * Math.cos(angle - aSpread), drawingRel.my - aLen * Math.sin(angle - aSpread));
+          ctx.lineTo(drawingRel.mx, drawingRel.my);
+          ctx.lineTo(drawingRel.mx - aLen * Math.cos(angle + aSpread), drawingRel.my - aLen * Math.sin(angle + aSpread));
+          ctx.strokeStyle = col; ctx.lineWidth = 1.8; ctx.lineJoin = 'round'; ctx.lineCap = 'round'; ctx.stroke();
+        }
+        // Waypoint dots
+        for (const wp of wps) {
+          ctx.beginPath(); ctx.arc(wp.x, wp.y, 4, 0, Math.PI * 2);
+          ctx.fillStyle = '#fff'; ctx.fill();
+          ctx.strokeStyle = col; ctx.lineWidth = 1.5; ctx.stroke();
+        }
+        ctx.restore();
+      }
+    }
+
+    ctx.restore();
+  }, [visibleElements, visibleElementMap, visibleRelationships, sortedElements, parentIds, selectedId, selType, cam, cSize, hovElId, hovRelId, drawingRel, gridType, snapGuides]);
+
+  // ==================== MOUSE HANDLERS ====================
+  const handleMouseDown = useCallback((e: React.MouseEvent) => {
+    if (relPicker || ctxMenu) { setRelPicker(null); setCtxMenu(null); return; }
+    if (editingElId) return;
+    const rect = canvasRef.current!.getBoundingClientRect();
+    const sx = e.clientX - rect.left, sy = e.clientY - rect.top;
+    const { x: wx, y: wy } = s2w(sx, sy);
+
+    if (drawingRel && e.shiftKey) {
+      setDrawingRel(prev => prev ? { ...prev, waypoints: [...prev.waypoints, { x: snap(wx), y: snap(wy) }] } : null);
+      return;
+    }
+
+    const linked = hitTestPopout(visibleElements, wx, wy);
+    if (linked) { navigateToView(linked); return; }
+
+    const anch = hitTestAnchor(visibleElements, wx, wy, getLayer, isNote);
+    if (anch) { setDrawingRel({ sourceId: anch.elId, mx: wx, my: wy, waypoints: [] }); return; }
+
+    // Endpoint dragging — only when a relationship is selected
+    if (selType === 'relationship' && selectedId) {
+      const selRel = visibleRelationships.find(r => r.id === selectedId);
+      if (selRel) {
+        const ep = hitTestEndpoint(selRel, visibleElements, wx, wy);
+        if (ep) { pushHistory(); setDragEndpoint({ relId: selRel.id, endpoint: ep }); return; }
+      }
+    }
+
+    const wp = hitTestWaypoint(visibleRelationships, wx, wy);
+    if (wp) { pushHistory(); setDragWP({ ...wp, startX: wx, startY: wy }); return; }
+
+    const lbl = hitTestLabel(visibleRelationships, visibleElements, wx, wy);
+    if (lbl) { pushHistory(); setDragLabel({ relId: lbl.id }); setSelectedId(lbl.id); setSelType('relationship'); return; }
+
+    // Check resize handles on currently selected element first
+    if (selType === 'element' && selectedId) {
+      const selEl = visibleElements.find(e => e.id === selectedId);
+      if (selEl) {
+        const handle = hitTestResizeHandle(selEl, wx, wy);
+        if (handle) {
+          pushHistory();
+          setResizing({ id: selEl.id, handle, startWx: wx, startWy: wy, origX: selEl.x, origY: selEl.y, origW: selEl.w, origH: selEl.h });
+          return;
+        }
+      }
+    }
+
+    const el = hitTestElement(visibleElements, wx, wy, getLayer, isNote);
+    if (el) {
+      setSelectedId(el.id); setSelType('element');
+      pushHistory();
+      setDragging({ id: el.id, ox: wx - el.x, oy: wy - el.y });
+    } else {
+      const rh = hitTestRelationship(visibleRelationships, visibleElements, wx, wy);
+      if (rh) { setSelectedId(rh.rel.id); setSelType('relationship'); }
+      else { setSelectedId(null); setSelType(null); setPanning({ sx: e.clientX, sy: e.clientY, cx: cam.x, cy: cam.y }); }
+    }
+  }, [s2w, visibleElements, visibleRelationships, cam, relPicker, ctxMenu, drawingRel, editingElId, navigateToView, selType, selectedId, pushHistory]);
+
+  const handleMouseMove = useCallback((e: React.MouseEvent) => {
+    const rect = canvasRef.current!.getBoundingClientRect();
+    const sx = e.clientX - rect.left, sy = e.clientY - rect.top;
+    const { x: wx, y: wy } = s2w(sx, sy);
+
+    if (resizing) {
+      const dx = wx - resizing.startWx, dy = wy - resizing.startWy;
+      const rh = resizing.handle;
+      let nx = resizing.origX, ny = resizing.origY, nw = resizing.origW, nh = resizing.origH;
+      if (rh.includes('w')) { nx = resizing.origX + dx; nw = resizing.origW - dx; }
+      if (rh.includes('e')) { nw = resizing.origW + dx; }
+      if (rh.includes('n')) { ny = resizing.origY + dy; nh = resizing.origH - dy; }
+      if (rh.includes('s')) { nh = resizing.origH + dy; }
+      nw = Math.max(60, nw); nh = Math.max(40, nh);
+      if (nw === 60 && rh.includes('w')) nx = resizing.origX + resizing.origW - 60;
+      if (nh === 40 && rh.includes('n')) ny = resizing.origY + resizing.origH - 40;
+      // Grid-snap first, then smart-snap to elements
+      nx = snap(nx); ny = snap(ny); nw = snap(nw); nh = snap(nh);
+      const others = visibleElements.filter(el => el.id !== resizing.id);
+      const result = snapResizeToElements({ x: nx, y: ny, w: nw, h: nh }, rh, others);
+      setSnapGuides(result.guides);
+      setElements(prev => prev.map(el => el.id === resizing.id ? { ...el, x: result.x, y: result.y, w: result.w, h: result.h } : el));
+      return;
+    }
+    if (drawingRel) { setDrawingRel(p => p ? { ...p, mx: wx, my: wy } : null); return; }
+    if (dragWP) {
+      setRelationships(prev => prev.map(r => r.id === dragWP.relId ? { ...r, waypoints: r.waypoints.map((w, i) => i === dragWP.wpIdx ? { x: snap(wx), y: snap(wy) } : w) } : r));
+      return;
+    }
+    if (dragEndpoint) {
+      const key = dragEndpoint.endpoint === 'source' ? 'sourceAnchor' : 'targetAnchor';
+      setRelationships(prev => prev.map(r => r.id === dragEndpoint.relId ? { ...r, [key]: { x: snap(wx), y: snap(wy) } } : r));
+      return;
+    }
+    if (dragLabel) {
+      const rel = visibleRelationships.find(r => r.id === dragLabel.relId);
+      if (rel) {
+        const pts = getRelPoints(rel, visibleElements);
+        if (pts) {
+          const allPts = [pts.start, ...pts.waypoints, pts.end];
+          const newT = nearestTOnPath(allPts, wx, wy);
+          setRelationships(prev => prev.map(r => r.id === dragLabel.relId ? { ...r, labelPos: newT } : r));
+        }
+      }
+      return;
+    }
+    if (dragging) {
+      const draggedEl = visibleElements.find(el => el.id === dragging.id);
+      if (draggedEl) {
+        const proposedX = snap(wx - dragging.ox);
+        const proposedY = snap(wy - dragging.oy);
+        const others = visibleElements.filter(el => el.id !== dragging.id);
+        const result = snapToElements({ x: proposedX, y: proposedY, w: draggedEl.w, h: draggedEl.h }, others);
+        setSnapGuides(result.guides);
+        setElements(prev => prev.map(el => el.id === dragging.id ? { ...el, x: result.x, y: result.y } : el));
+      }
+    } else if (panning) {
+      setCamThrottled(p => ({ ...p, x: panning.cx + e.clientX - panning.sx, y: panning.cy + e.clientY - panning.sy }));
+    } else {
+      if (selType === 'element' && selectedId) {
+        const selElHov = visibleElements.find(e => e.id === selectedId);
+        if (selElHov) {
+          const handle = hitTestResizeHandle(selElHov, wx, wy);
+          if (handle) {
+            canvasRef.current!.style.cursor = HANDLE_CURSORS[handle];
+            setHovElId(null); setHovRelId(null);
+            return;
+          }
+        }
+      }
+      const el = hitTestElement(visibleElements, wx, wy, getLayer, isNote);
+      setHovElId(el?.id || null);
+      if (!el) {
+        const rh = hitTestRelationship(visibleRelationships, visibleElements, wx, wy);
+        setHovRelId(rh?.rel?.id || null);
+      } else setHovRelId(null);
+      canvasRef.current!.style.cursor = 'default';
+    }
+  }, [s2w, dragging, panning, visibleElements, visibleRelationships, drawingRel, dragWP, dragEndpoint, dragLabel, resizing, selType, selectedId, setCamThrottled]);
+
+  const handleMouseUp = useCallback((e: React.MouseEvent) => {
+    if (drawingRel) {
+      const rect = canvasRef.current!.getBoundingClientRect();
+      const { x: wx, y: wy } = s2w(e.clientX - rect.left, e.clientY - rect.top);
+      const tgt = hitTestElement(visibleElements, wx, wy, getLayer, isNote);
+      if (tgt && tgt.id !== drawingRel.sourceId) {
+        relPickerWaypoints.current = drawingRel.waypoints;
+        setRelPicker({ sx: e.clientX - rect.left, sy: e.clientY - rect.top, srcId: drawingRel.sourceId, tgtId: tgt.id });
+      }
+      setDrawingRel(null); return;
+    }
+    setDragging(null); setPanning(null); setDragWP(null); setDragEndpoint(null); setDragLabel(null); setResizing(null);
+    setSnapGuides([]);
+  }, [drawingRel, s2w, visibleElements]);
+
+  const handleDblClick = useCallback((e: React.MouseEvent) => {
+    const rect = canvasRef.current!.getBoundingClientRect();
+    const { x: wx, y: wy } = s2w(e.clientX - rect.left, e.clientY - rect.top);
+
+    const el = hitTestElement(visibleElements, wx, wy, getLayer, isNote);
+    if (el) {
+      if (el.linkedViewId) {
+        navigateToView(el.linkedViewId);
+        return;
+      }
+      setEditingElId(el.id);
+      setEditingName(el.name);
+      setSelectedId(el.id);
+      setSelType('element');
+      return;
+    }
+
+    const rh = hitTestRelationship(visibleRelationships, visibleElements, wx, wy);
+    if (rh) {
+      const name = prompt('Relationship label:', rh.rel.name || '');
+      if (name !== null) { pushHistory(); setRelationships(prev => prev.map(r => r.id === rh.rel.id ? { ...r, name } : r)); }
+    }
+  }, [s2w, visibleElements, visibleRelationships, navigateToView]);
+
+  const handleContextMenu = useCallback((e: React.MouseEvent) => {
+    e.preventDefault();
+    const rect = canvasRef.current!.getBoundingClientRect();
+    const sx = e.clientX - rect.left, sy = e.clientY - rect.top;
+    const { x: wx, y: wy } = s2w(sx, sy);
+
+    const el = hitTestElement(visibleElements, wx, wy, getLayer, isNote);
+    if (el) {
+      setSelectedId(el.id); setSelType('element');
+      const elTypeDef = ELEMENT_TYPES[el.type];
+
+      // Build "Change type" submenu grouped by layer
+      const typesByLayer: Record<string, [string, typeof ELEMENT_TYPES[string]][]> = {};
+      for (const [k, v] of Object.entries(ELEMENT_TYPES)) {
+        if (v.isNote || k === el.type) continue;
+        const layer = v.layer;
+        if (!typesByLayer[layer]) typesByLayer[layer] = [];
+        typesByLayer[layer].push([k, v]);
+      }
+
+      const changeTypeChildren: typeof items = [];
+      // Current layer first, then others
+      const currentLayer = elTypeDef?.layer;
+      const layerOrder = currentLayer
+        ? [currentLayer, ...Object.keys(LAYERS).filter(l => l !== currentLayer)]
+        : Object.keys(LAYERS);
+
+      for (const layer of layerOrder) {
+        const types = typesByLayer[layer];
+        if (!types || types.length === 0) continue;
+        const L = LAYERS[layer];
+        if (changeTypeChildren.length > 0) {
+          changeTypeChildren.push({ label: '', separator: true });
+        }
+        for (const [k, v] of types) {
+          changeTypeChildren.push({
+            label: v.label,
+            icon: k,
+            iconColor: L?.accent || '#888',
+            action: () => { pushHistory(); setElements(prev => prev.map(e => e.id === el.id ? { ...e, type: k } : e)); },
+          });
+        }
+      }
+
+      const items: { label: string; action?: () => void; children?: typeof changeTypeChildren; separator?: boolean; icon?: string; iconColor?: string }[] = [
+        { label: 'Rename', action: () => { setEditingElId(el.id); setEditingName(el.name); } },
+        { label: 'Change type', children: changeTypeChildren },
+        { label: '', separator: true },
+        {
+          label: 'Bring to front',
+          action: () => {
+            pushHistory();
+            const maxZ = Math.max(0, ...elements.map(e => e.zIndex ?? 0));
+            setElements(prev => prev.map(e => e.id === el.id ? { ...e, zIndex: maxZ + 1 } : e));
+          },
+        },
+        {
+          label: 'Send to back',
+          action: () => {
+            pushHistory();
+            const minZ = Math.min(0, ...elements.map(e => e.zIndex ?? 0));
+            setElements(prev => prev.map(e => e.id === el.id ? { ...e, zIndex: minZ - 1 } : e));
+          },
+        },
+        { label: '', separator: true },
+        {
+          label: 'Delete',
+          action: () => {
+            pushHistory();
+            setElements(prev => prev.filter(e => e.id !== el.id));
+            setRelationships(prev => prev.filter(r => r.sourceId !== el.id && r.targetId !== el.id));
+            setViews(prev => prev.map(view => ({
+              ...view,
+              elementIds: (view.elementIds || []).filter(elementId => elementId !== el.id),
+            })));
+            setSelectedId(null);
+            setSelType(null);
+          },
+        },
+      ];
+
+      setCtxMenu({ x: sx, y: sy, items });
+      return;
+    }
+
+    const rh = hitTestRelationship(visibleRelationships, visibleElements, wx, wy);
+    if (rh) {
+      setCtxMenu({
+        x: sx, y: sy,
+        items: [
+          { label: 'Add waypoint here', action: () => { pushHistory(); setRelationships(prev => prev.map(r => { if (r.id !== rh.rel.id) return r; const wps = [...(r.waypoints || [])]; wps.splice(rh.segIdx, 0, { x: snap(wx), y: snap(wy) }); return { ...r, waypoints: wps }; })); } },
+          { label: 'Edit label', action: () => { pushHistory(); const name = prompt('Label:', rh.rel.name || ''); if (name !== null) setRelationships(prev => prev.map(r => r.id === rh.rel.id ? { ...r, name } : r)); } },
+          ...(rh.rel.waypoints?.length > 0 ? [{ label: 'Remove all waypoints', action: () => { pushHistory(); setRelationships(prev => prev.map(r => r.id === rh.rel.id ? { ...r, waypoints: [] } : r)); } }] : []),
+          ...((rh.rel.sourceAnchor || rh.rel.targetAnchor) ? [{ label: 'Reset endpoints to auto', action: () => { pushHistory(); setRelationships(prev => prev.map(r => r.id === rh.rel.id ? { ...r, sourceAnchor: undefined, targetAnchor: undefined } : r)); } }] : []),
+          { label: 'Delete relationship', action: () => { pushHistory(); setRelationships(prev => prev.filter(r => r.id !== rh.rel.id)); if (selectedId === rh.rel.id) { setSelectedId(null); setSelType(null); } } },
+        ],
+      });
+      return;
+    }
+
+    const wp = hitTestWaypoint(visibleRelationships, wx, wy);
+    if (wp) {
+      setCtxMenu({ x: sx, y: sy, items: [{ label: 'Remove waypoint', action: () => { pushHistory(); setRelationships(prev => prev.map(r => r.id === wp.relId ? { ...r, waypoints: r.waypoints.filter((_, i) => i !== wp.wpIdx) } : r)); } }] });
+    }
+  }, [s2w, visibleElements, visibleRelationships, selectedId, pushHistory]);
+
+  const handleWheel = useCallback((e: React.WheelEvent) => {
+    e.preventDefault();
+    const rect = canvasRef.current!.getBoundingClientRect();
+    const sx = e.clientX - rect.left, sy = e.clientY - rect.top;
+    const f = e.deltaY < 0 ? 1.08 : 0.93;
+    const ns = Math.min(3, Math.max(0.2, cam.s * f));
+    const wx = (sx - cam.x) / cam.s, wy = (sy - cam.y) / cam.s;
+    setCamThrottled({ s: ns, x: sx - wx * ns, y: sy - wy * ns });
+  }, [cam, setCamThrottled]);
+
+  // ==================== INLINE EDITING ====================
+  const commitEditing = useCallback(() => {
+    if (editingElId) {
+      pushHistory();
+      setElements(prev => prev.map(e => e.id === editingElId ? { ...e, name: editingName } : e));
+      setEditingElId(null);
+    }
+  }, [editingElId, editingName, pushHistory]);
+
+  const cancelEditing = useCallback(() => {
+    setEditingElId(null);
+  }, []);
+
+  // ==================== ACTIONS ====================
+  const addElement = useCallback((type: string) => {
+    pushHistory();
+    const c = s2w(cSize.w / 2, cSize.h / 2);
+    const isG = type === 'grouping' || type === 'location';
+    const isN = type === 'note';
+    const el: ModelElement = {
+      id: uid(), type,
+      name: isN ? 'Add note text here...' : ELEMENT_TYPES[type].label,
+      x: snap(c.x, GRID), y: snap(c.y, GRID),
+      w: isG ? 300 : isN ? 180 : 160,
+      h: isG ? 180 : isN ? 80 : 72,
+      documentation: '',
+    };
+    setElements(prev => [...prev, el]);
+    setViews(prev => prev.map(view =>
+      view.id === currentViewId
+        ? { ...view, elementIds: [...new Set([...(view.elementIds || []), el.id])] }
+        : view,
+    ));
+    setSelectedId(el.id); setSelType('element');
+  }, [s2w, cSize, currentViewId, pushHistory]);
+
+  const deleteSelected = useCallback(() => {
+    if (!selectedId) return;
+    pushHistory();
+    if (selType === 'element') {
+      setElements(prev => prev.filter(e => e.id !== selectedId));
+      setRelationships(prev => prev.filter(r => r.sourceId !== selectedId && r.targetId !== selectedId));
+      setViews(prev => prev.map(view => ({
+        ...view,
+        elementIds: (view.elementIds || []).filter(elementId => elementId !== selectedId),
+      })));
+    } else {
+      setRelationships(prev => prev.filter(r => r.id !== selectedId));
+    }
+    setSelectedId(null); setSelType(null);
+  }, [selectedId, selType, pushHistory]);
+
+  const exportModel = useCallback(() => {
+    const result = exportEditorModelToText({ version: 'openarchi-0.1', elements, relationships, views }, selectedFormatId);
+    const hasError = result.diagnostics.some(diagnostic => diagnostic.severity === 'error');
+    if (hasError) {
+      const firstError = result.diagnostics.find(diagnostic => diagnostic.severity === 'error');
+      alert(firstError?.message || 'Export failed');
+      return;
+    }
+    if (result.diagnostics.length > 0) console.warn('Export diagnostics', result.diagnostics);
+
+    const blob = new Blob([result.content], { type: result.mimeType });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a'); a.href = url; a.download = result.suggestedFileName; a.click();
+    URL.revokeObjectURL(url);
+  }, [elements, relationships, views, selectedFormatId]);
+
+  const importModel = useCallback(() => {
+    const acceptedExtensions = Array.from(new Set(modelFormats.flatMap(format => format.extensions.map(extension => `.${extension}`))));
+    const inp = document.createElement('input'); inp.type = 'file'; inp.accept = acceptedExtensions.join(',');
+    inp.onchange = (e: Event) => {
+      const f = (e.target as HTMLInputElement).files?.[0];
+      if (!f) return;
+
+      const detectedFormat = detectModelFormatByFileName(f.name);
+      const formatId = ioFormatId === 'auto' ? detectedFormat?.id : ioFormatId;
+      if (!formatId) {
+        alert('Unsupported file format');
+        return;
+      }
+
+      const r = new FileReader();
+      r.onload = (ev) => {
+        try {
+          const content = ev.target?.result as string;
+          const result = importEditorModelFromText(content, formatId);
+          if (!result.model) {
+            const firstError = result.diagnostics.find(diagnostic => diagnostic.severity === 'error');
+            alert(firstError?.message || 'Invalid file');
+            return;
+          }
+          if (result.diagnostics.length > 0) console.warn('Import diagnostics', result.diagnostics);
+
+          const importedLayouts = result.document
+            ? buildLayoutsFromCanonicalDocument(result.document)
+            : buildLayoutsFromEditorModel(result.model.elements, result.model.relationships, result.model.views);
+          elementLayoutsByViewRef.current = importedLayouts.elementLayouts;
+          relationshipLayoutsByViewRef.current = importedLayouts.relationshipLayouts;
+
+          setElements(result.model.elements);
+          setRelationships(result.model.relationships);
+          setViews(result.model.views);
+          if (result.model.views.length > 0) {
+            setCurrentViewId(result.model.views[0].id);
+            setOpenTabIds([result.model.views[0].id]);
+            applyViewLayout(result.model.views[0].id);
+          }
+          setSelectedId(null); setSelType(null);
+        } catch { alert('Invalid file'); }
+      };
+      r.readAsText(f);
+    };
+    inp.click();
+  }, [ioFormatId, modelFormats, applyViewLayout]);
+
+  // ---------------------------------------------------------------------------
+  // Filesystem: Open Directory, Open File, Save
+  // ---------------------------------------------------------------------------
+
+  const loadFileEntry = useCallback(async (entry: OpenFileEntry) => {
+    try {
+      const content = await entry.readText();
+      const detectedFormat = detectModelFormatByFileName(entry.name);
+      const formatId = detectedFormat?.id;
+      if (!formatId) { alert(`Unsupported format: ${entry.name}`); return; }
+
+      const result = importEditorModelFromText(content, formatId);
+      if (!result.model) {
+        const firstError = result.diagnostics.find(d => d.severity === 'error');
+        alert(firstError?.message || 'Invalid file');
+        return;
+      }
+      if (result.diagnostics.length > 0) console.warn('Import diagnostics', result.diagnostics);
+
+      const importedLayouts = result.document
+        ? buildLayoutsFromCanonicalDocument(result.document)
+        : buildLayoutsFromEditorModel(result.model.elements, result.model.relationships, result.model.views);
+      elementLayoutsByViewRef.current = importedLayouts.elementLayouts;
+      relationshipLayoutsByViewRef.current = importedLayouts.relationshipLayouts;
+
+      setElements(result.model.elements);
+      setRelationships(result.model.relationships);
+      setViews(result.model.views);
+      if (result.model.views.length > 0) {
+        setCurrentViewId(result.model.views[0].id);
+        setOpenTabIds([result.model.views[0].id]);
+        applyViewLayout(result.model.views[0].id);
+      }
+      setSelectedId(null); setSelType(null);
+
+      setActiveFileEntry(entry);
+      setActiveFormatId(formatId);
+      setIsDirty(false);
+    } catch (err) {
+      alert(`Failed to open file: ${err}`);
+    }
+  }, [applyViewLayout]);
+
+  const loadFragmentedModel = useCallback(async (files: OpenFileEntry[]) => {
+    try {
+      const result = await importFragmentedModel(files);
+      if (!result.model) {
+        const firstError = result.diagnostics.find(d => d.severity === 'error');
+        alert(firstError?.message || 'Failed to import fragmented model');
+        return;
+      }
+      if (result.diagnostics.length > 0) console.warn('Import diagnostics', result.diagnostics);
+
+      const importedLayouts = result.document
+        ? buildLayoutsFromCanonicalDocument(result.document)
+        : buildLayoutsFromEditorModel(result.model.elements, result.model.relationships, result.model.views);
+      elementLayoutsByViewRef.current = importedLayouts.elementLayouts;
+      relationshipLayoutsByViewRef.current = importedLayouts.relationshipLayouts;
+
+      setElements(result.model.elements);
+      setRelationships(result.model.relationships);
+      setViews(result.model.views);
+      if (result.model.views.length > 0) {
+        setCurrentViewId(result.model.views[0].id);
+        setOpenTabIds([result.model.views[0].id]);
+        applyViewLayout(result.model.views[0].id);
+      }
+      setSelectedId(null); setSelType(null);
+      setActiveFormatId('coarchi-xml');
+      setIsDirty(false);
+    } catch (err) {
+      alert(`Failed to import fragmented model: ${err}`);
+    }
+  }, [applyViewLayout]);
+
+  const handleOpenDirectory = useCallback(async () => {
+    try {
+      const state = await openDirectory();
+      setDirState(state);
+
+      // Detect fragmented coArchi directory (individual XML files per element)
+      if (isFragmentedModelDirectory(state.files)) {
+        await loadFragmentedModel(state.files);
+        return;
+      }
+
+      // Auto-open the first archimate/xml/json file
+      if (state.files.length > 0) {
+        await loadFileEntry(state.files[0]);
+      }
+    } catch (err) {
+      // User cancelled the picker
+      if (err instanceof DOMException && err.name === 'AbortError') return;
+      alert(`Failed to open directory: ${err}`);
+    }
+  }, [loadFileEntry, loadFragmentedModel]);
+
+  const handleSave = useCallback(async () => {
+    if (!activeFileEntry || !activeFormatId) {
+      // Fallback to download export
+      exportModel();
+      return;
+    }
+    const result = exportEditorModelToText({ version: 'openarchi-0.1', elements, relationships, views }, activeFormatId);
+    const hasError = result.diagnostics.some(d => d.severity === 'error');
+    if (hasError) {
+      const firstError = result.diagnostics.find(d => d.severity === 'error');
+      alert(firstError?.message || 'Save failed');
+      return;
+    }
+    if (activeFileEntry.writeText) {
+      try {
+        await activeFileEntry.writeText(result.content);
+        setIsDirty(false);
+      } catch (err) {
+        alert(`Save failed: ${err}`);
+      }
+    } else {
+      // No write access (fallback browser) – download instead
+      const blob = new Blob([result.content], { type: result.mimeType });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = activeFileEntry.name;
+      a.click();
+      URL.revokeObjectURL(url);
+      setIsDirty(false);
+    }
+  }, [activeFileEntry, activeFormatId, elements, relationships, views, exportModel]);
+
+  // Mark dirty on model changes (skip initial render)
+  const isInitialRender = useRef(true);
+  useEffect(() => {
+    if (isInitialRender.current) { isInitialRender.current = false; return; }
+    if (activeFileEntry) setIsDirty(true);
+  }, [elements, relationships, views, activeFileEntry]);
+
+  // Keyboard
+  useEffect(() => {
+    const h = (e: KeyboardEvent) => {
+      if (e.key === 'Delete' || e.key === 'Backspace') {
+        if (['INPUT', 'TEXTAREA', 'SELECT'].includes((document.activeElement as HTMLElement)?.tagName)) return;
+        deleteSelected();
+      }
+      if (e.key === 'Escape') { setRelPicker(null); setCtxMenu(null); setShowSearch(false); setDrawingRel(null); cancelEditing(); }
+      if ((e.metaKey || e.ctrlKey) && e.key === 'k') { e.preventDefault(); setShowSearch(s => !s); }
+      if ((e.metaKey || e.ctrlKey) && e.key === 's') { e.preventDefault(); handleSave(); }
+      if ((e.metaKey || e.ctrlKey) && e.key === 'z') {
+        if (['INPUT', 'TEXTAREA', 'SELECT'].includes((document.activeElement as HTMLElement)?.tagName)) return;
+        e.preventDefault();
+        if (e.shiftKey) redo(); else undo();
+      }
+      if ((e.metaKey || e.ctrlKey) && e.key === 'y') {
+        if (['INPUT', 'TEXTAREA', 'SELECT'].includes((document.activeElement as HTMLElement)?.tagName)) return;
+        e.preventDefault();
+        redo();
+      }
+      // Back/forward: Alt+Left / Alt+Right
+      if (e.altKey && e.key === 'ArrowLeft') { e.preventDefault(); goBack(); }
+      if (e.altKey && e.key === 'ArrowRight') { e.preventDefault(); goForward(); }
+    };
+    window.addEventListener('keydown', h);
+    return () => window.removeEventListener('keydown', h);
+  }, [deleteSelected, cancelEditing, goBack, goForward, handleSave, undo, redo]);
+
+  useEffect(() => {
+    if (!selectedId) return;
+    if (selType === 'element' && !visibleElementIds.has(selectedId)) {
+      setSelectedId(null);
+      setSelType(null);
+      return;
+    }
+    if (selType === 'relationship') {
+      const isVisible = visibleRelationships.some(relationship => relationship.id === selectedId);
+      if (!isVisible) {
+        setSelectedId(null);
+        setSelType(null);
+      }
+    }
+  }, [selectedId, selType, visibleElementIds, visibleRelationships]);
+
+  // ==================== DERIVED STATE ====================
+  const selEl = selType === 'element' ? elements.find(e => e.id === selectedId) || null : null;
+  const selRel = selType === 'relationship' ? relationships.find(r => r.id === selectedId) || null : null;
+
+  const propEditPushedRef = useRef(false);
+  useEffect(() => { propEditPushedRef.current = false; }, [selectedId]);
+
+  const updEl = useCallback((k: string, v: unknown) => {
+    if (!propEditPushedRef.current) { pushHistory(); propEditPushedRef.current = true; }
+    setElements(p => p.map(e => e.id === selectedId ? { ...e, [k]: v } : e));
+  }, [selectedId, pushHistory]);
+
+  const updRel = useCallback((k: string, v: unknown) => {
+    if (!propEditPushedRef.current) { pushHistory(); propEditPushedRef.current = true; }
+    setRelationships(p => p.map(r => r.id === selectedId ? { ...r, [k]: v } : r));
+  }, [selectedId, pushHistory]);
+
+  // Position for inline editing overlay
+  const editingEl = editingElId ? elements.find(e => e.id === editingElId) : null;
+  const editOverlay = editingEl ? {
+    left: editingEl.x * cam.s + cam.x,
+    top: editingEl.y * cam.s + cam.y,
+    width: editingEl.w * cam.s,
+    height: editingEl.h * cam.s,
+  } : null;
+  const editIsNote = editingEl ? isNote(editingEl.type) : false;
+
+  const relPickerWaypoints = useRef<{ x: number; y: number }[]>([]);
+
+  // Left panel cycling (views + changelog only — palette moved to toolbar)
+  const cycleLeftPanel = useCallback(() => {
+    setLeftPanel(p => p === 'views' ? 'changelog' : 'views');
+  }, []);
+
+  const leftPanelLabel = leftPanel === 'views' ? 'Changelog' : 'Views';
+
+  // ==================== RENDER ====================
+  return (
+    <div style={{ width: '100%', height: '100vh', display: 'flex', flexDirection: 'column', fontFamily: FONT, background: 'var(--bg, #f5f6f8)', color: 'var(--text-primary, #1a1a1a)' }}>
+      {/* Full-screen canvas area with floating UI */}
+      <div style={{ flex: 1, position: 'relative', overflow: 'hidden' }}>
+
+        {/* ====== Top-left: Logo + file info ====== */}
+        <div style={{
+          position: 'absolute', top: 10, left: 10, zIndex: 10,
+          display: 'flex', alignItems: 'center', gap: 8,
+          background: 'rgba(255,255,255,0.88)',
+          backdropFilter: 'blur(16px) saturate(1.6)',
+          WebkitBackdropFilter: 'blur(16px) saturate(1.6)',
+          border: '1px solid rgba(255,255,255,0.5)',
+          borderRadius: 10,
+          boxShadow: '0 2px 12px rgba(0,0,0,0.06)',
+          padding: '6px 12px',
+        }}>
+          <div style={{ width: 22, height: 22, background: '#2a2a2a', borderRadius: 5, display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 9, fontWeight: 600, color: '#fff', letterSpacing: '-0.3px' }}>OA</div>
+          <span style={{ fontWeight: 600, fontSize: 13, color: '#2a2a2a', letterSpacing: '-0.01em' }}>OpenArchi</span>
+          {activeFileEntry && (
+            <span style={{ fontSize: 11, color: '#999' }}>
+              {dirState ? `${dirState.directoryName}/` : ''}{activeFileEntry.relativePath}{isDirty ? ' *' : ''}
+            </span>
+          )}
+        </div>
+
+        {/* ====== Top-right: Actions cluster ====== */}
+        <div style={{
+          position: 'absolute', top: 10, right: propSide === 'right' ? 270 : 10, zIndex: 10,
+          display: 'flex', alignItems: 'center', gap: 4,
+          background: 'rgba(255,255,255,0.88)',
+          backdropFilter: 'blur(16px) saturate(1.6)',
+          WebkitBackdropFilter: 'blur(16px) saturate(1.6)',
+          border: '1px solid rgba(255,255,255,0.5)',
+          borderRadius: 10,
+          boxShadow: '0 2px 12px rgba(0,0,0,0.06)',
+          padding: '4px 6px',
+        }}>
+          <Btn onClick={goBack} disabled={!canGoBack}>{'\u25C0'}</Btn>
+          <Btn onClick={goForward} disabled={!canGoForward}>{'\u25B6'}</Btn>
+          <div style={{ width: 1, height: 18, background: 'rgba(0,0,0,0.07)', margin: '0 2px' }} />
+          <Btn onClick={undo} disabled={historyIndexRef.current <= 0}>Undo</Btn>
+          <Btn onClick={redo} disabled={historyIndexRef.current >= historyRef.current.length - 1}>Redo</Btn>
+          <div style={{ width: 1, height: 18, background: 'rgba(0,0,0,0.07)', margin: '0 2px' }} />
+          <Btn onClick={cycleLeftPanel}>{leftPanelLabel}</Btn>
+        </div>
+
+        {/* ====== Tab bar island ====== */}
+        <div style={{
+          position: 'absolute', top: 10,
+          left: activeFileEntry ? 320 : 200,
+          right: propSide === 'right' ? 520 : 260,
+          zIndex: 10,
+          height: 32,
+          background: 'rgba(255,255,255,0.88)',
+          backdropFilter: 'blur(16px) saturate(1.6)',
+          WebkitBackdropFilter: 'blur(16px) saturate(1.6)',
+          border: '1px solid rgba(255,255,255,0.5)',
+          borderRadius: 10,
+          boxShadow: '0 2px 12px rgba(0,0,0,0.06)',
+          display: 'flex', alignItems: 'center', padding: '0 4px', gap: 1, overflow: 'auto',
+        }}>
+          {openTabIds.map(tid => {
+            const v = views.find(vv => vv.id === tid);
+            const isActive = tid === currentViewId;
+            return (
+              <div
+                key={tid}
+                onClick={() => navigateToView(tid)}
+                style={{
+                  display: 'flex', alignItems: 'center', gap: 5, padding: '4px 10px', fontSize: 12, fontFamily: 'inherit',
+                  cursor: 'pointer', userSelect: 'none', whiteSpace: 'nowrap',
+                  background: isActive ? 'var(--accent-bg, #eef2ff)' : 'transparent',
+                  color: isActive ? 'var(--accent-text, #1d4ed8)' : '#999',
+                  fontWeight: isActive ? 500 : 400,
+                  borderRadius: 5,
+                  border: 'none',
+                }}
+              >
+                <span>{v?.name || tid}</span>
+                {openTabIds.length > 1 && (
+                  <span
+                    onClick={e => { e.stopPropagation(); closeTab(tid); }}
+                    style={{ fontSize: 13, color: '#ccc', lineHeight: 1, padding: '0 2px', borderRadius: 3, cursor: 'pointer' }}
+                    onMouseEnter={e => { e.currentTarget.style.color = '#666'; e.currentTarget.style.background = 'rgba(0,0,0,0.06)'; }}
+                    onMouseLeave={e => { e.currentTarget.style.color = '#ccc'; e.currentTarget.style.background = 'transparent'; }}
+                  >
+                    {'\u00D7'}
+                  </span>
+                )}
+              </div>
+            );
+          })}
+        </div>
+
+        {/* ====== Left panel island (views + properties) ====== */}
+        <div style={{
+          position: 'absolute', left: 10, top: 52, bottom: 10, width: leftPanelWidth, zIndex: 10,
+          background: 'rgba(255,255,255,0.92)',
+          backdropFilter: 'blur(20px) saturate(1.6)',
+          WebkitBackdropFilter: 'blur(20px) saturate(1.6)',
+          borderRadius: 14, border: '1px solid rgba(255,255,255,0.5)',
+          boxShadow: '0 4px 24px rgba(0,0,0,0.08)',
+          display: 'flex', flexDirection: 'column', overflow: 'hidden',
+        }}>
+          {/* Resize handle */}
+          <div
+            style={{
+              position: 'absolute', right: -3, top: 0, bottom: 0, width: 6,
+              cursor: 'col-resize', zIndex: 20,
+            }}
+            onMouseDown={e => {
+              e.preventDefault();
+              const startX = e.clientX;
+              const startWidth = leftPanelWidth;
+              const onMove = (ev: MouseEvent) => {
+                const newWidth = Math.min(600, Math.max(180, startWidth + ev.clientX - startX));
+                setLeftPanelWidth(newWidth);
+              };
+              const onUp = () => {
+                window.removeEventListener('mousemove', onMove);
+                window.removeEventListener('mouseup', onUp);
+              };
+              window.addEventListener('mousemove', onMove);
+              window.addEventListener('mouseup', onUp);
+            }}
+          />
+          {leftPanel === 'views' ? (
+            <ViewNav views={views} currentViewId={currentViewId} onNavigate={navigateToView} />
+          ) : (
+            <div style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
+              <div style={{ padding: '14px 14px 7px', fontSize: 11, fontWeight: 500, color: '#a0a0a0', textTransform: 'uppercase', letterSpacing: '0.5px' }}>Changelog</div>
+              <div style={{ padding: '10px 14px', color: '#aaa', fontSize: 13, lineHeight: 1.7 }}>
+                <p style={{ margin: '0 0 10px', color: '#777', fontWeight: 400 }}>Change history will appear here.</p>
+                <p style={{ margin: 0, fontSize: 12 }}>
+                  Track element additions, modifications, relationship changes, and view updates over time.
+                </p>
+              </div>
+            </div>
+          )}
+          {/* Property panel on left side */}
+          {propSide === 'left' && (
+            <PropertyPanel
+              selEl={selEl}
+              selRel={selRel}
+              elements={elements}
+              onUpdateElement={updEl}
+              onUpdateRelationship={updRel}
+              side="left"
+              onToggleSide={() => setPropSide('right')}
+            />
+          )}
+        </div>
+
+        {/* ====== Canvas ====== */}
+        <div ref={containerRef} style={{ position: 'absolute', inset: 0 }}>
+          <canvas
+            ref={canvasRef}
+            style={{ cursor: resizing ? HANDLE_CURSORS[resizing.handle] : drawingRel ? 'crosshair' : dragging ? 'grabbing' : panning ? 'grabbing' : dragLabel ? 'ew-resize' : undefined }}
+            onMouseDown={handleMouseDown}
+            onMouseMove={handleMouseMove}
+            onMouseUp={handleMouseUp}
+            onDoubleClick={handleDblClick}
+            onContextMenu={handleContextMenu}
+            onMouseLeave={() => { setDragging(null); setPanning(null); setDragWP(null); setDragEndpoint(null); setDragLabel(null); setResizing(null); setHovElId(null); setHovRelId(null); setSnapGuides([]); }}
+            onWheel={handleWheel}
+          />
+
+          {/* Inline element name editor */}
+          {editingEl && editOverlay && (
+            <div
+              style={{
+                position: 'absolute',
+                left: editOverlay.left,
+                top: editOverlay.top,
+                width: editOverlay.width,
+                height: editOverlay.height,
+                display: 'flex', alignItems: editIsNote ? 'stretch' : 'center', justifyContent: 'center',
+                pointerEvents: 'none',
+                padding: editIsNote ? 6 : 0,
+                boxSizing: 'border-box',
+              }}
+            >
+              {editIsNote ? (
+                <textarea
+                  autoFocus
+                  value={editingName}
+                  onChange={e => setEditingName(e.target.value)}
+                  onKeyDown={e => { if (e.key === 'Escape') cancelEditing(); }}
+                  onBlur={commitEditing}
+                  style={{
+                    pointerEvents: 'auto',
+                    width: '100%',
+                    height: '100%',
+                    padding: '8px 10px',
+                    fontSize: Math.max(12, 14 * cam.s),
+                    fontFamily: 'inherit',
+                    fontWeight: 400,
+                    textAlign: 'left',
+                    border: '2px solid #2563eb',
+                    borderRadius: 4,
+                    outline: 'none',
+                    background: '#fffffa',
+                    color: '#333',
+                    boxShadow: '0 2px 12px rgba(37,99,235,0.2)',
+                    resize: 'none',
+                    lineHeight: '1.4',
+                  }}
+                />
+              ) : (
+                <input
+                  autoFocus
+                  value={editingName}
+                  onChange={e => setEditingName(e.target.value)}
+                  onKeyDown={e => { if (e.key === 'Enter') commitEditing(); if (e.key === 'Escape') cancelEditing(); }}
+                  onBlur={commitEditing}
+                  style={{
+                    pointerEvents: 'auto',
+                    width: Math.max(80, editOverlay.width - 20),
+                    padding: '4px 8px',
+                    fontSize: Math.max(12, 14 * cam.s),
+                    fontFamily: 'inherit',
+                    fontWeight: 600,
+                    textAlign: 'center',
+                    border: '2px solid #2563eb',
+                    borderRadius: 6,
+                    outline: 'none',
+                    background: '#fff',
+                    color: '#333',
+                    boxShadow: '0 2px 12px rgba(37,99,235,0.2)',
+                  }}
+                />
+              )}
+            </div>
+          )}
+
+          {relPicker && (
+            <RelPicker
+              x={Math.min(relPicker.sx, cSize.w - 280)}
+              y={Math.min(relPicker.sy, cSize.h - 420)}
+              onSelect={t => {
+                pushHistory();
+                setRelationships(p => [...p, { id: uid(), type: t, sourceId: relPicker.srcId, targetId: relPicker.tgtId, name: '', waypoints: relPickerWaypoints.current, labelPos: 0.5 }]);
+                relPickerWaypoints.current = [];
+                setRelPicker(null);
+              }}
+              onCancel={() => { relPickerWaypoints.current = []; setRelPicker(null); }}
+            />
+          )}
+
+          {ctxMenu && <CtxMenu x={ctxMenu.x} y={ctxMenu.y} items={ctxMenu.items} onClose={() => setCtxMenu(null)} />}
+
+          {showSearch && (
+            <SearchPanel
+              elements={elements}
+              views={views}
+              onSelectElement={id => {
+                setSelectedId(id);
+                setSelType('element');
+                const inView = visibleElements.find(element => element.id === id);
+                const el = inView || elements.find(element => element.id === id);
+                if (el) setCam(p => ({ ...p, x: cSize.w / 2 - el.x * p.s, y: cSize.h / 2 - el.y * p.s }));
+              }}
+              onSelectView={id => navigateToView(id)}
+              onClose={() => setShowSearch(false)}
+            />
+          )}
+
+          {/* Shift hint when drawing */}
+          {drawingRel && (
+            <div style={{
+              position: 'absolute', bottom: 120, left: '50%', transform: 'translateX(-50%)',
+              fontSize: 12, color: '#666', background: 'rgba(255,255,255,0.92)',
+              backdropFilter: 'blur(12px)',
+              WebkitBackdropFilter: 'blur(12px)',
+              padding: '6px 14px', borderRadius: 8,
+              border: '1px solid rgba(255,255,255,0.5)',
+              boxShadow: '0 2px 12px rgba(0,0,0,0.08)',
+              whiteSpace: 'nowrap',
+            }}>
+              Hold <strong>Shift + Click</strong> to add a waypoint bend
+            </div>
+          )}
+        </div>
+
+        {/* ====== Floating toolbar (bottom center) ====== */}
+        <FloatingToolbar
+          activeLayer={activeLayer}
+          onLayerChange={setActiveLayer}
+          onAddElement={addElement}
+          onDeleteSelected={deleteSelected}
+          hasSelection={!!selectedId}
+          onOpenDir={handleOpenDirectory}
+          onImport={importModel}
+          onExport={exportModel}
+          onSave={handleSave}
+          canSave={!!activeFileEntry}
+          isDirty={isDirty}
+          dirState={!!dirState}
+          dirFiles={dirState?.files || []}
+          activeFilePath={activeFileEntry?.relativePath || ''}
+          onSelectFile={path => {
+            const entry = dirState?.files.find(f => f.relativePath === path);
+            if (entry) loadFileEntry(entry);
+          }}
+          ioFormatId={ioFormatId}
+          onFormatChange={setIoFormatId}
+          modelFormats={modelFormats}
+          gridType={gridType}
+          onToggleGrid={() => setGridType(g => g === 'dot' ? 'line' : 'dot')}
+          onSearch={() => setShowSearch(s => !s)}
+        />
+
+        {/* ====== Legend toggle + panel (bottom-right) ====== */}
+        <button
+          onClick={() => setShowLegend(l => !l)}
+          style={{
+            position: 'absolute', bottom: 14, right: propSide === 'right' ? 274 : 12, zIndex: 50,
+            width: 32, height: 32, borderRadius: 8, border: '1px solid rgba(0,0,0,0.06)',
+            background: showLegend ? 'rgba(37,99,235,0.1)' : 'rgba(245,246,248,0.8)',
+            backdropFilter: 'blur(12px)', WebkitBackdropFilter: 'blur(12px)',
+            boxShadow: '0 2px 8px rgba(0,0,0,0.06)',
+            cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center',
+            color: showLegend ? '#1d4ed8' : '#8a8a90', fontSize: 11, fontWeight: 600, fontFamily: FONT,
+            padding: 0,
+          }}
+          title={showLegend ? 'Hide Legend' : 'Show Legend'}
+        >
+          <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><rect x="2" y="2" width="12" height="12" rx="1.5" stroke="currentColor" strokeWidth="1.2" /><line x1="5" y1="6" x2="7.5" y2="6" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" /><line x1="9" y1="6" x2="11" y2="6" stroke="currentColor" strokeWidth="0.8" strokeLinecap="round" opacity="0.4" /><line x1="5" y1="8.5" x2="7.5" y2="8.5" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" /><line x1="9" y1="8.5" x2="11" y2="8.5" stroke="currentColor" strokeWidth="0.8" strokeLinecap="round" opacity="0.4" /><line x1="5" y1="11" x2="7.5" y2="11" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" /><line x1="9" y1="11" x2="11" y2="11" stroke="currentColor" strokeWidth="0.8" strokeLinecap="round" opacity="0.4" /></svg>
+        </button>
+        {showLegend && (() => {
+          const usedElTypes = new Set<string>();
+          for (const el of visibleElements) {
+            if (ELEMENT_TYPES[el.type] && !ELEMENT_TYPES[el.type].isNote) usedElTypes.add(el.type);
+          }
+          const usedRelTypes = new Set<string>();
+          for (const r of visibleRelationships) {
+            usedRelTypes.add(r.type);
+          }
+          const activeElTypes = Object.entries(ELEMENT_TYPES).filter(([k]) => usedElTypes.has(k));
+          const activeRelTypes = Object.entries(RELATIONSHIP_TYPES).filter(([k]) => usedRelTypes.has(k));
+
+          const relLineW = 44;
+          const relLineH = 16;
+
+          const renderRelSvg = (rd: { dash: boolean; head: string }) => {
+            const y = relLineH / 2;
+            const x1 = 2, x2 = relLineW - 2;
+            const col = '#777';
+            const aL = 7;
+            const aS = 0.5;
+
+            const linePath = `M${x1},${y} L${x2},${y}`;
+            const dashArray = rd.dash ? '4,2.5' : undefined;
+
+            let headMarkup = null;
+            if (rd.head === 'filled_arrow') {
+              const hw = aL * Math.sin(aS);
+              headMarkup = <polygon points={`${x2},${y} ${x2 - aL},${y - hw} ${x2 - aL},${y + hw}`} fill={col} />;
+            } else if (rd.head === 'open_arrow') {
+              const hw = aL * Math.sin(aS);
+              headMarkup = <polyline points={`${x2 - aL},${y - hw} ${x2},${y} ${x2 - aL},${y + hw}`} fill="none" stroke={col} strokeWidth="1.3" strokeLinejoin="round" />;
+            } else if (rd.head === 'hollow_arrow') {
+              const hw = aL * Math.sin(aS);
+              headMarkup = <polygon points={`${x2},${y} ${x2 - aL},${y - hw} ${x2 - aL},${y + hw}`} fill="#fff" stroke={col} strokeWidth="1.1" />;
+            } else if (rd.head === 'diamond_filled' || rd.head === 'diamond') {
+              const dL = 8, dW = 3.5;
+              headMarkup = <polygon points={`${x1},${y} ${x1 + dL / 2},${y - dW} ${x1 + dL},${y} ${x1 + dL / 2},${y + dW}`} fill={rd.head === 'diamond_filled' ? col : '#fff'} stroke={col} strokeWidth="0.9" />;
+            } else if (rd.head === 'filled_dot') {
+              headMarkup = <circle cx={x1 + 4} cy={y} r={3} fill={col} />;
+            }
+
+            return (
+              <svg width={relLineW} height={relLineH} style={{ flexShrink: 0 }}>
+                <path d={linePath} stroke={col} strokeWidth="1.1" fill="none" strokeDasharray={dashArray} />
+                {headMarkup}
+              </svg>
+            );
+          };
+
+          return (
+            <div style={{
+              position: 'absolute', bottom: 110, right: propSide === 'right' ? 274 : 12, zIndex: 50,
+              background: 'rgba(255,255,255,0.94)',
+              backdropFilter: 'blur(20px) saturate(1.6)',
+              WebkitBackdropFilter: 'blur(20px) saturate(1.6)',
+              border: '1px solid rgba(255,255,255,0.5)',
+              borderRadius: 12,
+              boxShadow: '0 4px 24px rgba(0,0,0,0.1)', padding: '12px 16px',
+              width: 300, fontSize: 12, fontFamily: FONT, maxHeight: 440, overflow: 'auto',
+            }}>
+              {activeElTypes.length > 0 && (
+                <>
+                  <div style={{ fontSize: 10, fontWeight: 600, color: '#a0a0a0', textTransform: 'uppercase', marginBottom: 8, letterSpacing: '0.5px' }}>Elements</div>
+                  <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '4px 12px' }}>
+                    {activeElTypes.map(([k, def]) => {
+                      const L = LAYERS[def.layer];
+                      return (
+                        <div key={k} style={{ display: 'flex', alignItems: 'center', gap: 7, padding: '2px 0' }}>
+                          <CanvasIcon type={k} size={16} color={L?.accent || '#888'} />
+                          <span style={{ color: '#444', fontSize: 12 }}>{def.label}</span>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </>
+              )}
+              {activeElTypes.length > 0 && activeRelTypes.length > 0 && (
+                <div style={{ height: 1, background: 'rgba(0,0,0,0.06)', margin: '10px 0' }} />
+              )}
+              {activeRelTypes.length > 0 && (
+                <>
+                  <div style={{ fontSize: 10, fontWeight: 600, color: '#a0a0a0', textTransform: 'uppercase', marginBottom: 8, letterSpacing: '0.5px' }}>Relationships</div>
+                  {activeRelTypes.map(([, rd]) => (
+                    <div key={rd.label} style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 2 }}>
+                      {renderRelSvg(rd)}
+                      <div style={{ display: 'flex', flexDirection: 'column' }}>
+                        <span style={{ color: '#444', fontSize: 12, fontWeight: 500 }}>{rd.label}</span>
+                        <span style={{ color: '#aaa', fontSize: 10 }}>{rd.desc}</span>
+                      </div>
+                    </div>
+                  ))}
+                </>
+              )}
+              {activeElTypes.length === 0 && activeRelTypes.length === 0 && (
+                <div style={{ color: '#bbb', fontSize: 12, padding: '4px 0' }}>No elements or relationships yet.</div>
+              )}
+            </div>
+          );
+        })()}
+
+        {/* ====== Zoom indicator (bottom-left) ====== */}
+        <div style={{
+          position: 'absolute', bottom: 12, left: leftPanelWidth + 24, zIndex: 10,
+          fontSize: 11, color: '#aaa',
+          background: 'rgba(255,255,255,0.85)',
+          backdropFilter: 'blur(12px)',
+          WebkitBackdropFilter: 'blur(12px)',
+          padding: '3px 8px', borderRadius: 6,
+          border: '1px solid rgba(255,255,255,0.5)',
+          boxShadow: '0 1px 4px rgba(0,0,0,0.04)',
+          fontWeight: 500,
+        }}>
+          {Math.round(cam.s * 100)}%
+        </div>
+
+        {/* ====== Stats (bottom-left, next to zoom) ====== */}
+        <div style={{
+          position: 'absolute', bottom: 12, left: leftPanelWidth + 80, zIndex: 10,
+          fontSize: 11, color: '#bbb',
+          fontWeight: 400,
+        }}>
+          {visibleElements.length} el {'\u00B7'} {visibleRelationships.length} rel
+        </div>
+
+        {/* ====== Property panel on right side ====== */}
+        {propSide === 'right' && (
+          <div style={{
+            position: 'absolute', right: 10, top: 52, bottom: 10, width: 252, zIndex: 10,
+            background: 'rgba(255,255,255,0.92)',
+            backdropFilter: 'blur(20px) saturate(1.6)',
+            WebkitBackdropFilter: 'blur(20px) saturate(1.6)',
+            borderRadius: 14, border: '1px solid rgba(255,255,255,0.5)',
+            boxShadow: '0 4px 24px rgba(0,0,0,0.08)',
+            display: 'flex', flexDirection: 'column', overflow: 'hidden',
+          }}>
+            <PropertyPanel
+              selEl={selEl}
+              selRel={selRel}
+              elements={elements}
+              onUpdateElement={updEl}
+              onUpdateRelationship={updRel}
+              side="right"
+              onToggleSide={() => setPropSide('left')}
+            />
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}

@@ -15,16 +15,18 @@ export function uid(): string {
 // Anchor points (8 per element)
 // ============================================================
 
+const ANCHOR_GAP = 8;
+
 export function getAnchors(el: ModelElement): Anchor[] {
   return [
-    { x: el.x + el.w / 2, y: el.y, side: 'tc' },
-    { x: el.x + el.w / 2, y: el.y + el.h, side: 'bc' },
-    { x: el.x, y: el.y + el.h / 2, side: 'ml' },
-    { x: el.x + el.w, y: el.y + el.h / 2, side: 'mr' },
-    { x: el.x + el.w * 0.25, y: el.y, side: 'tl' },
-    { x: el.x + el.w * 0.75, y: el.y, side: 'tr' },
-    { x: el.x + el.w * 0.25, y: el.y + el.h, side: 'bl' },
-    { x: el.x + el.w * 0.75, y: el.y + el.h, side: 'br' },
+    { x: el.x + el.w / 2, y: el.y - ANCHOR_GAP, side: 'tc' },
+    { x: el.x + el.w / 2, y: el.y + el.h + ANCHOR_GAP, side: 'bc' },
+    { x: el.x - ANCHOR_GAP, y: el.y + el.h / 2, side: 'ml' },
+    { x: el.x + el.w + ANCHOR_GAP, y: el.y + el.h / 2, side: 'mr' },
+    { x: el.x + el.w * 0.25, y: el.y - ANCHOR_GAP, side: 'tl' },
+    { x: el.x + el.w * 0.75, y: el.y - ANCHOR_GAP, side: 'tr' },
+    { x: el.x + el.w * 0.25, y: el.y + el.h + ANCHOR_GAP, side: 'bl' },
+    { x: el.x + el.w * 0.75, y: el.y + el.h + ANCHOR_GAP, side: 'br' },
   ];
 }
 

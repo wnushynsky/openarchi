@@ -613,7 +613,7 @@ export default function App() {
         const wps = drawingRel.waypoints;
         const startPt = wps.length > 0 ? wps[0] : null;
         const a = nearestAnchor(src, startPt?.x ?? drawingRel.mx, startPt?.y ?? drawingRel.my);
-        const col = '#3b82f6';
+        const col = '#4a5568';
         ctx.save();
         // Line
         ctx.beginPath();
@@ -1442,8 +1442,8 @@ export default function App() {
                 style={{
                   display: 'flex', alignItems: 'center', gap: 5, padding: '0 10px', fontSize: 12, fontFamily: 'inherit',
                   cursor: 'pointer', userSelect: 'none', whiteSpace: 'nowrap',
-                  background: isActive ? 'var(--surface-selected, rgba(37,99,235,0.07))' : 'transparent',
-                  color: isActive ? 'var(--accent-text, #1d4ed8)' : 'var(--text-muted, #8a8a90)',
+                  background: isActive ? 'var(--surface-selected, rgba(74,85,104,0.07))' : 'transparent',
+                  color: isActive ? 'var(--accent-text, #374151)' : 'var(--text-muted, #8a8a90)',
                   fontWeight: isActive ? 500 : 400,
                   borderRadius: 6,
                   border: 'none',
@@ -1578,7 +1578,7 @@ export default function App() {
                     fontFamily: 'inherit',
                     fontWeight: 400,
                     textAlign: 'left',
-                    border: '2px solid #2563eb',
+                    border: '2px solid #4a5568',
                     borderRadius: 4,
                     outline: 'none',
                     background: '#fffffa',
@@ -1603,7 +1603,7 @@ export default function App() {
                     fontFamily: 'inherit',
                     fontWeight: 600,
                     textAlign: 'center',
-                    border: '2px solid #2563eb',
+                    border: '2px solid #4a5568',
                     borderRadius: 6,
                     outline: 'none',
                     background: '#fff',
@@ -1700,12 +1700,12 @@ export default function App() {
             position: 'absolute', bottom: 14, right: propSide === 'right' ? 274 : 12, zIndex: 50,
             width: 30, height: 30, borderRadius: 'var(--radius-sm, 6px)',
             border: '1px solid var(--glass-border, rgba(255,255,255,0.55))',
-            background: showLegend ? 'var(--surface-selected, rgba(37,99,235,0.07))' : 'var(--glass, rgba(255,255,255,0.82))',
+            background: showLegend ? 'var(--surface-selected, rgba(74,85,104,0.07))' : 'var(--glass, rgba(255,255,255,0.82))',
             backdropFilter: 'var(--glass-blur, blur(20px) saturate(1.8))',
             WebkitBackdropFilter: 'var(--glass-blur, blur(20px) saturate(1.8))',
             boxShadow: 'var(--shadow-sm, 0 1px 3px rgba(0,0,0,0.03))',
             cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center',
-            color: showLegend ? 'var(--accent-text, #1d4ed8)' : 'var(--text-muted, #8a8a90)',
+            color: showLegend ? 'var(--accent-text, #374151)' : 'var(--text-muted, #8a8a90)',
             fontSize: 11, fontWeight: 600, fontFamily: FONT, padding: 0,
             transition: 'background var(--transition-fast, 0.12s ease), color var(--transition-fast, 0.12s ease)',
           }}
@@ -1785,7 +1785,7 @@ export default function App() {
                       const L = LAYERS[def.layer];
                       return (
                         <div key={k} style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '1px 0' }}>
-                          <CanvasIcon type={k} size={14} color={L?.accent || '#888'} />
+                          <CanvasIcon type={k} size={16} color={L?.stroke || '#666'} />
                           <span style={{ color: 'var(--text-secondary, #555)', fontSize: 11.5 }}>{def.label}</span>
                         </div>
                       );

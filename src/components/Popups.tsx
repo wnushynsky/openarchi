@@ -125,7 +125,7 @@ function CtxMenuItemRow({ item, onClose }: { item: CtxMenuItem; onClose: () => v
         onMouseEnter={itemHover}
         onMouseLeave={itemUnhover}
       >
-        {item.icon && <CanvasIcon type={item.icon} size={18} color={item.iconColor || '#888'} />}
+        {item.icon && <CanvasIcon type={item.icon} size={20} color={item.iconColor || '#666'} />}
         <span style={{ flex: 1 }}>{item.label}</span>
         {hasChildren && <span style={{ fontSize: 9, color: 'var(--text-faint, #b0b0b8)', marginLeft: 4 }}>{'\u25B6'}</span>}
       </button>

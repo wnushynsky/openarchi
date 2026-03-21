@@ -382,7 +382,7 @@ export function PropertyPanel({ selEl, selRel, elements, onUpdateElement, onUpda
             <>
               <PF label="Type">
                 <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-                  <CanvasIcon type={selEl.type} size={16} color={LAYERS[ELEMENT_TYPES[selEl.type]?.layer]?.accent || '#888'} />
+                  <CanvasIcon type={selEl.type} size={18} color={LAYERS[ELEMENT_TYPES[selEl.type]?.layer]?.stroke || '#666'} />
                   <select value={selEl.type} onChange={e => onUpdateElement('type', e.target.value)} style={{ ...iS, flex: 1 }}>
                     {Object.entries(ELEMENT_TYPES).filter(([, v]) => !v.isNote).map(([k, v]) => <option key={k} value={k}>{v.label}</option>)}
                   </select>

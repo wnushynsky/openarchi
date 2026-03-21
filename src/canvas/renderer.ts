@@ -1,13 +1,13 @@
 import type { ModelElement, ModelRelationship, LayerDef } from '../types';
-import { LAYERS, NOTE_STYLE, ELEMENT_TYPES, RELATIONSHIP_TYPES, ICONS, ICON_MAP } from '../core/metamodel';
+import { LAYERS, NOTE_STYLE, ELEMENT_TYPES, RELATIONSHIP_TYPES, ICON_MAP, drawIcon } from '../core/metamodel';
 import { GRID, FONT, getAnchors, getRelPoints, pointOnPath, getResizeHandles, type SnapGuide } from '../core/geometry';
 
 const VIEW_REFERENCE_STYLE: LayerDef = {
   label: 'View',
-  fill: '#ECEDEF',
-  stroke: '#A8ACB2',
-  accent: '#7E848D',
-  text: '#4C525B',
+  fill: '#E4E6EA',
+  stroke: '#8A9098',
+  accent: '#687078',
+  text: '#3A4048',
 };
 
 // ============================================================
@@ -99,9 +99,9 @@ export function drawElement(ctx: CanvasRenderingContext2D, el: ModelElement, isS
 
   // Shadow
   if (!isComposite) {
-    ctx.shadowColor = isSel ? 'rgba(37,99,235,0.14)' : 'rgba(0,0,0,0.05)';
-    ctx.shadowBlur = isSel ? 12 : 4;
-    ctx.shadowOffsetY = isSel ? 1 : 1;
+    ctx.shadowColor = isSel ? 'rgba(74,85,104,0.18)' : 'rgba(0,0,0,0.10)';
+    ctx.shadowBlur = isSel ? 14 : 6;
+    ctx.shadowOffsetY = isSel ? 2 : 1;
   }
 
   rrect(ctx, x, y, w, h, r);
@@ -110,7 +110,7 @@ export function drawElement(ctx: CanvasRenderingContext2D, el: ModelElement, isS
     ctx.fillStyle = L.fill; ctx.fill();
     ctx.shadowColor = 'transparent';
     ctx.lineWidth = isSel ? 2 : 1;
-    ctx.strokeStyle = isSel ? '#2563eb' : L.stroke;
+    ctx.strokeStyle = isSel ? '#4a5568' : L.stroke;
     ctx.stroke();
 
     // Folded corner icon (top-right)
@@ -146,17 +146,17 @@ export function drawElement(ctx: CanvasRenderingContext2D, el: ModelElement, isS
     if (el.type === 'orJunction') {
       ctx.fillStyle = '#fff'; ctx.fill();
       ctx.lineWidth = isSel ? 2.5 : 2;
-      ctx.strokeStyle = isSel ? '#2563eb' : '#444';
+      ctx.strokeStyle = isSel ? '#4a5568' : '#444';
       ctx.stroke();
     } else {
-      ctx.fillStyle = isSel ? '#2563eb' : '#444';
+      ctx.fillStyle = isSel ? '#4a5568' : '#444';
       ctx.fill();
     }
   } else if (isComposite) {
     ctx.fillStyle = 'rgba(255,255,255,0.02)'; ctx.fill();
     ctx.shadowColor = 'transparent';
     ctx.setLineDash([5, 4]); ctx.lineWidth = 1.2;
-    ctx.strokeStyle = isSel ? '#2563eb' : '#b0b0b8';
+    ctx.strokeStyle = isSel ? '#4a5568' : '#b0b0b8';
     ctx.stroke(); ctx.setLineDash([]);
 
     ctx.font = `400 14px ${FONT}`;
@@ -166,28 +166,22 @@ export function drawElement(ctx: CanvasRenderingContext2D, el: ModelElement, isS
     // Icon (top-right corner)
     const cIconKey = ICON_MAP[el.type];
     if (cIconKey) {
-      const cDrawFn = ICONS[cIconKey];
-      if (cDrawFn) {
-        ctx.save();
-        ctx.beginPath();
-        cDrawFn(ctx, x + w - 15, y + 14, 9);
-        ctx.strokeStyle = '#999'; ctx.lineWidth = 1.5;
-        ctx.lineJoin = 'round'; ctx.lineCap = 'round';
-        ctx.setLineDash([]); ctx.stroke();
-        ctx.restore();
-      }
+      ctx.save();
+      ctx.setLineDash([]);
+      drawIcon(ctx, cIconKey, x + w - 14, y + 13, 16, '#606068');
+      ctx.restore();
     }
   } else {
     ctx.fillStyle = L.fill; ctx.fill();
     ctx.shadowColor = 'transparent';
-    ctx.lineWidth = isSel ? 2 : 1;
-    ctx.strokeStyle = isSel ? '#2563eb' : L.stroke;
+    ctx.lineWidth = isSel ? 2.2 : 1.2;
+    ctx.strokeStyle = isSel ? '#4a5568' : L.stroke;
     ctx.stroke();
 
     if (isViewReference) {
       // View reference: draw a small "navigate" arrow icon (top-right)
       ctx.save();
-      const ix = x + w - 15, iy = y + 14, s = 7;
+      const ix = x + w - 16, iy = y + 15, s = 8;
       ctx.beginPath();
       // Folder tab shape
       ctx.moveTo(ix - s, iy - s * 0.5);
@@ -204,14 +198,7 @@ export function drawElement(ctx: CanvasRenderingContext2D, el: ModelElement, isS
       ctx.restore();
     } else {
       const iconKey = ICON_MAP[el.type] || 'generic';
-      const drawFn = ICONS[iconKey] || ICONS.generic;
-      ctx.save();
-      ctx.beginPath();
-      drawFn(ctx, x + w - 15, y + 14, 9);
-      ctx.strokeStyle = L.accent; ctx.lineWidth = 1.2;
-      ctx.lineJoin = 'round'; ctx.lineCap = 'round';
-      ctx.stroke();
-      ctx.restore();
+      drawIcon(ctx, iconKey, x + w - 14, y + 13, 16, L.stroke);
     }
 
     // Label — move to top-left when children overlap this element
@@ -278,17 +265,17 @@ export function drawElement(ctx: CanvasRenderingContext2D, el: ModelElement, isS
       ctx.beginPath(); ctx.arc(a.x, a.y, rad, 0, Math.PI * 2);
       ctx.fillStyle = '#fff'; ctx.fill();
       ctx.lineWidth = isPrimary ? 2 : 1.4;
-      ctx.strokeStyle = '#3b82f6'; ctx.stroke();
+      ctx.strokeStyle = '#4a5568'; ctx.stroke();
       if (isPrimary) {
         ctx.beginPath(); ctx.arc(a.x, a.y, 2, 0, Math.PI * 2);
-        ctx.fillStyle = '#3b82f6'; ctx.fill();
+        ctx.fillStyle = '#4a5568'; ctx.fill();
       }
     });
   }
 
   // Selection + resize handles
   if (isSel) {
-    ctx.setLineDash([4, 3]); ctx.strokeStyle = 'rgba(37,99,235,0.35)'; ctx.lineWidth = 1;
+    ctx.setLineDash([4, 3]); ctx.strokeStyle = 'rgba(74,85,104,0.35)'; ctx.lineWidth = 1;
     rrect(ctx, x - 5, y - 5, w + 10, h + 10, r + 3);
     ctx.stroke(); ctx.setLineDash([]);
 
@@ -297,7 +284,7 @@ export function drawElement(ctx: CanvasRenderingContext2D, el: ModelElement, isS
     for (const hd of handles) {
       const sz = 4;
       ctx.fillStyle = '#fff';
-      ctx.strokeStyle = '#2563eb';
+      ctx.strokeStyle = '#4a5568';
       ctx.lineWidth = 1.4;
       ctx.beginPath();
       ctx.rect(hd.x - sz, hd.y - sz, sz * 2, sz * 2);
@@ -402,8 +389,8 @@ export function drawRelationship(ctx: CanvasRenderingContext2D, rel: ModelRelati
   if (!pts) return;
   const { start, end, waypoints } = pts;
   const rd = RELATIONSHIP_TYPES[rel.type] || RELATIONSHIP_TYPES.association;
-  const col = isSel ? '#2563eb' : isHov ? '#555' : '#777';
-  const lw = isSel ? 1.6 : 1.1;
+  const col = isSel ? '#4a5568' : isHov ? '#444' : '#555';
+  const lw = isSel ? 1.8 : 1.2;
 
   ctx.save();
   ctx.strokeStyle = col; ctx.lineWidth = lw;
@@ -476,12 +463,12 @@ export function drawRelationship(ctx: CanvasRenderingContext2D, rel: ModelRelati
     waypoints.forEach(wp => {
       ctx.beginPath(); ctx.arc(wp.x, wp.y, 4.5, 0, Math.PI * 2);
       ctx.fillStyle = '#fff'; ctx.fill();
-      ctx.lineWidth = 1.6; ctx.strokeStyle = '#2563eb'; ctx.stroke();
+      ctx.lineWidth = 1.6; ctx.strokeStyle = '#4a5568'; ctx.stroke();
     });
     // Endpoint handles (start & end)
     [start, end].forEach(pt => {
       ctx.beginPath(); ctx.arc(pt.x, pt.y, 5, 0, Math.PI * 2);
-      ctx.fillStyle = '#2563eb'; ctx.fill();
+      ctx.fillStyle = '#4a5568'; ctx.fill();
       ctx.lineWidth = 1.6; ctx.strokeStyle = '#fff'; ctx.stroke();
     });
   }
@@ -495,8 +482,8 @@ export function drawRelationship(ctx: CanvasRenderingContext2D, rel: ModelRelati
     const padX = 6, padY = 3;
     rrect(ctx, pt.x - measured / 2 - padX, pt.y - 8 - padY, measured + padX * 2, 16 + padY * 2, 3);
     ctx.fillStyle = 'rgba(255,255,255,0.95)'; ctx.fill();
-    if (isSel) { ctx.strokeStyle = 'rgba(37,99,235,0.25)'; ctx.lineWidth = 0.8; ctx.stroke(); }
-    ctx.fillStyle = isSel ? '#2563eb' : '#777';
+    if (isSel) { ctx.strokeStyle = 'rgba(74,85,104,0.25)'; ctx.lineWidth = 0.8; ctx.stroke(); }
+    ctx.fillStyle = isSel ? '#4a5568' : '#777';
     ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
     ctx.fillText(rel.name, pt.x, pt.y);
   }
@@ -515,7 +502,7 @@ export function drawSnapGuides(ctx: CanvasRenderingContext2D, guides: SnapGuide[
   ctx.lineWidth = 1 / sc; // constant pixel width regardless of zoom
 
   for (const guide of guides) {
-    ctx.strokeStyle = guide.type === 'center' ? '#e855a0' : '#3b82f6';
+    ctx.strokeStyle = guide.type === 'center' ? '#e855a0' : '#4a5568';
     ctx.beginPath();
     // Extend lines across the visible viewport
     const vLeft   = -ox / sc;

@@ -10,37 +10,37 @@
 
 :root {
   /* ── Canvas ── */
-  --bg: #f3f4f6;
-  --canvas-dot: rgba(0, 0, 0, 0.14);
+  --bg: #eef0f4;
+  --canvas-dot: rgba(0, 0, 0, 0.18);
 
   /* ── Surfaces ── */
-  --glass: rgba(255, 255, 255, 0.82);
-  --glass-strong: rgba(255, 255, 255, 0.92);
-  --glass-blur: blur(20px) saturate(1.8);
-  --glass-border: rgba(255, 255, 255, 0.55);
-  --glass-border-subtle: rgba(0, 0, 0, 0.04);
+  --glass: rgba(255, 255, 255, 0.92);
+  --glass-strong: rgba(255, 255, 255, 0.96);
+  --glass-blur: blur(16px) saturate(1.6);
+  --glass-border: rgba(0, 0, 0, 0.08);
+  --glass-border-subtle: rgba(0, 0, 0, 0.05);
   --surface-solid: #ffffff;
-  --surface-hover: rgba(0, 0, 0, 0.035);
-  --surface-active: rgba(0, 0, 0, 0.06);
-  --surface-selected: rgba(37, 99, 235, 0.07);
+  --surface-hover: rgba(0, 0, 0, 0.05);
+  --surface-active: rgba(0, 0, 0, 0.08);
+  --surface-selected: rgba(74, 85, 104, 0.09);
 
   /* ── Borders ── */
-  --border: rgba(0, 0, 0, 0.06);
-  --border-strong: rgba(0, 0, 0, 0.10);
-  --border-focus: rgba(37, 99, 235, 0.4);
+  --border: rgba(0, 0, 0, 0.10);
+  --border-strong: rgba(0, 0, 0, 0.16);
+  --border-focus: rgba(74, 85, 104, 0.45);
 
   /* ── Text ── */
-  --text-primary: #1a1a1a;
-  --text-secondary: #555;
-  --text-muted: #8a8a90;
-  --text-faint: #b0b0b8;
+  --text-primary: #111318;
+  --text-secondary: #3d4350;
+  --text-muted: #6b7080;
+  --text-faint: #9298a4;
 
   /* ── Accent ── */
-  --accent: #2563eb;
-  --accent-hover: #1d4ed8;
-  --accent-bg: #eef2ff;
-  --accent-text: #1d4ed8;
-  --accent-ring: rgba(37, 99, 235, 0.12);
+  --accent: #4a5568;
+  --accent-hover: #374151;
+  --accent-bg: #f0f1f3;
+  --accent-text: #2d3748;
+  --accent-ring: rgba(74, 85, 104, 0.14);
 
   /* ── Radii ── */
   --radius-xs: 4px;
@@ -49,10 +49,10 @@
   --radius-lg: 14px;
 
   /* ── Shadows ── */
-  --shadow-sm: 0 1px 3px rgba(0, 0, 0, 0.03), 0 1px 2px rgba(0, 0, 0, 0.02);
-  --shadow-md: 0 2px 12px rgba(0, 0, 0, 0.06), 0 1px 3px rgba(0, 0, 0, 0.03);
-  --shadow-lg: 0 4px 24px rgba(0, 0, 0, 0.08), 0 2px 8px rgba(0, 0, 0, 0.03);
-  --shadow-xl: 0 8px 40px rgba(0, 0, 0, 0.10), 0 4px 12px rgba(0, 0, 0, 0.04);
+  --shadow-sm: 0 1px 3px rgba(0, 0, 0, 0.06), 0 1px 2px rgba(0, 0, 0, 0.04);
+  --shadow-md: 0 2px 8px rgba(0, 0, 0, 0.10), 0 1px 3px rgba(0, 0, 0, 0.06);
+  --shadow-lg: 0 4px 20px rgba(0, 0, 0, 0.12), 0 2px 6px rgba(0, 0, 0, 0.06);
+  --shadow-xl: 0 8px 32px rgba(0, 0, 0, 0.14), 0 4px 10px rgba(0, 0, 0, 0.06);
 
   /* ── Spacing ── */
   --sp-1: 4px;
@@ -106,12 +106,12 @@ button {
 }
 
 ::-webkit-scrollbar-thumb {
-  background: rgba(0, 0, 0, 0.10);
+  background: rgba(0, 0, 0, 0.16);
   border-radius: 4px;
 }
 
 ::-webkit-scrollbar-thumb:hover {
-  background: rgba(0, 0, 0, 0.18);
+  background: rgba(0, 0, 0, 0.28);
 }
 
 /* ── Focus rings ── */
@@ -125,6 +125,6 @@ select:focus {
 
 /* ── Selection ── */
 ::selection {
-  background: rgba(37, 99, 235, 0.15);
+  background: rgba(74, 85, 104, 0.15);
   color: inherit;
 }

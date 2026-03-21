@@ -71,7 +71,7 @@ function ElementPicker({ layerKey, onAddElement, onClose }: { layerKey: string; 
             onMouseEnter={e => { e.currentTarget.style.background = L?.fill === 'transparent' ? 'var(--surface-hover)' : (L?.fill || 'var(--surface-hover)'); }}
             onMouseLeave={e => { e.currentTarget.style.background = 'transparent'; }}
           >
-            <CanvasIcon type={k} size={18} color={L?.accent || '#888'} />
+            <CanvasIcon type={k} size={20} color={L?.stroke || '#666'} />
             <span style={{ overflow: 'hidden', textOverflow: 'ellipsis' }}>{d.label}</span>
           </button>
         ))}

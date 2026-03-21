@@ -71,16 +71,26 @@ export function drawLineGrid(ctx: CanvasRenderingContext2D, w: number, h: number
 // Element rendering
 // ============================================================
 
+const JUNCTION_STYLE: LayerDef = {
+  label: 'Junction',
+  fill: '#444',
+  stroke: '#222',
+  accent: '#666',
+  text: '#fff',
+};
+
 function getLayerStyle(type: string): LayerDef {
   if (ELEMENT_TYPES[type]?.isNote) return NOTE_STYLE;
   if (type === 'viewReference') return VIEW_REFERENCE_STYLE;
+  if (type === 'andJunction' || type === 'orJunction') return JUNCTION_STYLE;
   return LAYERS[ELEMENT_TYPES[type]?.layer] || LAYERS.composite;
 }
 
 export function drawElement(ctx: CanvasRenderingContext2D, el: ModelElement, isSel: boolean, isHov: boolean, showAnch: boolean, hasChildren: boolean = false) {
   const isNote = ELEMENT_TYPES[el.type]?.isNote;
   const isViewReference = el.type === 'viewReference';
-  const isComposite = ELEMENT_TYPES[el.type]?.layer === 'composite' && !isNote;
+  const isJunction = el.type === 'andJunction' || el.type === 'orJunction';
+  const isComposite = ELEMENT_TYPES[el.type]?.layer === 'composite' && !isNote && !isJunction;
   const L = getLayerStyle(el.type);
   const { x, y, w, h } = el;
   const r = isNote ? 3 : (ELEMENT_TYPES[el.type]?.shape === 'round' ? 10 : 3);
@@ -126,6 +136,22 @@ export function drawElement(ctx: CanvasRenderingContext2D, el: ModelElement, isS
     }
     if (cur) lines.push(cur);
     lines.forEach((ln, i) => ctx.fillText(ln, x + pad, y + pad + i * 19));
+  } else if (isJunction) {
+    // Junction: small filled circle (AND=black, OR=white with border)
+    ctx.shadowColor = 'transparent';
+    const cx = x + w / 2, cy = y + h / 2;
+    const radius = Math.min(w, h) / 2.5;
+    ctx.beginPath();
+    ctx.arc(cx, cy, radius, 0, Math.PI * 2);
+    if (el.type === 'orJunction') {
+      ctx.fillStyle = '#fff'; ctx.fill();
+      ctx.lineWidth = isSel ? 2.5 : 2;
+      ctx.strokeStyle = isSel ? '#2563eb' : '#444';
+      ctx.stroke();
+    } else {
+      ctx.fillStyle = isSel ? '#2563eb' : '#444';
+      ctx.fill();
+    }
   } else if (isComposite) {
     ctx.fillStyle = 'rgba(255,255,255,0.02)'; ctx.fill();
     ctx.shadowColor = 'transparent';
@@ -158,7 +184,25 @@ export function drawElement(ctx: CanvasRenderingContext2D, el: ModelElement, isS
     ctx.strokeStyle = isSel ? '#2563eb' : L.stroke;
     ctx.stroke();
 
-    if (!isViewReference) {
+    if (isViewReference) {
+      // View reference: draw a small "navigate" arrow icon (top-right)
+      ctx.save();
+      const ix = x + w - 15, iy = y + 14, s = 7;
+      ctx.beginPath();
+      // Folder tab shape
+      ctx.moveTo(ix - s, iy - s * 0.5);
+      ctx.lineTo(ix - s, iy - s);
+      ctx.lineTo(ix - s * 0.2, iy - s);
+      ctx.lineTo(ix + s * 0.1, iy - s * 0.5);
+      ctx.lineTo(ix + s, iy - s * 0.5);
+      ctx.lineTo(ix + s, iy + s);
+      ctx.lineTo(ix - s, iy + s);
+      ctx.closePath();
+      ctx.strokeStyle = L.accent; ctx.lineWidth = 1.4;
+      ctx.lineJoin = 'round'; ctx.lineCap = 'round';
+      ctx.stroke();
+      ctx.restore();
+    } else {
       const iconKey = ICON_MAP[el.type] || 'generic';
       const drawFn = ICONS[iconKey] || ICONS.generic;
       ctx.save();
@@ -210,7 +254,7 @@ export function drawElement(ctx: CanvasRenderingContext2D, el: ModelElement, isS
   }
 
   // Pop-out icon (larger, more visible)
-  if (el.linkedViewId) {
+  if (el.linkedViewId && !isJunction) {
     const px = x + w - 16, py = y + h - 16;
     ctx.save();
     rrect(ctx, px - 8, py - 8, 16, 16, 3);
@@ -226,7 +270,7 @@ export function drawElement(ctx: CanvasRenderingContext2D, el: ModelElement, isS
   }
 
   // Anchors
-  if (showAnch && !isComposite) {
+  if (showAnch && !isComposite && !isJunction) {
     const anchors = getAnchors(el);
     anchors.forEach((a, i) => {
       const isPrimary = i < 4;

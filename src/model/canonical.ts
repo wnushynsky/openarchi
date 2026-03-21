@@ -1,5 +1,22 @@
 import type { Waypoint } from '../types';
 
+/** Optional visual style metadata preserved from source diagram */
+export interface DiagramStyle {
+  fillColor?: string;
+  lineColor?: string;
+  fontColor?: string;
+  font?: string;
+  textAlignment?: number;
+  textPosition?: number;
+  lineWidth?: number;
+  lineStyle?: string;
+  gradient?: number;
+  alpha?: number;
+  lineAlpha?: number;
+  nameVisible?: boolean;
+  labelExpression?: string;
+}
+
 export interface CanonicalElement {
   id: string;
   type: string;
@@ -30,6 +47,8 @@ export interface CanonicalViewNode {
   width: number;
   height: number;
   linkedViewId?: string;
+  /** Source diagram style metadata (preserved for fidelity, optional) */
+  style?: DiagramStyle;
 }
 
 export interface CanonicalViewConnection {
@@ -38,6 +57,8 @@ export interface CanonicalViewConnection {
   relationshipId: string;
   waypoints: Waypoint[];
   labelPosition: number;
+  /** Source diagram style metadata (preserved for fidelity, optional) */
+  style?: DiagramStyle;
 }
 
 export interface CanonicalModelDocument {

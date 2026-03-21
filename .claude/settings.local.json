@@ -3,7 +3,10 @@
     "allow": [
       "Bash(npx vite:*)",
       "Bash(npx tsc:*)",
-      "Bash(ls:*)"
+      "Bash(ls:*)",
+      "Bash(find /home/wnu/Repos/openarchi -type f \\\\\\(-name *.md -o -name *.test.ts -o -name *.test.tsx \\\\\\))",
+      "Bash(file /home/wnu/Repos/openarchi/*.archimate)",
+      "Bash(node:*)"
     ]
   }
 }

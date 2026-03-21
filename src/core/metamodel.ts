@@ -71,6 +71,10 @@ export const ELEMENT_TYPES: Record<string, ElementTypeDef> = {
   technologyEvent: { label: 'Tech. Event', layer: 'technology', shape: 'round', desc: 'A technology state change that triggers or is triggered by behavior' },
   technologyService: { label: 'Tech. Service', layer: 'technology', shape: 'round', desc: 'An explicitly defined exposed technology behavior' },
   artifact: { label: 'Artifact', layer: 'technology', shape: 'rect', desc: 'A piece of data used or produced in a software development process' },
+  equipment: { label: 'Equipment', layer: 'technology', shape: 'rect', desc: 'One or more physical machines, tools, or instruments that can create, use, store, move, or transform materials' },
+  facility: { label: 'Facility', layer: 'technology', shape: 'rect', desc: 'A physical structure or environment used to house equipment or other active structure elements' },
+  distributionNetwork: { label: 'Distribution Network', layer: 'technology', shape: 'rect', desc: 'A physical network used to transport materials or energy' },
+  material: { label: 'Material', layer: 'technology', shape: 'rect', desc: 'Tangible physical matter or energy used to create, use, store, move, or transform' },
   // Motivation
   stakeholder: { label: 'Stakeholder', layer: 'motivation', shape: 'rect', desc: 'The role of an individual, team, or organization that represents their interests' },
   driver: { label: 'Driver', layer: 'motivation', shape: 'rect', desc: 'An external or internal condition that motivates an organization to define its goals' },
@@ -92,6 +96,8 @@ export const ELEMENT_TYPES: Record<string, ElementTypeDef> = {
   grouping: { label: 'Grouping', layer: 'composite', shape: 'rect', desc: 'Groups a collection of concepts within an architecture' },
   location: { label: 'Location', layer: 'composite', shape: 'rect', desc: 'A conceptual or physical place or position where concepts are located' },
   // Special
+  andJunction: { label: 'Junction (And)', layer: 'composite', shape: 'round', desc: 'A junction used to connect relationships of the same type (AND semantics)' },
+  orJunction: { label: 'Junction (Or)', layer: 'composite', shape: 'round', desc: 'A junction used to connect relationships of the same type (OR semantics)' },
   viewReference: { label: 'View', layer: 'application', shape: 'rect', desc: 'A navigation reference to another view' },
   note: { label: 'Note', layer: 'composite', shape: 'rect', isNote: true, desc: 'An annotation or comment' },
 };
@@ -488,6 +494,61 @@ export const ICONS: Record<string, IconDrawFn> = {
     c.moveTo(x - s * 0.6, y - s * 0.25);
     c.lineTo(x + s * 0.6, y - s * 0.25);
   },
+  // Physical technology
+  equipment: (c, x, y, s) => {
+    // Gear/cog shape
+    const r = s * 0.55, teeth = 6, toothH = s * 0.2;
+    for (let i = 0; i < teeth; i++) {
+      const a1 = (Math.PI * 2 * i) / teeth - Math.PI / teeth;
+      const a2 = (Math.PI * 2 * (i + 0.4)) / teeth - Math.PI / teeth;
+      const a3 = (Math.PI * 2 * (i + 0.5)) / teeth - Math.PI / teeth;
+      const a4 = (Math.PI * 2 * (i + 0.9)) / teeth - Math.PI / teeth;
+      if (i === 0) c.moveTo(x + (r + toothH) * Math.cos(a1), y + (r + toothH) * Math.sin(a1));
+      c.lineTo(x + (r + toothH) * Math.cos(a2), y + (r + toothH) * Math.sin(a2));
+      c.lineTo(x + r * Math.cos(a3), y + r * Math.sin(a3));
+      c.lineTo(x + r * Math.cos(a4), y + r * Math.sin(a4));
+    }
+    c.closePath();
+    c.moveTo(x + s * 0.2, y);
+    c.arc(x, y, s * 0.2, 0, Math.PI * 2);
+  },
+  facility: (c, x, y, s) => {
+    // Building shape
+    const w = s * 1.2, h = s * 1.4;
+    c.moveTo(x - w / 2, y + h / 2);
+    c.lineTo(x - w / 2, y - h / 2 + s * 0.3);
+    c.lineTo(x, y - h / 2);
+    c.lineTo(x + w / 2, y - h / 2 + s * 0.3);
+    c.lineTo(x + w / 2, y + h / 2);
+    c.closePath();
+    // Door
+    c.moveTo(x - s * 0.15, y + h / 2);
+    c.lineTo(x - s * 0.15, y + s * 0.1);
+    c.lineTo(x + s * 0.15, y + s * 0.1);
+    c.lineTo(x + s * 0.15, y + h / 2);
+  },
+  distributionNetwork: (c, x, y, s) => {
+    // Horizontal line with nodes
+    c.moveTo(x - s * 0.7, y);
+    c.lineTo(x + s * 0.7, y);
+    c.moveTo(x - s * 0.5 + s * 0.12, y);
+    c.arc(x - s * 0.5, y, s * 0.12, 0, Math.PI * 2);
+    c.moveTo(x + s * 0.12, y);
+    c.arc(x, y, s * 0.12, 0, Math.PI * 2);
+    c.moveTo(x + s * 0.5 + s * 0.12, y);
+    c.arc(x + s * 0.5, y, s * 0.12, 0, Math.PI * 2);
+  },
+  material: (c, x, y, s) => {
+    // Triangle (physical matter)
+    c.moveTo(x, y - s * 0.7);
+    c.lineTo(x + s * 0.7, y + s * 0.5);
+    c.lineTo(x - s * 0.7, y + s * 0.5);
+    c.closePath();
+  },
+  junction: (c, x, y, s) => {
+    // Filled circle (junction point)
+    c.arc(x, y, s * 0.4, 0, Math.PI * 2);
+  },
   generic: (c, x, y, s) => {
     c.rect(x - s * 0.6, y - s * 0.6, s * 1.2, s * 1.2);
   },
@@ -512,6 +573,8 @@ export const ICON_MAP: Record<string, string> = {
   // Technology
   node: 'node', device: 'device',
   path: 'path', communicationNetwork: 'communicationNetwork',
+  equipment: 'equipment', facility: 'facility',
+  distributionNetwork: 'distributionNetwork', material: 'material',
   // Passive
   businessObject: 'object', dataObject: 'object',
   contract: 'contract', representation: 'representation', product: 'product',
@@ -524,5 +587,6 @@ export const ICON_MAP: Record<string, string> = {
   // Implementation
   workPackage: 'workPackage', deliverable: 'deliverable', plateau: 'plateau', gap: 'gap',
   // Composite/special
+  andJunction: 'junction', orJunction: 'junction',
   note: 'note', grouping: 'grouping', location: 'location',
 };

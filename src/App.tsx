@@ -127,6 +127,8 @@ export default function App() {
   const [elements, setElements] = useState<ModelElement[]>(SAMPLE_ELEMENTS);
   const [relationships, setRelationships] = useState<ModelRelationship[]>(SAMPLE_RELATIONSHIPS);
 
+  const [importDiag, setImportDiag] = useState<string | null>(null);
+
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [selType, setSelType] = useState<SelectionType>(null);
   const [activeLayer, setActiveLayer] = useState('business');
@@ -250,9 +252,21 @@ export default function App() {
   );
 
   const visibleRelationships = useMemo(
-    () => relationships.filter(relationship =>
-      visibleElementIds.has(relationship.sourceId) && visibleElementIds.has(relationship.targetId),
-    ),
+    () => {
+      const visible = relationships.filter(relationship =>
+        visibleElementIds.has(relationship.sourceId) && visibleElementIds.has(relationship.targetId),
+      );
+      if (relationships.length > 0 && visible.length === 0 && visibleElementIds.size > 0) {
+        const sample = relationships.slice(0, 3);
+        const elSample = Array.from(visibleElementIds).slice(0, 3);
+        const msg = `[Debug] ${relationships.length} relationships loaded but 0 match current view (${visibleElementIds.size} elements). `
+          + `Rel endpoints: ${sample.map(r => `${r.sourceId}→${r.targetId}`).join(', ')}. `
+          + `View element IDs: ${elSample.join(', ')}`;
+        console.warn('[OpenArchi]', msg);
+        setImportDiag(msg);
+      }
+      return visible;
+    },
     [relationships, visibleElementIds],
   );
 
@@ -331,6 +345,63 @@ export default function App() {
     }));
   }, []);
 
+  // ==================== CAMERA ====================
+  const [cam, setCam] = useState<Camera>({ x: 0, y: 0, s: 1 });
+  const [cSize, setCSize] = useState({ w: 800, h: 600 });
+
+  // rAF-throttled camera updates — avoids re-rendering more than once per frame
+  const camPendingRef = useRef<Camera | null>(null);
+  const camRafRef = useRef(0);
+  const setCamThrottled = useCallback((next: Camera | ((prev: Camera) => Camera)) => {
+    if (typeof next === 'function') {
+      const current = camPendingRef.current ?? cam;
+      camPendingRef.current = next(current);
+    } else {
+      camPendingRef.current = next;
+    }
+    if (!camRafRef.current) {
+      camRafRef.current = requestAnimationFrame(() => {
+        camRafRef.current = 0;
+        if (camPendingRef.current) {
+          setCam(camPendingRef.current);
+          camPendingRef.current = null;
+        }
+      });
+    }
+  }, [cam]);
+
+  // Fit camera to show all elements with padding
+  const fitToContent = useCallback((els?: ModelElement[]) => {
+    const targets = els ?? elements;
+    if (targets.length === 0) return;
+
+    const minX = Math.min(...targets.map(e => e.x));
+    const minY = Math.min(...targets.map(e => e.y));
+    const maxX = Math.max(...targets.map(e => e.x + e.w));
+    const maxY = Math.max(...targets.map(e => e.y + e.h));
+
+    const contentW = maxX - minX;
+    const contentH = maxY - minY;
+    if (contentW < 1 || contentH < 1) return;
+
+    const pad = 60;
+    const canvasW = cSize.w;
+    const canvasH = cSize.h;
+
+    const scaleX = canvasW / (contentW + pad * 2);
+    const scaleY = canvasH / (contentH + pad * 2);
+    const s = Math.min(scaleX, scaleY, 1.5);
+
+    const cx = minX + contentW / 2;
+    const cy = minY + contentH / 2;
+
+    setCam({
+      s,
+      x: canvasW / 2 - cx * s,
+      y: canvasH / 2 - cy * s,
+    });
+  }, [elements, cSize]);
+
   // ==================== BACK / FORWARD NAVIGATION ====================
   const viewHistory = useRef<string[]>(['v1']);
   const historyIdx = useRef(0);
@@ -351,7 +422,16 @@ export default function App() {
     isNavAction.current = false;
     setCurrentViewId(id);
     setOpenTabIds(prev => prev.includes(id) ? prev : [...prev, id]);
-  }, [currentViewId, saveViewLayoutSnapshot, applyViewLayout]);
+
+    // Fit camera to the new view's content using layout data
+    const layoutEls = elementLayoutsByViewRef.current[id];
+    if (layoutEls) {
+      const laidOut = elements
+        .filter(e => layoutEls[e.id])
+        .map(e => ({ ...e, ...layoutEls[e.id], w: layoutEls[e.id].w, h: layoutEls[e.id].h }));
+      if (laidOut.length > 0) fitToContent(laidOut);
+    }
+  }, [currentViewId, saveViewLayoutSnapshot, applyViewLayout, elements, fitToContent]);
 
   const canGoBack = historyIdx.current > 0;
   const canGoForward = historyIdx.current < viewHistory.current.length - 1;
@@ -385,32 +465,6 @@ export default function App() {
       return next;
     });
   }, [currentViewId, saveViewLayoutSnapshot, applyViewLayout]);
-
-  const [cam, setCam] = useState<Camera>({ x: 0, y: 0, s: 1 });
-  const [cSize, setCSize] = useState({ w: 800, h: 600 });
-
-  // rAF-throttled camera updates — avoids re-rendering more than once per frame
-  const camPendingRef = useRef<Camera | null>(null);
-  const camRafRef = useRef(0);
-  const setCamThrottled = useCallback((next: Camera | ((prev: Camera) => Camera)) => {
-    // Resolve the next value
-    if (typeof next === 'function') {
-      // Need current cam — use ref
-      const current = camPendingRef.current ?? cam;
-      camPendingRef.current = next(current);
-    } else {
-      camPendingRef.current = next;
-    }
-    if (!camRafRef.current) {
-      camRafRef.current = requestAnimationFrame(() => {
-        camRafRef.current = 0;
-        if (camPendingRef.current) {
-          setCam(camPendingRef.current);
-          camPendingRef.current = null;
-        }
-      });
-    }
-  }, [cam]);
 
   // Resize observer
   useEffect(() => {
@@ -997,12 +1051,23 @@ export default function App() {
             applyViewLayout(result.model.views[0].id);
           }
           setSelectedId(null); setSelType(null);
+          // Fit camera to imported content using layout-resolved positions
+          const firstViewId = result.model.views[0]?.id;
+          const layoutEls = firstViewId ? importedLayouts.elementLayouts[firstViewId] : null;
+          if (layoutEls) {
+            const laidOut = result.model.elements
+              .filter(e => layoutEls[e.id])
+              .map(e => ({ ...e, ...layoutEls[e.id], w: layoutEls[e.id].w, h: layoutEls[e.id].h }));
+            fitToContent(laidOut);
+          } else {
+            fitToContent(result.model.elements);
+          }
         } catch { alert('Invalid file'); }
       };
       r.readAsText(f);
     };
     inp.click();
-  }, [ioFormatId, modelFormats, applyViewLayout]);
+  }, [ioFormatId, modelFormats, applyViewLayout, fitToContent]);
 
   // ---------------------------------------------------------------------------
   // Filesystem: Open Directory, Open File, Save
@@ -1023,6 +1088,16 @@ export default function App() {
       }
       if (result.diagnostics.length > 0) console.warn('Import diagnostics', result.diagnostics);
 
+      // Debug: log model summary for troubleshooting
+      console.log(`[OpenArchi] File import summary (${formatId}):`, {
+        elements: result.model.elements.length,
+        relationships: result.model.relationships.length,
+        views: result.model.views.length,
+        viewElementIds: result.model.views.map(v => ({ id: v.id, name: v.name, elementCount: v.elementIds.length })),
+        canonicalViewNodes: result.document?.viewNodes.length ?? 'n/a',
+        canonicalViewConnections: result.document?.viewConnections.length ?? 'n/a',
+      });
+
       const importedLayouts = result.document
         ? buildLayoutsFromCanonicalDocument(result.document)
         : buildLayoutsFromEditorModel(result.model.elements, result.model.relationships, result.model.views);
@@ -1039,16 +1114,29 @@ export default function App() {
       }
       setSelectedId(null); setSelType(null);
 
+      // Fit camera to imported content
+      const firstViewId = result.model.views[0]?.id;
+      const layoutEls = firstViewId ? importedLayouts.elementLayouts[firstViewId] : null;
+      if (layoutEls) {
+        const laidOut = result.model.elements
+          .filter(e => layoutEls[e.id])
+          .map(e => ({ ...e, ...layoutEls[e.id], w: layoutEls[e.id].w, h: layoutEls[e.id].h }));
+        fitToContent(laidOut);
+      } else {
+        fitToContent(result.model.elements);
+      }
+
       setActiveFileEntry(entry);
       setActiveFormatId(formatId);
       setIsDirty(false);
     } catch (err) {
       alert(`Failed to open file: ${err}`);
     }
-  }, [applyViewLayout]);
+  }, [applyViewLayout, fitToContent]);
 
   const loadFragmentedModel = useCallback(async (files: OpenFileEntry[]) => {
     try {
+      setImportDiag(null);
       const result = await importFragmentedModel(files);
       if (!result.model) {
         const firstError = result.diagnostics.find(d => d.severity === 'error');
@@ -1056,6 +1144,32 @@ export default function App() {
         return;
       }
       if (result.diagnostics.length > 0) console.warn('Import diagnostics', result.diagnostics);
+
+      // Debug: log model summary for troubleshooting
+      const firstView = result.model.views[0];
+      const firstViewElIds = firstView ? new Set(firstView.elementIds) : new Set<string>();
+      const relsInFirstView = result.model.relationships.filter(
+        r => firstViewElIds.has(r.sourceId) && firstViewElIds.has(r.targetId),
+      );
+      const relsPartialInFirstView = result.model.relationships.filter(
+        r => firstViewElIds.has(r.sourceId) || firstViewElIds.has(r.targetId),
+      );
+      console.log('[OpenArchi] Fragmented import summary:', {
+        elements: result.model.elements.length,
+        relationships: result.model.relationships.length,
+        views: result.model.views.length,
+        firstView: firstView ? { id: firstView.id, name: firstView.name, elementCount: firstView.elementIds.length } : null,
+        relsFullyInFirstView: relsInFirstView.length,
+        relsPartiallyInFirstView: relsPartialInFirstView.length,
+        canonicalViewNodes: result.document?.viewNodes.length ?? 'n/a',
+        canonicalViewConnections: result.document?.viewConnections.length ?? 'n/a',
+        sampleRelEndpoints: result.model.relationships.slice(0, 3).map(r => ({
+          id: r.id, src: r.sourceId, tgt: r.targetId,
+          srcInView: firstViewElIds.has(r.sourceId),
+          tgtInView: firstViewElIds.has(r.targetId),
+        })),
+        sampleElementIds: Array.from(firstViewElIds).slice(0, 5),
+      });
 
       const importedLayouts = result.document
         ? buildLayoutsFromCanonicalDocument(result.document)
@@ -1074,25 +1188,57 @@ export default function App() {
       setSelectedId(null); setSelType(null);
       setActiveFormatId('coarchi-xml');
       setIsDirty(false);
+
+      // Show import summary as a temporary visible diagnostic
+      const m = result.model;
+      const fv = m.views[0];
+      const fvEls = fv ? new Set(fv.elementIds) : new Set<string>();
+      const relsMatch = m.relationships.filter(r => fvEls.has(r.sourceId) && fvEls.has(r.targetId)).length;
+      const summary = `Imported: ${m.elements.length} elements, ${m.relationships.length} relationships, ${m.views.length} views. `
+        + `First view "${fv?.name || '?'}": ${fv?.elementIds.length ?? 0} els, ${relsMatch} rels match.`;
+      setImportDiag(summary);
+      setTimeout(() => setImportDiag(prev => prev === summary ? null : prev), 8000);
+
+      // Fit camera to imported content
+      const firstViewId = result.model.views[0]?.id;
+      const layoutEls = firstViewId ? importedLayouts.elementLayouts[firstViewId] : null;
+      if (layoutEls) {
+        const laidOut = result.model.elements
+          .filter(e => layoutEls[e.id])
+          .map(e => ({ ...e, ...layoutEls[e.id], w: layoutEls[e.id].w, h: layoutEls[e.id].h }));
+        fitToContent(laidOut);
+      } else {
+        fitToContent(result.model.elements);
+      }
     } catch (err) {
       alert(`Failed to import fragmented model: ${err}`);
     }
-  }, [applyViewLayout]);
+  }, [applyViewLayout, fitToContent]);
 
   const handleOpenDirectory = useCallback(async () => {
     try {
       const state = await openDirectory();
       setDirState(state);
 
+      console.log('[OpenArchi] Directory opened:', state.directoryName,
+        'Files:', state.files.length,
+        'Paths:', state.files.map(f => f.relativePath));
+
       // Detect fragmented coArchi directory (individual XML files per element)
-      if (isFragmentedModelDirectory(state.files)) {
+      const isFragmented = isFragmentedModelDirectory(state.files);
+      console.log('[OpenArchi] isFragmentedModelDirectory:', isFragmented);
+
+      if (isFragmented) {
         await loadFragmentedModel(state.files);
         return;
       }
 
       // Auto-open the first archimate/xml/json file
       if (state.files.length > 0) {
+        console.log('[OpenArchi] Opening first file:', state.files[0].relativePath);
         await loadFileEntry(state.files[0]);
+      } else {
+        console.warn('[OpenArchi] No valid files found in directory');
       }
     } catch (err) {
       // User cancelled the picker
@@ -1164,10 +1310,12 @@ export default function App() {
       // Back/forward: Alt+Left / Alt+Right
       if (e.altKey && e.key === 'ArrowLeft') { e.preventDefault(); goBack(); }
       if (e.altKey && e.key === 'ArrowRight') { e.preventDefault(); goForward(); }
+      // Fit to content: Ctrl+Shift+1
+      if ((e.metaKey || e.ctrlKey) && e.shiftKey && e.key === '1') { e.preventDefault(); fitToContent(); }
     };
     window.addEventListener('keydown', h);
     return () => window.removeEventListener('keydown', h);
-  }, [deleteSelected, cancelEditing, goBack, goForward, handleSave, undo, redo]);
+  }, [deleteSelected, cancelEditing, goBack, goForward, handleSave, undo, redo, fitToContent]);
 
   useEffect(() => {
     if (!selectedId) return;
@@ -1223,7 +1371,7 @@ export default function App() {
 
   // ==================== RENDER ====================
   return (
-    <div style={{ width: '100%', height: '100vh', display: 'flex', flexDirection: 'column', fontFamily: FONT, background: 'var(--bg, #f5f6f8)', color: 'var(--text-primary, #1a1a1a)' }}>
+    <div style={{ width: '100%', height: '100vh', display: 'flex', flexDirection: 'column', fontFamily: FONT, background: 'var(--bg, #f3f4f6)', color: 'var(--text-primary, #1a1a1a)' }}>
       {/* Full-screen canvas area with floating UI */}
       <div style={{ flex: 1, position: 'relative', overflow: 'hidden' }}>
 
@@ -1231,18 +1379,18 @@ export default function App() {
         <div style={{
           position: 'absolute', top: 10, left: 10, zIndex: 10,
           display: 'flex', alignItems: 'center', gap: 8,
-          background: 'rgba(255,255,255,0.88)',
-          backdropFilter: 'blur(16px) saturate(1.6)',
-          WebkitBackdropFilter: 'blur(16px) saturate(1.6)',
-          border: '1px solid rgba(255,255,255,0.5)',
-          borderRadius: 10,
-          boxShadow: '0 2px 12px rgba(0,0,0,0.06)',
-          padding: '6px 12px',
+          background: 'var(--glass, rgba(255,255,255,0.82))',
+          backdropFilter: 'var(--glass-blur, blur(20px) saturate(1.8))',
+          WebkitBackdropFilter: 'var(--glass-blur, blur(20px) saturate(1.8))',
+          border: '1px solid var(--glass-border, rgba(255,255,255,0.55))',
+          borderRadius: 'var(--radius-md, 10px)',
+          boxShadow: 'var(--shadow-md, 0 2px 12px rgba(0,0,0,0.06))',
+          padding: '5px 10px',
         }}>
-          <div style={{ width: 22, height: 22, background: '#2a2a2a', borderRadius: 5, display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 9, fontWeight: 600, color: '#fff', letterSpacing: '-0.3px' }}>OA</div>
-          <span style={{ fontWeight: 600, fontSize: 13, color: '#2a2a2a', letterSpacing: '-0.01em' }}>OpenArchi</span>
+          <div style={{ width: 20, height: 20, background: 'var(--text-primary, #1a1a1a)', borderRadius: 5, display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 8, fontWeight: 600, color: '#fff', letterSpacing: '-0.3px' }}>OA</div>
+          <span style={{ fontWeight: 600, fontSize: 13, color: 'var(--text-primary, #1a1a1a)', letterSpacing: '-0.01em' }}>OpenArchi</span>
           {activeFileEntry && (
-            <span style={{ fontSize: 11, color: '#999' }}>
+            <span style={{ fontSize: 11, color: 'var(--text-muted, #8a8a90)' }}>
               {dirState ? `${dirState.directoryName}/` : ''}{activeFileEntry.relativePath}{isDirty ? ' *' : ''}
             </span>
           )}
@@ -1251,21 +1399,21 @@ export default function App() {
         {/* ====== Top-right: Actions cluster ====== */}
         <div style={{
           position: 'absolute', top: 10, right: propSide === 'right' ? 270 : 10, zIndex: 10,
-          display: 'flex', alignItems: 'center', gap: 4,
-          background: 'rgba(255,255,255,0.88)',
-          backdropFilter: 'blur(16px) saturate(1.6)',
-          WebkitBackdropFilter: 'blur(16px) saturate(1.6)',
-          border: '1px solid rgba(255,255,255,0.5)',
-          borderRadius: 10,
-          boxShadow: '0 2px 12px rgba(0,0,0,0.06)',
-          padding: '4px 6px',
+          display: 'flex', alignItems: 'center', gap: 2,
+          background: 'var(--glass, rgba(255,255,255,0.82))',
+          backdropFilter: 'var(--glass-blur, blur(20px) saturate(1.8))',
+          WebkitBackdropFilter: 'var(--glass-blur, blur(20px) saturate(1.8))',
+          border: '1px solid var(--glass-border, rgba(255,255,255,0.55))',
+          borderRadius: 'var(--radius-md, 10px)',
+          boxShadow: 'var(--shadow-md, 0 2px 12px rgba(0,0,0,0.06))',
+          padding: '3px 5px',
         }}>
           <Btn onClick={goBack} disabled={!canGoBack}>{'\u25C0'}</Btn>
           <Btn onClick={goForward} disabled={!canGoForward}>{'\u25B6'}</Btn>
-          <div style={{ width: 1, height: 18, background: 'rgba(0,0,0,0.07)', margin: '0 2px' }} />
+          <div style={{ width: 1, height: 16, background: 'var(--border, rgba(0,0,0,0.06))', margin: '0 2px' }} />
           <Btn onClick={undo} disabled={historyIndexRef.current <= 0}>Undo</Btn>
           <Btn onClick={redo} disabled={historyIndexRef.current >= historyRef.current.length - 1}>Redo</Btn>
-          <div style={{ width: 1, height: 18, background: 'rgba(0,0,0,0.07)', margin: '0 2px' }} />
+          <div style={{ width: 1, height: 16, background: 'var(--border, rgba(0,0,0,0.06))', margin: '0 2px' }} />
           <Btn onClick={cycleLeftPanel}>{leftPanelLabel}</Btn>
         </div>
 
@@ -1276,13 +1424,13 @@ export default function App() {
           right: propSide === 'right' ? 520 : 260,
           zIndex: 10,
           height: 32,
-          background: 'rgba(255,255,255,0.88)',
-          backdropFilter: 'blur(16px) saturate(1.6)',
-          WebkitBackdropFilter: 'blur(16px) saturate(1.6)',
-          border: '1px solid rgba(255,255,255,0.5)',
-          borderRadius: 10,
-          boxShadow: '0 2px 12px rgba(0,0,0,0.06)',
-          display: 'flex', alignItems: 'center', padding: '0 4px', gap: 1, overflow: 'auto',
+          background: 'var(--glass, rgba(255,255,255,0.82))',
+          backdropFilter: 'var(--glass-blur, blur(20px) saturate(1.8))',
+          WebkitBackdropFilter: 'var(--glass-blur, blur(20px) saturate(1.8))',
+          border: '1px solid var(--glass-border, rgba(255,255,255,0.55))',
+          borderRadius: 'var(--radius-md, 10px)',
+          boxShadow: 'var(--shadow-md, 0 2px 12px rgba(0,0,0,0.06))',
+          display: 'flex', alignItems: 'stretch', padding: '3px 4px', gap: 1, overflow: 'auto',
         }}>
           {openTabIds.map(tid => {
             const v = views.find(vv => vv.id === tid);
@@ -1292,22 +1440,30 @@ export default function App() {
                 key={tid}
                 onClick={() => navigateToView(tid)}
                 style={{
-                  display: 'flex', alignItems: 'center', gap: 5, padding: '4px 10px', fontSize: 12, fontFamily: 'inherit',
+                  display: 'flex', alignItems: 'center', gap: 5, padding: '0 10px', fontSize: 12, fontFamily: 'inherit',
                   cursor: 'pointer', userSelect: 'none', whiteSpace: 'nowrap',
-                  background: isActive ? 'var(--accent-bg, #eef2ff)' : 'transparent',
-                  color: isActive ? 'var(--accent-text, #1d4ed8)' : '#999',
+                  background: isActive ? 'var(--surface-selected, rgba(37,99,235,0.07))' : 'transparent',
+                  color: isActive ? 'var(--accent-text, #1d4ed8)' : 'var(--text-muted, #8a8a90)',
                   fontWeight: isActive ? 500 : 400,
-                  borderRadius: 5,
+                  borderRadius: 6,
                   border: 'none',
+                  position: 'relative',
+                  transition: 'background var(--transition-fast, 0.12s ease), color var(--transition-fast, 0.12s ease)',
                 }}
+                onMouseEnter={e => { if (!isActive) e.currentTarget.style.background = 'var(--surface-hover, rgba(0,0,0,0.035))'; }}
+                onMouseLeave={e => { if (!isActive) e.currentTarget.style.background = 'transparent'; }}
               >
                 <span>{v?.name || tid}</span>
                 {openTabIds.length > 1 && (
                   <span
                     onClick={e => { e.stopPropagation(); closeTab(tid); }}
-                    style={{ fontSize: 13, color: '#ccc', lineHeight: 1, padding: '0 2px', borderRadius: 3, cursor: 'pointer' }}
-                    onMouseEnter={e => { e.currentTarget.style.color = '#666'; e.currentTarget.style.background = 'rgba(0,0,0,0.06)'; }}
-                    onMouseLeave={e => { e.currentTarget.style.color = '#ccc'; e.currentTarget.style.background = 'transparent'; }}
+                    style={{
+                      fontSize: 12, color: 'var(--text-faint, #b0b0b8)', lineHeight: 1,
+                      padding: '1px 2px', borderRadius: 3, cursor: 'pointer',
+                      transition: 'color var(--transition-fast, 0.12s ease), background var(--transition-fast, 0.12s ease)',
+                    }}
+                    onMouseEnter={e => { e.currentTarget.style.color = 'var(--text-secondary, #555)'; e.currentTarget.style.background = 'var(--surface-active, rgba(0,0,0,0.06))'; }}
+                    onMouseLeave={e => { e.currentTarget.style.color = 'var(--text-faint, #b0b0b8)'; e.currentTarget.style.background = 'transparent'; }}
                   >
                     {'\u00D7'}
                   </span>
@@ -1320,11 +1476,12 @@ export default function App() {
         {/* ====== Left panel island (views + properties) ====== */}
         <div style={{
           position: 'absolute', left: 10, top: 52, bottom: 10, width: leftPanelWidth, zIndex: 10,
-          background: 'rgba(255,255,255,0.92)',
-          backdropFilter: 'blur(20px) saturate(1.6)',
-          WebkitBackdropFilter: 'blur(20px) saturate(1.6)',
-          borderRadius: 14, border: '1px solid rgba(255,255,255,0.5)',
-          boxShadow: '0 4px 24px rgba(0,0,0,0.08)',
+          background: 'var(--glass-strong, rgba(255,255,255,0.92))',
+          backdropFilter: 'var(--glass-blur, blur(20px) saturate(1.8))',
+          WebkitBackdropFilter: 'var(--glass-blur, blur(20px) saturate(1.8))',
+          borderRadius: 'var(--radius-lg, 14px)',
+          border: '1px solid var(--glass-border, rgba(255,255,255,0.55))',
+          boxShadow: 'var(--shadow-lg, 0 4px 24px rgba(0,0,0,0.08))',
           display: 'flex', flexDirection: 'column', overflow: 'hidden',
         }}>
           {/* Resize handle */}
@@ -1353,10 +1510,10 @@ export default function App() {
             <ViewNav views={views} currentViewId={currentViewId} onNavigate={navigateToView} />
           ) : (
             <div style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
-              <div style={{ padding: '14px 14px 7px', fontSize: 11, fontWeight: 500, color: '#a0a0a0', textTransform: 'uppercase', letterSpacing: '0.5px' }}>Changelog</div>
-              <div style={{ padding: '10px 14px', color: '#aaa', fontSize: 13, lineHeight: 1.7 }}>
-                <p style={{ margin: '0 0 10px', color: '#777', fontWeight: 400 }}>Change history will appear here.</p>
-                <p style={{ margin: 0, fontSize: 12 }}>
+              <div style={{ padding: '10px 12px 6px', fontSize: 10, fontWeight: 500, color: 'var(--text-faint, #b0b0b8)', textTransform: 'uppercase', letterSpacing: '0.5px' }}>Changelog</div>
+              <div style={{ padding: '8px 12px', color: 'var(--text-faint, #b0b0b8)', fontSize: 12, lineHeight: 1.7 }}>
+                <p style={{ margin: '0 0 8px', color: 'var(--text-muted, #8a8a90)', fontWeight: 400 }}>Change history will appear here.</p>
+                <p style={{ margin: 0, fontSize: 11 }}>
                   Track element additions, modifications, relationship changes, and view updates over time.
                 </p>
               </div>
@@ -1494,12 +1651,13 @@ export default function App() {
           {drawingRel && (
             <div style={{
               position: 'absolute', bottom: 120, left: '50%', transform: 'translateX(-50%)',
-              fontSize: 12, color: '#666', background: 'rgba(255,255,255,0.92)',
-              backdropFilter: 'blur(12px)',
-              WebkitBackdropFilter: 'blur(12px)',
-              padding: '6px 14px', borderRadius: 8,
-              border: '1px solid rgba(255,255,255,0.5)',
-              boxShadow: '0 2px 12px rgba(0,0,0,0.08)',
+              fontSize: 12, color: 'var(--text-secondary, #555)',
+              background: 'var(--glass, rgba(255,255,255,0.82))',
+              backdropFilter: 'var(--glass-blur, blur(20px) saturate(1.8))',
+              WebkitBackdropFilter: 'var(--glass-blur, blur(20px) saturate(1.8))',
+              padding: '5px 12px', borderRadius: 'var(--radius-sm, 6px)',
+              border: '1px solid var(--glass-border, rgba(255,255,255,0.55))',
+              boxShadow: 'var(--shadow-md, 0 2px 12px rgba(0,0,0,0.06))',
               whiteSpace: 'nowrap',
             }}>
               Hold <strong>Shift + Click</strong> to add a waypoint bend
@@ -1540,15 +1698,20 @@ export default function App() {
           onClick={() => setShowLegend(l => !l)}
           style={{
             position: 'absolute', bottom: 14, right: propSide === 'right' ? 274 : 12, zIndex: 50,
-            width: 32, height: 32, borderRadius: 8, border: '1px solid rgba(0,0,0,0.06)',
-            background: showLegend ? 'rgba(37,99,235,0.1)' : 'rgba(245,246,248,0.8)',
-            backdropFilter: 'blur(12px)', WebkitBackdropFilter: 'blur(12px)',
-            boxShadow: '0 2px 8px rgba(0,0,0,0.06)',
+            width: 30, height: 30, borderRadius: 'var(--radius-sm, 6px)',
+            border: '1px solid var(--glass-border, rgba(255,255,255,0.55))',
+            background: showLegend ? 'var(--surface-selected, rgba(37,99,235,0.07))' : 'var(--glass, rgba(255,255,255,0.82))',
+            backdropFilter: 'var(--glass-blur, blur(20px) saturate(1.8))',
+            WebkitBackdropFilter: 'var(--glass-blur, blur(20px) saturate(1.8))',
+            boxShadow: 'var(--shadow-sm, 0 1px 3px rgba(0,0,0,0.03))',
             cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center',
-            color: showLegend ? '#1d4ed8' : '#8a8a90', fontSize: 11, fontWeight: 600, fontFamily: FONT,
-            padding: 0,
+            color: showLegend ? 'var(--accent-text, #1d4ed8)' : 'var(--text-muted, #8a8a90)',
+            fontSize: 11, fontWeight: 600, fontFamily: FONT, padding: 0,
+            transition: 'background var(--transition-fast, 0.12s ease), color var(--transition-fast, 0.12s ease)',
           }}
           title={showLegend ? 'Hide Legend' : 'Show Legend'}
+          onMouseEnter={e => { if (!showLegend) e.currentTarget.style.background = 'var(--surface-hover, rgba(0,0,0,0.035))'; }}
+          onMouseLeave={e => { if (!showLegend) e.currentTarget.style.background = 'var(--glass, rgba(255,255,255,0.82))'; }}
         >
           <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><rect x="2" y="2" width="12" height="12" rx="1.5" stroke="currentColor" strokeWidth="1.2" /><line x1="5" y1="6" x2="7.5" y2="6" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" /><line x1="9" y1="6" x2="11" y2="6" stroke="currentColor" strokeWidth="0.8" strokeLinecap="round" opacity="0.4" /><line x1="5" y1="8.5" x2="7.5" y2="8.5" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" /><line x1="9" y1="8.5" x2="11" y2="8.5" stroke="currentColor" strokeWidth="0.8" strokeLinecap="round" opacity="0.4" /><line x1="5" y1="11" x2="7.5" y2="11" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" /><line x1="9" y1="11" x2="11" y2="11" stroke="currentColor" strokeWidth="0.8" strokeLinecap="round" opacity="0.4" /></svg>
         </button>
@@ -1604,25 +1767,26 @@ export default function App() {
 
           return (
             <div style={{
-              position: 'absolute', bottom: 110, right: propSide === 'right' ? 274 : 12, zIndex: 50,
-              background: 'rgba(255,255,255,0.94)',
-              backdropFilter: 'blur(20px) saturate(1.6)',
-              WebkitBackdropFilter: 'blur(20px) saturate(1.6)',
-              border: '1px solid rgba(255,255,255,0.5)',
-              borderRadius: 12,
-              boxShadow: '0 4px 24px rgba(0,0,0,0.1)', padding: '12px 16px',
-              width: 300, fontSize: 12, fontFamily: FONT, maxHeight: 440, overflow: 'auto',
+              position: 'absolute', bottom: 54, right: propSide === 'right' ? 274 : 12, zIndex: 50,
+              background: 'var(--glass-strong, rgba(255,255,255,0.92))',
+              backdropFilter: 'var(--glass-blur, blur(20px) saturate(1.8))',
+              WebkitBackdropFilter: 'var(--glass-blur, blur(20px) saturate(1.8))',
+              border: '1px solid var(--glass-border, rgba(255,255,255,0.55))',
+              borderRadius: 'var(--radius-md, 10px)',
+              boxShadow: 'var(--shadow-lg, 0 4px 24px rgba(0,0,0,0.08))',
+              padding: '10px 14px',
+              width: 280, fontSize: 12, fontFamily: FONT, maxHeight: 400, overflow: 'auto',
             }}>
               {activeElTypes.length > 0 && (
                 <>
-                  <div style={{ fontSize: 10, fontWeight: 600, color: '#a0a0a0', textTransform: 'uppercase', marginBottom: 8, letterSpacing: '0.5px' }}>Elements</div>
-                  <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '4px 12px' }}>
+                  <div style={{ fontSize: 10, fontWeight: 500, color: 'var(--text-faint, #b0b0b8)', textTransform: 'uppercase', marginBottom: 6, letterSpacing: '0.5px' }}>Elements</div>
+                  <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '3px 10px' }}>
                     {activeElTypes.map(([k, def]) => {
                       const L = LAYERS[def.layer];
                       return (
-                        <div key={k} style={{ display: 'flex', alignItems: 'center', gap: 7, padding: '2px 0' }}>
-                          <CanvasIcon type={k} size={16} color={L?.accent || '#888'} />
-                          <span style={{ color: '#444', fontSize: 12 }}>{def.label}</span>
+                        <div key={k} style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '1px 0' }}>
+                          <CanvasIcon type={k} size={14} color={L?.accent || '#888'} />
+                          <span style={{ color: 'var(--text-secondary, #555)', fontSize: 11.5 }}>{def.label}</span>
                         </div>
                       );
                     })}
@@ -1630,62 +1794,71 @@ export default function App() {
                 </>
               )}
               {activeElTypes.length > 0 && activeRelTypes.length > 0 && (
-                <div style={{ height: 1, background: 'rgba(0,0,0,0.06)', margin: '10px 0' }} />
+                <div style={{ height: 1, background: 'var(--border, rgba(0,0,0,0.06))', margin: '8px 0' }} />
               )}
               {activeRelTypes.length > 0 && (
                 <>
-                  <div style={{ fontSize: 10, fontWeight: 600, color: '#a0a0a0', textTransform: 'uppercase', marginBottom: 8, letterSpacing: '0.5px' }}>Relationships</div>
+                  <div style={{ fontSize: 10, fontWeight: 500, color: 'var(--text-faint, #b0b0b8)', textTransform: 'uppercase', marginBottom: 6, letterSpacing: '0.5px' }}>Relationships</div>
                   {activeRelTypes.map(([, rd]) => (
-                    <div key={rd.label} style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 2 }}>
+                    <div key={rd.label} style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 2 }}>
                       {renderRelSvg(rd)}
                       <div style={{ display: 'flex', flexDirection: 'column' }}>
-                        <span style={{ color: '#444', fontSize: 12, fontWeight: 500 }}>{rd.label}</span>
-                        <span style={{ color: '#aaa', fontSize: 10 }}>{rd.desc}</span>
+                        <span style={{ color: 'var(--text-secondary, #555)', fontSize: 11.5, fontWeight: 500 }}>{rd.label}</span>
+                        <span style={{ color: 'var(--text-faint, #b0b0b8)', fontSize: 10 }}>{rd.desc}</span>
                       </div>
                     </div>
                   ))}
                 </>
               )}
               {activeElTypes.length === 0 && activeRelTypes.length === 0 && (
-                <div style={{ color: '#bbb', fontSize: 12, padding: '4px 0' }}>No elements or relationships yet.</div>
+                <div style={{ color: 'var(--text-faint, #b0b0b8)', fontSize: 12, padding: '4px 0' }}>No elements or relationships yet.</div>
               )}
             </div>
           );
         })()}
 
-        {/* ====== Zoom indicator (bottom-left) ====== */}
+        {/* ====== Zoom + stats (bottom-left) ====== */}
         <div style={{
           position: 'absolute', bottom: 12, left: leftPanelWidth + 24, zIndex: 10,
-          fontSize: 11, color: '#aaa',
-          background: 'rgba(255,255,255,0.85)',
-          backdropFilter: 'blur(12px)',
-          WebkitBackdropFilter: 'blur(12px)',
-          padding: '3px 8px', borderRadius: 6,
-          border: '1px solid rgba(255,255,255,0.5)',
-          boxShadow: '0 1px 4px rgba(0,0,0,0.04)',
-          fontWeight: 500,
+          display: 'flex', alignItems: 'center', gap: 8,
+          fontSize: 11, fontWeight: 400,
+          background: 'var(--glass, rgba(255,255,255,0.82))',
+          backdropFilter: 'var(--glass-blur, blur(20px) saturate(1.8))',
+          WebkitBackdropFilter: 'var(--glass-blur, blur(20px) saturate(1.8))',
+          padding: '3px 10px', borderRadius: 'var(--radius-sm, 6px)',
+          border: '1px solid var(--glass-border, rgba(255,255,255,0.55))',
+          boxShadow: 'var(--shadow-sm, 0 1px 3px rgba(0,0,0,0.03))',
         }}>
-          {Math.round(cam.s * 100)}%
+          <span style={{ color: 'var(--text-muted, #8a8a90)', fontWeight: 500 }}>{Math.round(cam.s * 100)}%</span>
+          <span style={{ width: 1, height: 12, background: 'var(--border, rgba(0,0,0,0.06))' }} />
+          <span style={{ color: 'var(--text-faint, #b0b0b8)' }}>{visibleElements.length} el {'\u00B7'} {visibleRelationships.length} rel</span>
         </div>
 
-        {/* ====== Stats (bottom-left, next to zoom) ====== */}
-        <div style={{
-          position: 'absolute', bottom: 12, left: leftPanelWidth + 80, zIndex: 10,
-          fontSize: 11, color: '#bbb',
-          fontWeight: 400,
-        }}>
-          {visibleElements.length} el {'\u00B7'} {visibleRelationships.length} rel
-        </div>
+        {importDiag && (
+          <div
+            onClick={() => setImportDiag(null)}
+            style={{
+              position: 'absolute', bottom: 60, left: '50%', transform: 'translateX(-50%)',
+              maxWidth: '80vw', padding: '8px 14px', zIndex: 100,
+              background: 'rgba(220,160,0,0.95)', color: '#000', borderRadius: 8,
+              fontSize: 11, fontFamily: 'monospace', cursor: 'pointer', whiteSpace: 'pre-wrap',
+              boxShadow: '0 2px 8px rgba(0,0,0,0.2)',
+            }}
+          >
+            {importDiag} <span style={{ opacity: 0.5 }}>(click to dismiss)</span>
+          </div>
+        )}
 
         {/* ====== Property panel on right side ====== */}
         {propSide === 'right' && (
           <div style={{
             position: 'absolute', right: 10, top: 52, bottom: 10, width: 252, zIndex: 10,
-            background: 'rgba(255,255,255,0.92)',
-            backdropFilter: 'blur(20px) saturate(1.6)',
-            WebkitBackdropFilter: 'blur(20px) saturate(1.6)',
-            borderRadius: 14, border: '1px solid rgba(255,255,255,0.5)',
-            boxShadow: '0 4px 24px rgba(0,0,0,0.08)',
+            background: 'var(--glass-strong, rgba(255,255,255,0.92))',
+            backdropFilter: 'var(--glass-blur, blur(20px) saturate(1.8))',
+            WebkitBackdropFilter: 'var(--glass-blur, blur(20px) saturate(1.8))',
+            borderRadius: 'var(--radius-lg, 14px)',
+            border: '1px solid var(--glass-border, rgba(255,255,255,0.55))',
+            boxShadow: 'var(--shadow-lg, 0 4px 24px rgba(0,0,0,0.08))',
             display: 'flex', flexDirection: 'column', overflow: 'hidden',
           }}>
             <PropertyPanel

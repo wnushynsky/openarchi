@@ -77,7 +77,7 @@ export function isFragmentedModelDirectory(files: OpenFileEntry[]): boolean {
 
   // Check for typical coArchi/GRAFICO directory structure patterns
   // The "model" folder can appear at any depth (root, or nested under project name)
-  const graficoFolders = new Set(['model', 'relations', 'views']);
+  const graficoFolders = new Set(['model', 'relations', 'views', 'diagrams']);
   const hasModelSubdir = xmlFiles.some(f => {
     const parts = f.relativePath.toLowerCase().split('/');
     // Check the first few path segments for typical GRAFICO folder names
@@ -119,6 +119,7 @@ export async function importFragmentedModel(files: OpenFileEntry[]): Promise<Mod
   // Read files in batches to avoid memory pressure
   const BATCH_SIZE = 50;
   const contents: string[] = [];
+  const paths: string[] = [];
   const errors: string[] = [];
 
   for (let i = 0; i < xmlFiles.length; i += BATCH_SIZE) {
@@ -131,6 +132,7 @@ export async function importFragmentedModel(files: OpenFileEntry[]): Promise<Mod
       const result = results[j];
       if (result.status === 'fulfilled') {
         contents.push(result.value);
+        paths.push(batch[j].relativePath);
       } else {
         errors.push(`Failed to read ${batch[j].relativePath}: ${result.reason}`);
       }
@@ -152,7 +154,7 @@ export async function importFragmentedModel(files: OpenFileEntry[]): Promise<Mod
     };
   }
 
-  const parsed = parseCoArchiFragments(contents);
+  const parsed = parseCoArchiFragments(contents, paths);
 
   if (!parsed.model || hasDiagnosticErrors(parsed.diagnostics)) {
     return { diagnostics: parsed.diagnostics };

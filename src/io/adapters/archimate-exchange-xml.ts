@@ -60,7 +60,7 @@ function toCamelLower(name: string): string {
 function mapElementType(node: Element, rawType: string | undefined): string | undefined {
   const base = extractTypeName(rawType).replace(/Element$/, '');
   if (!base || /relationship$/i.test(base)) return undefined;
-  if (/diagram|view|node|connection/i.test(base)) return undefined;
+  if (/diagrammodel|diagramobject|diagramconnection/i.test(base)) return undefined;
 
   const candidate = toCamelLower(base);
   if (ELEMENT_TYPE_KEYS.has(candidate)) return candidate;
@@ -224,6 +224,35 @@ function isDiagramReferenceNode(node: Element): boolean {
   return rawType.includes('diagrammodelreference');
 }
 
+function isDiagramNoteNode(node: Element): boolean {
+  const childName = localName(node).toLowerCase();
+  if (childName.includes('diagrammodelnote')) return true;
+
+  const rawType = extractTypeName(getAttr(node, ['xsi:type', 'type'])).toLowerCase();
+  return rawType.includes('diagrammodelnote');
+}
+
+function isDiagramGroupNode(node: Element): boolean {
+  const childName = localName(node).toLowerCase();
+  if (childName.includes('diagrammodelgroup')) return true;
+
+  const rawType = extractTypeName(getAttr(node, ['xsi:type', 'type'])).toLowerCase();
+  return rawType.includes('diagrammodelgroup');
+}
+
+/** Extract text from a <content> child element */
+function getContentText(node: Element): string {
+  const byAttr = getAttr(node, ['content']);
+  if (byAttr) return byAttr;
+
+  for (const child of Array.from(node.children)) {
+    if (localName(child).toLowerCase() === 'content') {
+      return child.textContent?.trim() || '';
+    }
+  }
+  return '';
+}
+
 /** Pending connection collected during tree walk, resolved after all nodes are known */
 interface PendingConnection {
   id: string;
@@ -353,6 +382,72 @@ function walkViewTree(node: Element, offsetX: number, offsetY: number, state: Vi
         if (diagramObjectId) {
           state.diagramObjectCenters.set(diagramObjectId, { x: x + width / 2, y: y + height / 2 });
         }
+      }
+    }
+  }
+
+  if (isDiagramNoteNode(node)) {
+    const diagramObjectId = getAttr(node, ['identifier', 'id']);
+    if (diagramObjectId) {
+      const noteText = getContentText(node) || getName(node) || 'Note';
+      if (!state.elementIds.has(diagramObjectId)) {
+        state.elements.push({
+          id: diagramObjectId,
+          type: 'note',
+          name: noteText,
+          documentation: '',
+        });
+        state.elementIds.add(diagramObjectId);
+      }
+      const key = `${state.viewId}::${diagramObjectId}`;
+      if (!state.viewNodeKeys.has(key)) {
+        const bounds = parseBounds(node);
+        const x = (bounds?.x ?? 140 + (state.fallbackIndex % 10) * 180) + offsetX;
+        const y = (bounds?.y ?? 100 + Math.floor(state.fallbackIndex / 10) * 120) + offsetY;
+        const width = bounds?.width ?? 200;
+        const height = bounds?.height ?? 60;
+        state.viewNodes.push({
+          id: diagramObjectId,
+          viewId: state.viewId,
+          elementId: diagramObjectId,
+          x, y, width, height,
+        });
+        state.viewNodeKeys.add(key);
+        state.fallbackIndex += 1;
+        state.diagramObjectCenters.set(diagramObjectId, { x: x + width / 2, y: y + height / 2 });
+      }
+    }
+  }
+
+  if (isDiagramGroupNode(node)) {
+    const diagramObjectId = getAttr(node, ['identifier', 'id']);
+    if (diagramObjectId) {
+      const groupName = getName(node) || 'Group';
+      if (!state.elementIds.has(diagramObjectId)) {
+        state.elements.push({
+          id: diagramObjectId,
+          type: 'grouping',
+          name: groupName,
+          documentation: getDocumentation(node),
+        });
+        state.elementIds.add(diagramObjectId);
+      }
+      const key = `${state.viewId}::${diagramObjectId}`;
+      if (!state.viewNodeKeys.has(key)) {
+        const bounds = parseBounds(node);
+        const x = (bounds?.x ?? 140 + (state.fallbackIndex % 10) * 180) + offsetX;
+        const y = (bounds?.y ?? 100 + Math.floor(state.fallbackIndex / 10) * 120) + offsetY;
+        const width = bounds?.width ?? 300;
+        const height = bounds?.height ?? 200;
+        state.viewNodes.push({
+          id: diagramObjectId,
+          viewId: state.viewId,
+          elementId: diagramObjectId,
+          x, y, width, height,
+        });
+        state.viewNodeKeys.add(key);
+        state.fallbackIndex += 1;
+        state.diagramObjectCenters.set(diagramObjectId, { x: x + width / 2, y: y + height / 2 });
       }
     }
   }

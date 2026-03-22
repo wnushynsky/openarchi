@@ -128,6 +128,84 @@ function snapToEdge(el: ModelElement, p: Point): Anchor {
   return { x: candidates[0].x, y: candidates[0].y, side: candidates[0].side };
 }
 
+/**
+ * Generate simple orthogonal (Manhattan) routing between two elements.
+ * Produces 1–2 intermediate waypoints so all segments are horizontal or vertical.
+ */
+function manhattanRoute(src: ModelElement, tgt: ModelElement): RelPath {
+  const sc = { x: src.x + src.w / 2, y: src.y + src.h / 2 };
+  const tc = { x: tgt.x + tgt.w / 2, y: tgt.y + tgt.h / 2 };
+  const gap = 12; // minimum gap from element edges
+
+  // Determine if elements overlap on each axis
+  const overlapX = src.x < tgt.x + tgt.w && tgt.x < src.x + src.w;
+  const overlapY = src.y < tgt.y + tgt.h && tgt.y < src.y + src.h;
+
+  // If one is clearly above/below the other (no horizontal overlap or dominant vertical)
+  if (!overlapX || Math.abs(tc.y - sc.y) > Math.abs(tc.x - sc.x)) {
+    // Route: source bottom/top → horizontal midpoint → target top/bottom
+    const goDown = tc.y > sc.y;
+    const exitY = goDown ? src.y + src.h : src.y;
+    const enterY = goDown ? tgt.y : tgt.y + tgt.h;
+    const midY = (exitY + enterY) / 2;
+
+    const sA: Anchor = { x: sc.x, y: exitY, side: goDown ? 'bc' : 'tc' };
+    const tA: Anchor = { x: tc.x, y: enterY, side: goDown ? 'tc' : 'bc' };
+
+    if (Math.abs(sc.x - tc.x) < 2) {
+      // Vertically aligned — straight vertical line
+      return { waypoints: [], start: sA, end: tA };
+    }
+
+    return {
+      waypoints: [{ x: sc.x, y: midY }, { x: tc.x, y: midY }],
+      start: sA, end: tA,
+    };
+  }
+
+  // Elements are side by side (no vertical overlap or dominant horizontal)
+  const goRight = tc.x > sc.x;
+  const exitX = goRight ? src.x + src.w : src.x;
+  const enterX = goRight ? tgt.x : tgt.x + tgt.w;
+  const midX = (exitX + enterX) / 2;
+
+  const sA: Anchor = { x: exitX, y: sc.y, side: goRight ? 'mr' : 'ml' };
+  const tA: Anchor = { x: enterX, y: tc.y, side: goRight ? 'ml' : 'mr' };
+
+  if (Math.abs(sc.y - tc.y) < 2) {
+    // Horizontally aligned — straight horizontal line
+    return { waypoints: [], start: sA, end: tA };
+  }
+
+  return {
+    waypoints: [{ x: midX, y: sc.y }, { x: midX, y: tc.y }],
+    start: sA, end: tA,
+  };
+}
+
+/**
+ * Snap a polyline's segments to be orthogonal where they're nearly aligned.
+ * If consecutive points have dx or dy within threshold, snap to exact alignment.
+ */
+function snapToOrthogonal(points: Point[], threshold: number = 8): Point[] {
+  if (points.length < 2) return points;
+  const result = points.map(p => ({ ...p }));
+  for (let i = 0; i < result.length - 1; i++) {
+    const a = result[i], b = result[i + 1];
+    const dx = Math.abs(b.x - a.x), dy = Math.abs(b.y - a.y);
+    if (dx < threshold && dy > threshold) {
+      // Nearly vertical — snap x to average
+      const avgX = (a.x + b.x) / 2;
+      a.x = avgX; b.x = avgX;
+    } else if (dy < threshold && dx > threshold) {
+      // Nearly horizontal — snap y to average
+      const avgY = (a.y + b.y) / 2;
+      a.y = avgY; b.y = avgY;
+    }
+  }
+  return result;
+}
+
 export function getRelPoints(rel: ModelRelationship, elements: ModelElement[], elementMap?: Map<string, ModelElement>): RelPath | null {
   const src = elementMap ? elementMap.get(rel.sourceId) : elements.find(e => e.id === rel.sourceId);
   const tgt = elementMap ? elementMap.get(rel.targetId) : elements.find(e => e.id === rel.targetId);
@@ -137,10 +215,14 @@ export function getRelPoints(rel: ModelRelationship, elements: ModelElement[], e
   const tc = { x: tgt.x + tgt.w / 2, y: tgt.y + tgt.h / 2 };
   const waypoints = (rel.waypoints || []).map(wp => ({ x: wp.x, y: wp.y }));
 
+  // No explicit waypoints and no manual anchors — use orthogonal routing
+  if (waypoints.length === 0 && !rel.sourceAnchor && !rel.targetAnchor) {
+    return manhattanRoute(src, tgt);
+  }
+
   let sA: Anchor, tA: Anchor;
 
   if (rel.sourceAnchor) {
-    // Manual anchor — snap to nearest edge point
     sA = snapToEdge(src, rel.sourceAnchor);
   } else {
     const srcTarget = waypoints.length > 0 ? waypoints[0] : tc;
@@ -152,6 +234,18 @@ export function getRelPoints(rel: ModelRelationship, elements: ModelElement[], e
   } else {
     const tgtTarget = waypoints.length > 0 ? waypoints[waypoints.length - 1] : sc;
     tA = rectEdgeIntersect(tgt, tgtTarget);
+  }
+
+  // Snap the full path (start + waypoints + end) to orthogonal segments,
+  // then extract the snapped waypoints back out
+  if (waypoints.length > 0) {
+    const fullPath = [{ x: sA.x, y: sA.y }, ...waypoints, { x: tA.x, y: tA.y }];
+    const snapped = snapToOrthogonal(fullPath);
+    // Update start/end from snapped path
+    sA = { x: snapped[0].x, y: snapped[0].y, side: sA.side };
+    tA = { x: snapped[snapped.length - 1].x, y: snapped[snapped.length - 1].y, side: tA.side };
+    const snappedWaypoints = snapped.slice(1, -1);
+    return { start: sA, end: tA, waypoints: snappedWaypoints };
   }
 
   return { start: sA, end: tA, waypoints };

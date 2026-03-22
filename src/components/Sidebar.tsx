@@ -87,6 +87,7 @@ function TreeNode({ view, depth, currentViewId, onNavigate, expanded, onToggle, 
   const isExpanded = expanded.has(view.id);
   const isCurrent = view.id === currentViewId;
   const elCount = elementCountById.get(view.id) ?? 0;
+  const isFolder = hasChildren && elCount === 0;
 
   const renderName = () => {
     if (!searchQuery) return view.name;
@@ -114,7 +115,7 @@ function TreeNode({ view, depth, currentViewId, onNavigate, expanded, onToggle, 
           transition: 'background var(--transition-fast, 0.12s ease)',
           minHeight: 26,
         }}
-        onClick={() => onNavigate(view.id)}
+        onClick={() => isFolder ? onToggle(view.id) : onNavigate(view.id)}
         onMouseEnter={e => { if (!isCurrent) e.currentTarget.style.background = 'var(--surface-hover, rgba(0,0,0,0.035))'; }}
         onMouseLeave={e => { if (!isCurrent) e.currentTarget.style.background = 'transparent'; }}
       >
@@ -133,9 +134,10 @@ function TreeNode({ view, depth, currentViewId, onNavigate, expanded, onToggle, 
 
         <span style={{
           flex: 1, fontSize: 12, fontWeight: isCurrent ? 500 : 400,
-          color: isCurrent ? 'var(--accent-text, #1d4ed8)' : 'var(--text-secondary, #555)',
+          color: isFolder ? 'var(--text-muted, #8a8a90)' : isCurrent ? 'var(--accent-text, #1d4ed8)' : 'var(--text-secondary, #555)',
           overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
           lineHeight: '20px', paddingLeft: 2,
+          fontStyle: isFolder ? 'italic' : 'normal',
         }}>
           {renderName()}
         </span>

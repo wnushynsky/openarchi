@@ -297,14 +297,21 @@ function resolveBendpoints(
   sourceCenter: { x: number; y: number } | null,
   targetCenter: { x: number; y: number } | null,
 ): { x: number; y: number }[] {
-  return raw.flatMap(bp => {
+  const total = raw.length;
+  return raw.flatMap((bp, i) => {
     if (bp.x !== undefined && bp.y !== undefined) {
       return [{ x: bp.x, y: bp.y }];
     }
+    // Archi uses weighted interpolation: weight = (i+1) / (N+1)
+    // For 1 bendpoint: weight=0.5. For 2: weights=0.33,0.67. For 3: 0.25,0.5,0.75.
     if (sourceCenter && targetCenter) {
+      const weight = (i + 1) / (total + 1);
       const fromSource = { x: sourceCenter.x + (bp.startX ?? 0), y: sourceCenter.y + (bp.startY ?? 0) };
       const fromTarget = { x: targetCenter.x + (bp.endX ?? 0), y: targetCenter.y + (bp.endY ?? 0) };
-      return [{ x: (fromSource.x + fromTarget.x) / 2, y: (fromSource.y + fromTarget.y) / 2 }];
+      return [{
+        x: fromSource.x * (1 - weight) + fromTarget.x * weight,
+        y: fromSource.y * (1 - weight) + fromTarget.y * weight,
+      }];
     }
     return [];
   });
@@ -313,6 +320,15 @@ function resolveBendpoints(
 // ---------------------------------------------------------------------------
 // Recursive view tree walker — handles nested children with relative coords
 // ---------------------------------------------------------------------------
+
+interface PendingConnection {
+  id: string;
+  viewId: string;
+  relationshipId: string;
+  rawBendpoints: RawBendpoint[];
+  labelPosition: number;
+  style?: import('../../model/canonical').DiagramStyle;
+}
 
 interface ViewWalkContext {
   viewId: string;
@@ -328,6 +344,8 @@ interface ViewWalkContext {
   /** View name lookup for view references */
   viewNameById: Map<string, string>;
   fallbackIndex: number;
+  /** Connections deferred until all nodes are collected */
+  pendingConnections: PendingConnection[];
 }
 
 /**
@@ -340,6 +358,8 @@ function walkViewChildren(
   parentX: number,
   parentY: number,
   ctx: ViewWalkContext,
+  parentNodeId?: string,
+  depth: number = 0,
 ): void {
   // Direct <children> (Archi format) or <child> elements
   const childNodes = Array.from(parentEl.children).filter(c => {
@@ -375,13 +395,15 @@ function walkViewChildren(
           width,
           height,
           style,
+          parentNodeId,
+          nestingDepth: depth,
         });
         ctx.viewNodeKeys.add(nodeId);
         ctx.fallbackIndex += 1;
       }
     }
 
-    // Check if this node is a connection
+    // Check if this node is a connection — defer resolution until all nodes are collected
     const relId = getRef(child,
       ['archimateRelationship', 'relationshipRef', 'relationship'],
       ['archimateRelationship', 'relationshipRef']);
@@ -389,22 +411,11 @@ function walkViewChildren(
       const connId = getAttr(child, ['identifier', 'id'])
         || `${ctx.viewId}::${relId}::${ctx.fallbackIndex}`;
       if (!ctx.viewConnectionKeys.has(connId)) {
-        const rawBendpoints = parseRawBendpoints(child);
-        const rel = ctx.relationships.find(r => r.id === relId);
-        let sourceCenter: { x: number; y: number } | null = null;
-        let targetCenter: { x: number; y: number } | null = null;
-        if (rel) {
-          const srcNode = ctx.viewNodes.find(vn => vn.viewId === ctx.viewId && vn.elementId === rel.sourceId);
-          const tgtNode = ctx.viewNodes.find(vn => vn.viewId === ctx.viewId && vn.elementId === rel.targetId);
-          if (srcNode) sourceCenter = { x: srcNode.x + srcNode.width / 2, y: srcNode.y + srcNode.height / 2 };
-          if (tgtNode) targetCenter = { x: tgtNode.x + tgtNode.width / 2, y: tgtNode.y + tgtNode.height / 2 };
-        }
-
-        ctx.viewConnections.push({
+        ctx.pendingConnections.push({
           id: connId,
           viewId: ctx.viewId,
           relationshipId: relId,
-          waypoints: resolveBendpoints(rawBendpoints, sourceCenter, targetCenter),
+          rawBendpoints: parseRawBendpoints(child),
           labelPosition: asNumber(getAttr(child, ['labelPos', 'labelPosition'])) ?? 0.5,
           style,
         });
@@ -419,7 +430,15 @@ function walkViewChildren(
       const typeLower = extractTypeName(rawType).toLowerCase();
       const diagramObjectId = getAttr(child, ['identifier', 'id']);
 
-      if (typeLower.includes('diagrammodelreference') && diagramObjectId) {
+      // Type detection: .archimate format uses short names (Group, Note)
+      // while coArchi/GRAFICO uses long names (DiagramModelGroup, DiagramModelNote)
+      const tagLowerChild = localName(child).toLowerCase();
+      const isViewRef = typeLower.includes('diagrammodelreference')
+        || tagLowerChild.includes('diagrammodelreference');
+      const isNote = typeLower.includes('note') || tagLowerChild.includes('note');
+      const isGroup = typeLower.includes('group') || tagLowerChild.includes('group');
+
+      if (isViewRef && diagramObjectId) {
         // View reference — navigable link to another view
         const targetViewId = getAttr(child, ['model', 'viewRef', 'targetView'])
           || getChildElementRef(child, ['model']);
@@ -441,12 +460,14 @@ function walkViewChildren(
               elementId: diagramObjectId,
               x: absX, y: absY, width, height,
               linkedViewId: targetViewId,
+              parentNodeId,
+              nestingDepth: depth,
             });
             ctx.viewNodeKeys.add(diagramObjectId);
             ctx.fallbackIndex += 1;
           }
         }
-      } else if (typeLower.includes('diagrammodelnote') && diagramObjectId) {
+      } else if (isNote && diagramObjectId) {
         // Note — free-text annotation
         const noteText = getContentText(child) || getName(child) || 'Note';
         if (!ctx.elementIds.has(diagramObjectId)) {
@@ -464,11 +485,13 @@ function walkViewChildren(
             viewId: ctx.viewId,
             elementId: diagramObjectId,
             x: absX, y: absY, width, height,
+            parentNodeId,
+            nestingDepth: depth,
           });
           ctx.viewNodeKeys.add(diagramObjectId);
           ctx.fallbackIndex += 1;
         }
-      } else if (typeLower.includes('diagrammodelgroup') && diagramObjectId) {
+      } else if (isGroup && diagramObjectId) {
         // Group — visual container
         const groupName = getName(child) || 'Group';
         if (!ctx.elementIds.has(diagramObjectId)) {
@@ -486,6 +509,8 @@ function walkViewChildren(
             viewId: ctx.viewId,
             elementId: diagramObjectId,
             x: absX, y: absY, width, height,
+            parentNodeId,
+            nestingDepth: depth,
           });
           ctx.viewNodeKeys.add(diagramObjectId);
           ctx.fallbackIndex += 1;
@@ -494,7 +519,11 @@ function walkViewChildren(
     }
 
     // Recurse into nested children (they'll be offset relative to this node)
-    walkViewChildren(child, absX, absY, ctx);
+    // Determine the current node's ID for parent tracking
+    const currentNodeId = (elementId && ctx.elementIds.has(elementId))
+      ? (getAttr(child, ['identifier', 'id']) || `${ctx.viewId}::${elementId}::${ctx.fallbackIndex - 1}`)
+      : (getAttr(child, ['identifier', 'id']) || parentNodeId);
+    walkViewChildren(child, absX, absY, ctx, currentNodeId, depth + 1);
   }
 
   // Also handle <sourceConnection(s)> / <connection(s)> elements at this level
@@ -513,28 +542,41 @@ function walkViewChildren(
       const connId = getAttr(conn, ['identifier', 'id'])
         || `${ctx.viewId}::${relId}::${ctx.fallbackIndex}`;
       if (!ctx.viewConnectionKeys.has(connId)) {
-        const rawBendpoints = parseRawBendpoints(conn);
-        const rel = ctx.relationships.find(r => r.id === relId);
-        let sourceCenter: { x: number; y: number } | null = null;
-        let targetCenter: { x: number; y: number } | null = null;
-        if (rel) {
-          const srcNode = ctx.viewNodes.find(vn => vn.viewId === ctx.viewId && vn.elementId === rel.sourceId);
-          const tgtNode = ctx.viewNodes.find(vn => vn.viewId === ctx.viewId && vn.elementId === rel.targetId);
-          if (srcNode) sourceCenter = { x: srcNode.x + srcNode.width / 2, y: srcNode.y + srcNode.height / 2 };
-          if (tgtNode) targetCenter = { x: tgtNode.x + tgtNode.width / 2, y: tgtNode.y + tgtNode.height / 2 };
-        }
-
-        ctx.viewConnections.push({
+        ctx.pendingConnections.push({
           id: connId,
           viewId: ctx.viewId,
           relationshipId: relId,
-          waypoints: resolveBendpoints(rawBendpoints, sourceCenter, targetCenter),
+          rawBendpoints: parseRawBendpoints(conn),
           labelPosition: asNumber(getAttr(conn, ['labelPos', 'labelPosition'])) ?? 0.5,
           style: parseStyle(conn),
         });
         ctx.viewConnectionKeys.add(connId);
       }
     }
+  }
+}
+
+/** Resolve all pending connections now that every node position is known */
+function resolvePendingViewConnections(ctx: ViewWalkContext): void {
+  for (const conn of ctx.pendingConnections) {
+    const rel = ctx.relationships.find(r => r.id === conn.relationshipId);
+    let sourceCenter: { x: number; y: number } | null = null;
+    let targetCenter: { x: number; y: number } | null = null;
+    if (rel) {
+      const srcNode = ctx.viewNodes.find(vn => vn.viewId === ctx.viewId && vn.elementId === rel.sourceId);
+      const tgtNode = ctx.viewNodes.find(vn => vn.viewId === ctx.viewId && vn.elementId === rel.targetId);
+      if (srcNode) sourceCenter = { x: srcNode.x + srcNode.width / 2, y: srcNode.y + srcNode.height / 2 };
+      if (tgtNode) targetCenter = { x: tgtNode.x + tgtNode.width / 2, y: tgtNode.y + tgtNode.height / 2 };
+    }
+
+    ctx.viewConnections.push({
+      id: conn.id,
+      viewId: conn.viewId,
+      relationshipId: conn.relationshipId,
+      waypoints: resolveBendpoints(conn.rawBendpoints, sourceCenter, targetCenter),
+      labelPosition: conn.labelPosition,
+      style: conn.style,
+    });
   }
 }
 
@@ -627,6 +669,11 @@ function parseCoArchiXml(raw: string): ParseResult {
       continue;
     }
 
+    // Skip diagram objects (<child> elements inside views) — they're not semantic elements.
+    // In monolithic .archimate format, <child xsi:type="archimate:Note"> or <child xsi:type="archimate:Group">
+    // would falsely match 'note'/'grouping' element types if not excluded here.
+    if (tagLower === 'child' || tagLower === 'children') continue;
+
     const mappedType = mapElementType(rawType, node);
     if (!mappedType) continue;
     if (elementIds.has(id)) continue;
@@ -690,9 +737,82 @@ function parseCoArchiXml(raw: string): ParseResult {
       elements: semanticElements,
       viewNameById,
       fallbackIndex: 0,
+      pendingConnections: [],
     };
-    walkViewChildren(viewNode, 0, 0, walkCtx);
+    // Pass 1: collect all nodes and diagram object positions
+    walkViewChildren(viewNode, 0, 0, walkCtx, undefined, 0);
+    // Pass 2: resolve connections now that all positions are known
+    resolvePendingViewConnections(walkCtx);
   }
+
+  // Build folder hierarchy from <folder> elements in the diagrams section.
+  // Folders become pseudo-views (no elementIds) with childViewIds linking to sub-folders and views.
+  const viewIdSet = new Set(views.map(v => v.id));
+  const viewByIdMap = new Map(views.map(v => [v.id, v]));
+
+  function walkFolderTree(folderEl: Element): string[] {
+    const directChildIds: string[] = [];
+
+    for (const child of Array.from(folderEl.children)) {
+      const tag = localName(child).toLowerCase();
+
+      if (tag === 'folder') {
+        const folderId = getAttr(child, ['id', 'identifier']);
+        const folderName = getName(child) || getAttr(child, ['name']) || 'Folder';
+        if (!folderId) continue;
+
+        // Recurse into sub-folder first to collect its children
+        const subChildIds = walkFolderTree(child);
+
+        // Only create a folder entry if it has children (views or sub-folders)
+        if (subChildIds.length > 0) {
+          if (!viewIdSet.has(folderId)) {
+            views.push({
+              id: folderId,
+              name: folderName,
+              childViewIds: subChildIds,
+            });
+            viewIdSet.add(folderId);
+            viewByIdMap.set(folderId, views[views.length - 1]);
+          } else {
+            // Folder ID collides with an existing view — update its children
+            const existing = viewByIdMap.get(folderId);
+            if (existing) existing.childViewIds = subChildIds;
+          }
+          directChildIds.push(folderId);
+        }
+      } else {
+        // Check if this child is a view (already collected)
+        const childId = getAttr(child, ['id', 'identifier']);
+        if (childId && viewIdSet.has(childId)) {
+          directChildIds.push(childId);
+        }
+      }
+    }
+
+    return directChildIds;
+  }
+
+  // Find the top-level diagrams folder(s) and walk them
+  const diagramsFolders = allNodes.filter(n => {
+    const tag = localName(n).toLowerCase();
+    if (tag !== 'folder') return false;
+    const type = getAttr(n, ['type']);
+    return type === 'diagrams';
+  });
+
+  // Track which views end up as children of a folder
+  const childViewIdSet = new Set<string>();
+
+  for (const df of diagramsFolders) {
+    const topChildIds = walkFolderTree(df);
+    for (const cid of topChildIds) childViewIdSet.add(cid);
+  }
+
+  // For views that are direct children of the diagrams folder (not inside a sub-folder),
+  // they remain as root-level views. Views inside sub-folders are already linked via childViewIds.
+  // Mark views that are children of folders so they don't appear as roots.
+  // (The Sidebar's getRootViews filters by parentMap, which is built from childViewIds.)
 
   if (semanticElements.length === 0) {
     return {
@@ -981,8 +1101,10 @@ export function parseCoArchiFragments(xmlContents: string[], filePaths?: string[
       elements: allElements,
       viewNameById,
       fallbackIndex: 0,
+      pendingConnections: [],
     };
-    walkViewChildren(node, 0, 0, walkCtx);
+    walkViewChildren(node, 0, 0, walkCtx, undefined, 0);
+    resolvePendingViewConnections(walkCtx);
   }
 
   // Build folder hierarchy from file paths (if available)

@@ -121,6 +121,7 @@ export function canonicalToEditorModel(document: CanonicalModelDocument): OpenAr
       h: node?.height ?? DEFAULT_ELEMENT_HEIGHT,
       documentation: element.documentation || '',
       linkedViewId: node?.linkedViewId,
+      zIndex: node?.nestingDepth ?? 0,
     };
   });
 

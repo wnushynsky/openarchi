@@ -181,16 +181,22 @@ function resolveBendpoints(
   sourceCenter: { x: number; y: number } | null,
   targetCenter: { x: number; y: number } | null,
 ): { x: number; y: number }[] {
-  return raw.flatMap(bp => {
+  const total = raw.length;
+  return raw.flatMap((bp, i) => {
     if (bp.x !== undefined && bp.y !== undefined) {
       return [{ x: bp.x, y: bp.y }];
     }
 
     // Relative bendpoints — resolve using source/target centers
+    // Archi uses weighted interpolation: weight = (i+1) / (N+1)
     if (sourceCenter && targetCenter) {
+      const weight = (i + 1) / (total + 1);
       const fromSource = { x: sourceCenter.x + (bp.startX ?? 0), y: sourceCenter.y + (bp.startY ?? 0) };
       const fromTarget = { x: targetCenter.x + (bp.endX ?? 0), y: targetCenter.y + (bp.endY ?? 0) };
-      return [{ x: (fromSource.x + fromTarget.x) / 2, y: (fromSource.y + fromTarget.y) / 2 }];
+      return [{
+        x: fromSource.x * (1 - weight) + fromTarget.x * weight,
+        y: fromSource.y * (1 - weight) + fromTarget.y * weight,
+      }];
     }
 
     // Can't resolve — skip
@@ -226,18 +232,18 @@ function isDiagramReferenceNode(node: Element): boolean {
 
 function isDiagramNoteNode(node: Element): boolean {
   const childName = localName(node).toLowerCase();
-  if (childName.includes('diagrammodelnote')) return true;
+  if (childName.includes('diagrammodelnote') || childName === 'note') return true;
 
   const rawType = extractTypeName(getAttr(node, ['xsi:type', 'type'])).toLowerCase();
-  return rawType.includes('diagrammodelnote');
+  return rawType.includes('diagrammodelnote') || rawType === 'note';
 }
 
 function isDiagramGroupNode(node: Element): boolean {
   const childName = localName(node).toLowerCase();
-  if (childName.includes('diagrammodelgroup')) return true;
+  if (childName.includes('diagrammodelgroup') || childName === 'group') return true;
 
   const rawType = extractTypeName(getAttr(node, ['xsi:type', 'type'])).toLowerCase();
-  return rawType.includes('diagrammodelgroup');
+  return rawType.includes('diagrammodelgroup') || rawType === 'group';
 }
 
 /** Extract text from a <content> child element */
@@ -283,9 +289,10 @@ interface ViewWalkState {
   fallbackIndex: number;
 }
 
-function walkViewTree(node: Element, offsetX: number, offsetY: number, state: ViewWalkState): void {
+function walkViewTree(node: Element, offsetX: number, offsetY: number, state: ViewWalkState, parentNodeId?: string, depth: number = 0): void {
   let nextOffsetX = offsetX;
   let nextOffsetY = offsetY;
+  let currentNodeId: string | undefined = parentNodeId;
 
   if (isDiagramObjectNode(node)) {
     const bounds = parseBounds(node);
@@ -306,17 +313,21 @@ function walkViewTree(node: Element, offsetX: number, offsetY: number, state: Vi
         const width = bounds?.width ?? 160;
         const height = bounds?.height ?? 72;
 
+        const nodeId = diagramObjectId || key;
         state.viewNodes.push({
-          id: diagramObjectId || key,
+          id: nodeId,
           viewId: state.viewId,
           elementId,
           x,
           y,
           width,
           height,
+          parentNodeId,
+          nestingDepth: depth,
         });
         state.viewNodeKeys.add(key);
         state.fallbackIndex += 1;
+        currentNodeId = nodeId;
 
         // Record absolute center for bendpoint resolution
         if (diagramObjectId) {
@@ -330,6 +341,7 @@ function walkViewTree(node: Element, offsetX: number, offsetY: number, state: Vi
         if (existing) {
           nextOffsetX = existing.x;
           nextOffsetY = existing.y;
+          currentNodeId = existing.id;
         }
       }
     } else if (diagramObjectId && hasBounds) {
@@ -339,6 +351,7 @@ function walkViewTree(node: Element, offsetX: number, offsetY: number, state: Vi
       const width = bounds?.width ?? 160;
       const height = bounds?.height ?? 72;
       state.diagramObjectCenters.set(diagramObjectId, { x: x + width / 2, y: y + height / 2 });
+      currentNodeId = diagramObjectId;
     }
   }
 
@@ -375,9 +388,12 @@ function walkViewTree(node: Element, offsetX: number, offsetY: number, state: Vi
           width,
           height,
           linkedViewId: targetViewId,
+          parentNodeId,
+          nestingDepth: depth,
         });
         state.viewNodeKeys.add(key);
         state.fallbackIndex += 1;
+        currentNodeId = referenceId;
 
         if (diagramObjectId) {
           state.diagramObjectCenters.set(diagramObjectId, { x: x + width / 2, y: y + height / 2 });
@@ -411,10 +427,13 @@ function walkViewTree(node: Element, offsetX: number, offsetY: number, state: Vi
           viewId: state.viewId,
           elementId: diagramObjectId,
           x, y, width, height,
+          parentNodeId,
+          nestingDepth: depth,
         });
         state.viewNodeKeys.add(key);
         state.fallbackIndex += 1;
         state.diagramObjectCenters.set(diagramObjectId, { x: x + width / 2, y: y + height / 2 });
+        currentNodeId = diagramObjectId;
       }
     }
   }
@@ -444,10 +463,13 @@ function walkViewTree(node: Element, offsetX: number, offsetY: number, state: Vi
           viewId: state.viewId,
           elementId: diagramObjectId,
           x, y, width, height,
+          parentNodeId,
+          nestingDepth: depth,
         });
         state.viewNodeKeys.add(key);
         state.fallbackIndex += 1;
         state.diagramObjectCenters.set(diagramObjectId, { x: x + width / 2, y: y + height / 2 });
+        currentNodeId = diagramObjectId;
       }
     }
   }
@@ -475,7 +497,7 @@ function walkViewTree(node: Element, offsetX: number, offsetY: number, state: Vi
   }
 
   for (const child of Array.from(node.children)) {
-    walkViewTree(child, nextOffsetX, nextOffsetY, state);
+    walkViewTree(child, nextOffsetX, nextOffsetY, state, currentNodeId, depth + 1);
   }
 }
 
@@ -645,11 +667,53 @@ function parseArchiMateExchangeXml(raw: string): ParseResult {
 
     // Pass 1: collect all nodes and diagram object positions
     for (const child of Array.from(viewNode.children)) {
-      walkViewTree(child, 0, 0, state);
+      walkViewTree(child, 0, 0, state, undefined, 0);
     }
 
     // Pass 2: resolve connections now that all positions are known
     resolvePendingConnections(state);
+  }
+
+  // Build folder hierarchy from <folder> elements in the diagrams section
+  const viewIdSet = new Set(views.map(v => v.id));
+  const viewByIdMapLocal = new Map(views.map(v => [v.id, v]));
+
+  function walkFolderHierarchy(folderEl: Element): string[] {
+    const directChildIds: string[] = [];
+    for (const child of Array.from(folderEl.children)) {
+      const tag = localName(child).toLowerCase();
+      if (tag === 'folder') {
+        const folderId = getAttr(child, ['id', 'identifier']);
+        const folderName = getName(child) || getAttr(child, ['name']) || 'Folder';
+        if (!folderId) continue;
+        const subChildIds = walkFolderHierarchy(child);
+        if (subChildIds.length > 0) {
+          if (!viewIdSet.has(folderId)) {
+            views.push({ id: folderId, name: folderName, childViewIds: subChildIds });
+            viewIdSet.add(folderId);
+            viewByIdMapLocal.set(folderId, views[views.length - 1]);
+          } else {
+            const existing = viewByIdMapLocal.get(folderId);
+            if (existing) existing.childViewIds = subChildIds;
+          }
+          directChildIds.push(folderId);
+        }
+      } else {
+        const childId = getAttr(child, ['id', 'identifier']);
+        if (childId && viewIdSet.has(childId)) {
+          directChildIds.push(childId);
+        }
+      }
+    }
+    return directChildIds;
+  }
+
+  const diagramsFolders = allNodes.filter(n => {
+    const tag = localName(n).toLowerCase();
+    return tag === 'folder' && getAttr(n, ['type']) === 'diagrams';
+  });
+  for (const df of diagramsFolders) {
+    walkFolderHierarchy(df);
   }
 
   if (elements.length === 0) {

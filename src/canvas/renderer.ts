@@ -124,9 +124,9 @@ export function drawElement(ctx: CanvasRenderingContext2D, el: ModelElement, isS
     ctx.strokeStyle = L.stroke; ctx.lineWidth = 0.6; ctx.stroke();
 
     ctx.fillStyle = L.text;
-    ctx.font = `400 14px ${FONT}`;
+    ctx.font = `400 11px ${FONT}`;
     ctx.textAlign = 'left'; ctx.textBaseline = 'top';
-    const pad = 12, mw = w - pad * 2;
+    const pad = 8, mw = w - pad * 2;
     const words = (el.name || 'Note').split(' ');
     const lines: string[] = [];
     let cur = '';
@@ -159,9 +159,9 @@ export function drawElement(ctx: CanvasRenderingContext2D, el: ModelElement, isS
     ctx.strokeStyle = isSel ? '#4a5568' : '#b0b0b8';
     ctx.stroke(); ctx.setLineDash([]);
 
-    ctx.font = `400 14px ${FONT}`;
+    ctx.font = `400 11px ${FONT}`;
     ctx.fillStyle = '#606060'; ctx.textAlign = 'left'; ctx.textBaseline = 'top';
-    ctx.fillText(el.name || 'Group', x + 12, y + 10);
+    ctx.fillText(el.name || 'Group', x + 8, y + 8);
 
     // Icon (top-right corner)
     const cIconKey = ICON_MAP[el.type];
@@ -203,8 +203,8 @@ export function drawElement(ctx: CanvasRenderingContext2D, el: ModelElement, isS
 
     // Label — move to top-left when children overlap this element
     ctx.fillStyle = L.text;
-    ctx.font = `400 13px ${FONT}`;
-    const mw = w - 28;
+    ctx.font = `400 11px ${FONT}`;
+    const mw = w - 24;
     const displayName = isViewReference ? `View: ${el.name || 'Untitled'}` : (el.name || '');
     const words = displayName.split(' ');
     const lines: string[] = [];
@@ -214,8 +214,8 @@ export function drawElement(ctx: CanvasRenderingContext2D, el: ModelElement, isS
       if (ctx.measureText(t).width > mw && cur) { lines.push(cur); cur = word; } else cur = t;
     }
     if (cur) lines.push(cur);
-    const lh = 17;
-    const availableHeight = Math.max(lh, h - (hasChildren ? 20 : 10));
+    const lh = 14;
+    const availableHeight = Math.max(lh, h - (hasChildren ? 18 : 8));
     const maxLines = Math.max(1, Math.floor(availableHeight / lh));
     const renderLines = lines.slice(0, maxLines);
     if (lines.length > maxLines) {

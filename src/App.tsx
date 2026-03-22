@@ -39,6 +39,8 @@ interface ElementViewLayout {
   w: number;
   h: number;
   linkedViewId?: string;
+  zIndex?: number;
+  isParent?: boolean;
 }
 
 interface RelationshipViewLayout {
@@ -70,6 +72,7 @@ function buildLayoutsFromEditorModel(
         w: element.w,
         h: element.h,
         linkedViewId: element.linkedViewId,
+        zIndex: element.zIndex,
       };
     }
 
@@ -96,6 +99,12 @@ function buildLayoutsFromCanonicalDocument(
     relationshipLayouts[view.id] = {};
   }
 
+  // Build a map from viewNode ID to elementId for parent resolution
+  const viewNodeIdToElementId = new Map<string, string>();
+  for (const node of document.viewNodes) {
+    viewNodeIdToElementId.set(node.id, node.elementId);
+  }
+
   for (const node of document.viewNodes) {
     if (!elementLayouts[node.viewId]) elementLayouts[node.viewId] = {};
     elementLayouts[node.viewId][node.elementId] = {
@@ -104,7 +113,18 @@ function buildLayoutsFromCanonicalDocument(
       w: node.width,
       h: node.height,
       linkedViewId: node.linkedViewId,
+      zIndex: node.nestingDepth ?? 0,
     };
+  }
+
+  // Mark elements that are structural parents (have children nested inside them)
+  for (const node of document.viewNodes) {
+    if (node.parentNodeId) {
+      const parentElementId = viewNodeIdToElementId.get(node.parentNodeId);
+      if (parentElementId && elementLayouts[node.viewId]?.[parentElementId]) {
+        elementLayouts[node.viewId][parentElementId].isParent = true;
+      }
+    }
   }
 
   for (const connection of document.viewConnections) {
@@ -152,6 +172,7 @@ export default function App() {
   const [propSide, setPropSide] = useState<'left' | 'right'>('left');
   const [openTabIds, setOpenTabIds] = useState<string[]>(['v1']);
   const [editingElId, setEditingElId] = useState<string | null>(null);
+  const [interactionMode, setInteractionMode] = useState<'view' | 'edit'>('edit');
   const [editingName, setEditingName] = useState('');
   const [showLegend, setShowLegend] = useState(false);
   const [snapGuides, setSnapGuides] = useState<SnapGuide[]>([]);
@@ -253,9 +274,26 @@ export default function App() {
 
   const visibleRelationships = useMemo(
     () => {
-      const visible = relationships.filter(relationship =>
-        visibleElementIds.has(relationship.sourceId) && visibleElementIds.has(relationship.targetId),
-      );
+      // Build element lookup for containment checks
+      const elMap = new Map(elements.map(e => [e.id, e]));
+
+      const visible = relationships.filter(relationship => {
+        if (!visibleElementIds.has(relationship.sourceId) || !visibleElementIds.has(relationship.targetId)) return false;
+
+        // Hide connections between parent and child when one visually contains the other.
+        // This matches Archi's behavior of hiding nested connections for composition/aggregation.
+        const src = elMap.get(relationship.sourceId);
+        const tgt = elMap.get(relationship.targetId);
+        if (src && tgt) {
+          const srcContainsTgt = tgt.x >= src.x && tgt.y >= src.y &&
+            tgt.x + tgt.w <= src.x + src.w && tgt.y + tgt.h <= src.y + src.h;
+          const tgtContainsSrc = src.x >= tgt.x && src.y >= tgt.y &&
+            src.x + src.w <= tgt.x + tgt.w && src.y + src.h <= tgt.y + tgt.h;
+          if (srcContainsTgt || tgtContainsSrc) return false;
+        }
+
+        return true;
+      });
       if (relationships.length > 0 && visible.length === 0 && visibleElementIds.size > 0) {
         const sample = relationships.slice(0, 3);
         const elSample = Array.from(visibleElementIds).slice(0, 3);
@@ -267,7 +305,7 @@ export default function App() {
       }
       return visible;
     },
-    [relationships, visibleElementIds],
+    [relationships, visibleElementIds, elements],
   );
 
   // Element lookup map for O(1) access in getRelPoints/drawRelationship
@@ -296,6 +334,7 @@ export default function App() {
         w: element.w,
         h: element.h,
         linkedViewId: element.linkedViewId,
+        zIndex: element.zIndex,
       };
     }
 
@@ -331,6 +370,7 @@ export default function App() {
         w: layout.w,
         h: layout.h,
         linkedViewId: layout.linkedViewId,
+        zIndex: layout.zIndex ?? element.zIndex ?? 0,
       };
     }));
 
@@ -482,41 +522,49 @@ export default function App() {
     y: (sy - cam.y) / cam.s,
   }), [cam]);
 
-  // Pre-compute parent IDs using spatial index for large models (avoid O(n²))
+  // Pre-compute parent IDs — prefer structural data from import, fall back to spatial detection
   const parentIds = useMemo(() => {
     const ids = new Set<string>();
-    const n = visibleElements.length;
-    // For small sets, brute force is fine. For larger sets, use sorted-edge approach.
-    if (n < 200) {
-      for (const outer of visibleElements) {
-        for (const inner of visibleElements) {
-          if (inner.id === outer.id) continue;
-          if (inner.x >= outer.x && inner.y >= outer.y &&
-              inner.x + inner.w <= outer.x + outer.w &&
-              inner.y + inner.h <= outer.y + outer.h) {
-            ids.add(outer.id);
-            break;
+
+    // Try structural detection first (from parsed nesting hierarchy)
+    const currentLayout = elementLayoutsByViewRef.current[currentViewId] || {};
+    for (const [elementId, layout] of Object.entries(currentLayout)) {
+      if (layout.isParent) ids.add(elementId);
+    }
+
+    // If no structural data available, fall back to spatial containment detection
+    if (ids.size === 0 && visibleElements.length > 0) {
+      const n = visibleElements.length;
+      if (n < 200) {
+        for (const outer of visibleElements) {
+          for (const inner of visibleElements) {
+            if (inner.id === outer.id) continue;
+            if (inner.x >= outer.x && inner.y >= outer.y &&
+                inner.x + inner.w <= outer.x + outer.w &&
+                inner.y + inner.h <= outer.y + outer.h) {
+              ids.add(outer.id);
+              break;
+            }
           }
         }
-      }
-    } else {
-      // Sort by area descending — larger elements are more likely parents
-      const byArea = [...visibleElements].sort((a, b) => (b.w * b.h) - (a.w * a.h));
-      for (let i = 0; i < byArea.length && !ids.has(byArea[i].id); i++) {
-        const outer = byArea[i];
-        for (let j = i + 1; j < byArea.length; j++) {
-          const inner = byArea[j];
-          if (inner.x >= outer.x && inner.y >= outer.y &&
-              inner.x + inner.w <= outer.x + outer.w &&
-              inner.y + inner.h <= outer.y + outer.h) {
-            ids.add(outer.id);
-            break;
+      } else {
+        const byArea = [...visibleElements].sort((a, b) => (b.w * b.h) - (a.w * a.h));
+        for (let i = 0; i < byArea.length && !ids.has(byArea[i].id); i++) {
+          const outer = byArea[i];
+          for (let j = i + 1; j < byArea.length; j++) {
+            const inner = byArea[j];
+            if (inner.x >= outer.x && inner.y >= outer.y &&
+                inner.x + inner.w <= outer.x + outer.w &&
+                inner.y + inner.h <= outer.y + outer.h) {
+              ids.add(outer.id);
+              break;
+            }
           }
         }
       }
     }
     return ids;
-  }, [visibleElements]);
+  }, [visibleElements, currentViewId]);
 
   const sortedElements = useMemo(
     () => [...visibleElements].sort((a, b) => (a.zIndex ?? 0) - (b.zIndex ?? 0)),
@@ -565,18 +613,9 @@ export default function App() {
 
     const culledElements = sortedElements.filter(inViewport);
 
-    // 1. Composite elements (background)
+    // Elements — single pass sorted by zIndex (parents draw before children)
     for (const el of culledElements) {
-      if (getLayer(el.type) === 'composite' && !isNote(el.type)) {
-        drawElement(ctx, el, selType === 'element' && selectedId === el.id, hovElId === el.id, (selType === 'element' && selectedId === el.id) || hovElId === el.id, parentIds.has(el.id));
-      }
-    }
-
-    // 2. Non-composite elements + notes
-    for (const el of culledElements) {
-      if (getLayer(el.type) !== 'composite' || isNote(el.type)) {
-        drawElement(ctx, el, selType === 'element' && selectedId === el.id, hovElId === el.id, (selType === 'element' && selectedId === el.id) || hovElId === el.id, parentIds.has(el.id));
-      }
+      drawElement(ctx, el, selType === 'element' && selectedId === el.id, hovElId === el.id, (selType === 'element' && selectedId === el.id) || hovElId === el.id, parentIds.has(el.id));
     }
 
     // 3. Relationships (always on top of elements) — with crossing hops
@@ -649,12 +688,30 @@ export default function App() {
   }, [visibleElements, visibleElementMap, visibleRelationships, sortedElements, parentIds, selectedId, selType, cam, cSize, hovElId, hovRelId, drawingRel, gridType, snapGuides]);
 
   // ==================== MOUSE HANDLERS ====================
+  const isViewMode = interactionMode === 'view';
+
   const handleMouseDown = useCallback((e: React.MouseEvent) => {
     if (relPicker || ctxMenu) { setRelPicker(null); setCtxMenu(null); return; }
     if (editingElId) return;
     const rect = canvasRef.current!.getBoundingClientRect();
     const sx = e.clientX - rect.left, sy = e.clientY - rect.top;
     const { x: wx, y: wy } = s2w(sx, sy);
+
+    // View mode: only allow selection (inspect), panning, and view navigation
+    if (isViewMode) {
+      const linked = hitTestPopout(visibleElements, wx, wy);
+      if (linked) { navigateToView(linked); return; }
+
+      const el = hitTestElement(visibleElements, wx, wy, getLayer, isNote);
+      if (el) {
+        setSelectedId(el.id); setSelType('element');
+      } else {
+        const rh = hitTestRelationship(visibleRelationships, visibleElements, wx, wy);
+        if (rh) { setSelectedId(rh.rel.id); setSelType('relationship'); }
+        else { setSelectedId(null); setSelType(null); setPanning({ sx: e.clientX, sy: e.clientY, cx: cam.x, cy: cam.y }); }
+      }
+      return;
+    }
 
     if (drawingRel && e.shiftKey) {
       setDrawingRel(prev => prev ? { ...prev, waypoints: [...prev.waypoints, { x: snap(wx), y: snap(wy) }] } : null);
@@ -705,7 +762,7 @@ export default function App() {
       if (rh) { setSelectedId(rh.rel.id); setSelType('relationship'); }
       else { setSelectedId(null); setSelType(null); setPanning({ sx: e.clientX, sy: e.clientY, cx: cam.x, cy: cam.y }); }
     }
-  }, [s2w, visibleElements, visibleRelationships, cam, relPicker, ctxMenu, drawingRel, editingElId, navigateToView, selType, selectedId, pushHistory]);
+  }, [s2w, visibleElements, visibleRelationships, cam, relPicker, ctxMenu, drawingRel, editingElId, navigateToView, selType, selectedId, pushHistory, isViewMode]);
 
   const handleMouseMove = useCallback((e: React.MouseEvent) => {
     const rect = canvasRef.current!.getBoundingClientRect();
@@ -808,26 +865,33 @@ export default function App() {
 
     const el = hitTestElement(visibleElements, wx, wy, getLayer, isNote);
     if (el) {
+      // View navigation always allowed
       if (el.linkedViewId) {
         navigateToView(el.linkedViewId);
         return;
       }
-      setEditingElId(el.id);
-      setEditingName(el.name);
-      setSelectedId(el.id);
-      setSelType('element');
+      // Inline editing only in edit mode
+      if (!isViewMode) {
+        setEditingElId(el.id);
+        setEditingName(el.name);
+        setSelectedId(el.id);
+        setSelType('element');
+      }
       return;
     }
 
-    const rh = hitTestRelationship(visibleRelationships, visibleElements, wx, wy);
-    if (rh) {
-      const name = prompt('Relationship label:', rh.rel.name || '');
-      if (name !== null) { pushHistory(); setRelationships(prev => prev.map(r => r.id === rh.rel.id ? { ...r, name } : r)); }
+    if (!isViewMode) {
+      const rh = hitTestRelationship(visibleRelationships, visibleElements, wx, wy);
+      if (rh) {
+        const name = prompt('Relationship label:', rh.rel.name || '');
+        if (name !== null) { pushHistory(); setRelationships(prev => prev.map(r => r.id === rh.rel.id ? { ...r, name } : r)); }
+      }
     }
-  }, [s2w, visibleElements, visibleRelationships, navigateToView]);
+  }, [s2w, visibleElements, visibleRelationships, navigateToView, isViewMode]);
 
   const handleContextMenu = useCallback((e: React.MouseEvent) => {
     e.preventDefault();
+    if (isViewMode) return; // No context menu in view mode
     const rect = canvasRef.current!.getBoundingClientRect();
     const sx = e.clientX - rect.left, sy = e.clientY - rect.top;
     const { x: wx, y: wy } = s2w(sx, sy);
@@ -1292,7 +1356,7 @@ export default function App() {
     const h = (e: KeyboardEvent) => {
       if (e.key === 'Delete' || e.key === 'Backspace') {
         if (['INPUT', 'TEXTAREA', 'SELECT'].includes((document.activeElement as HTMLElement)?.tagName)) return;
-        deleteSelected();
+        if (interactionMode !== 'view') deleteSelected();
       }
       if (e.key === 'Escape') { setRelPicker(null); setCtxMenu(null); setShowSearch(false); setDrawingRel(null); cancelEditing(); }
       if ((e.metaKey || e.ctrlKey) && e.key === 'k') { e.preventDefault(); setShowSearch(s => !s); }
@@ -1315,7 +1379,7 @@ export default function App() {
     };
     window.addEventListener('keydown', h);
     return () => window.removeEventListener('keydown', h);
-  }, [deleteSelected, cancelEditing, goBack, goForward, handleSave, undo, redo, fitToContent]);
+  }, [deleteSelected, cancelEditing, goBack, goForward, handleSave, undo, redo, fitToContent, interactionMode]);
 
   useEffect(() => {
     if (!selectedId) return;
@@ -1691,6 +1755,8 @@ export default function App() {
           gridType={gridType}
           onToggleGrid={() => setGridType(g => g === 'dot' ? 'line' : 'dot')}
           onSearch={() => setShowSearch(s => !s)}
+          interactionMode={interactionMode}
+          onToggleMode={() => setInteractionMode(m => m === 'view' ? 'edit' : 'view')}
         />
 
         {/* ====== Legend toggle + panel (bottom-right) ====== */}

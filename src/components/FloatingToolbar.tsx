@@ -16,6 +16,8 @@ const GridIcon = () => <I>{[5,9,13].map(x=>[5,9,13].map(y=><circle key={`${x}${y
 const SearchIcon = () => <I><circle cx="8" cy="8" r="4.5" stroke="currentColor" strokeWidth="1.3" /><line x1="11.5" y1="11.5" x2="15" y2="15" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" /></I>;
 const MenuIcon = () => <I><line x1="3.5" y1="5.5" x2="14.5" y2="5.5" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" /><line x1="3.5" y1="9" x2="14.5" y2="9" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" /><line x1="3.5" y1="12.5" x2="14.5" y2="12.5" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" /></I>;
 const DeleteIcon = () => <I><path d="M5.5 4.5V3.5a1.5 1.5 0 011.5-1.5h4a1.5 1.5 0 011.5 1.5v1" stroke="currentColor" strokeWidth="1.3" /><path d="M3 4.5h12" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" /><path d="M4.5 4.5l.7 10a1 1 0 001 .9h5.6a1 1 0 001-.9l.7-10" stroke="currentColor" strokeWidth="1.3" /></I>;
+const ViewIcon = () => <I><path d="M2 9s3-5.5 7-5.5S16 9 16 9s-3 5.5-7 5.5S2 9 2 9z" stroke="currentColor" strokeWidth="1.3" strokeLinejoin="round" /><circle cx="9" cy="9" r="2.5" stroke="currentColor" strokeWidth="1.3" /></I>;
+const EditIcon = () => <I><path d="M11.5 2.5l4 4-9.5 9.5H2v-4z" stroke="currentColor" strokeWidth="1.3" strokeLinejoin="round" /><path d="M9.5 4.5l4 4" stroke="currentColor" strokeWidth="1.3" /></I>;
 
 const LAYER_ORDER = ['strategy', 'business', 'application', 'technology', 'motivation', 'implementation', 'composite'] as const;
 
@@ -181,6 +183,8 @@ export interface FloatingToolbarProps {
   gridType: 'dot' | 'line';
   onToggleGrid: () => void;
   onSearch: () => void;
+  interactionMode: 'view' | 'edit';
+  onToggleMode: () => void;
 }
 
 export function FloatingToolbar(props: FloatingToolbarProps) {
@@ -189,7 +193,10 @@ export function FloatingToolbar(props: FloatingToolbarProps) {
     onOpenDir, onImport, onExport, onSave, canSave, isDirty, dirState, dirFiles, activeFilePath, onSelectFile,
     ioFormatId, onFormatChange, modelFormats,
     gridType, onToggleGrid, onSearch,
+    interactionMode, onToggleMode,
   } = props;
+
+  const isViewMode = interactionMode === 'view';
 
   const [pickerLayer, setPickerLayer] = useState<string | null>(null);
   const [showMenu, setShowMenu] = useState(false);
@@ -246,6 +253,19 @@ export function FloatingToolbar(props: FloatingToolbarProps) {
         padding: '5px 8px',
         height: 48,
       }}>
+        {/* Mode toggle */}
+        <button onClick={() => { onToggleMode(); close(); }} title={isViewMode ? 'Switch to Edit mode' : 'Switch to View mode'} style={{
+          ...tb(true),
+          background: isViewMode ? 'var(--accent-ring, rgba(37,99,235,0.12))' : 'var(--surface-active, rgba(0,0,0,0.06))',
+          color: isViewMode ? 'var(--accent-text, #1d4ed8)' : 'var(--text-secondary, #555)',
+        }}
+          onMouseEnter={e => { e.currentTarget.style.opacity = '0.8'; }}
+          onMouseLeave={e => { e.currentTarget.style.opacity = '1'; }}>
+          {isViewMode ? <ViewIcon /> : <EditIcon />}
+        </button>
+
+        {div}
+
         {/* Layer dots */}
         {LAYER_ORDER.map(k => {
           const L = LAYERS[k];
@@ -253,13 +273,14 @@ export function FloatingToolbar(props: FloatingToolbarProps) {
           const isOpen = pickerLayer === k;
           return (
             <button key={k}
-              onClick={() => { setPickerLayer(prev => prev === k ? null : k); setShowMenu(false); }}
+              onClick={() => { if (!isViewMode) { setPickerLayer(prev => prev === k ? null : k); setShowMenu(false); } }}
               title={L.label}
               style={{
                 width: 24, height: 24, borderRadius: '50%', padding: 0, flexShrink: 0,
                 background: `radial-gradient(circle at 40% 35%, ${fill}, ${L.stroke}40)`,
                 border: isOpen ? `2px solid ${L.stroke}` : `1.5px solid ${L.stroke}60`,
-                cursor: 'pointer',
+                cursor: isViewMode ? 'default' : 'pointer',
+                opacity: isViewMode ? 0.35 : 1,
                 transition: 'transform var(--transition-fast, 0.12s ease), border-color var(--transition-fast, 0.12s ease), box-shadow var(--transition-fast, 0.12s ease)',
                 boxSizing: 'border-box',
                 boxShadow: isOpen
@@ -275,14 +296,14 @@ export function FloatingToolbar(props: FloatingToolbarProps) {
         {div}
 
         {/* Note */}
-        <button onClick={() => { onAddElement('note'); close(); }} title="Note" style={tb()}
-          onMouseEnter={e => hover(e)} onMouseLeave={e => unhover(e)}>
+        <button onClick={() => { if (!isViewMode) { onAddElement('note'); close(); } }} title="Note" disabled={isViewMode} style={tb(false, isViewMode)}
+          onMouseEnter={e => { if (!isViewMode) hover(e); }} onMouseLeave={e => { if (!isViewMode) unhover(e); }}>
           <NoteIcon />
         </button>
 
         {/* Group */}
-        <button onClick={() => { onAddElement('grouping'); close(); }} title="Group" style={tb()}
-          onMouseEnter={e => hover(e)} onMouseLeave={e => unhover(e)}>
+        <button onClick={() => { if (!isViewMode) { onAddElement('grouping'); close(); } }} title="Group" disabled={isViewMode} style={tb(false, isViewMode)}
+          onMouseEnter={e => { if (!isViewMode) hover(e); }} onMouseLeave={e => { if (!isViewMode) unhover(e); }}>
           <GroupIcon />
         </button>
 
@@ -303,8 +324,8 @@ export function FloatingToolbar(props: FloatingToolbarProps) {
         {div}
 
         {/* Delete */}
-        <button onClick={() => { onDeleteSelected(); close(); }} title="Delete" disabled={!hasSelection} style={tb(false, !hasSelection)}
-          onMouseEnter={e => { if (hasSelection) hover(e); }} onMouseLeave={e => { if (hasSelection) unhover(e); }}>
+        <button onClick={() => { if (!isViewMode) { onDeleteSelected(); close(); } }} title="Delete" disabled={!hasSelection || isViewMode} style={tb(false, !hasSelection || isViewMode)}
+          onMouseEnter={e => { if (hasSelection && !isViewMode) hover(e); }} onMouseLeave={e => { if (hasSelection && !isViewMode) unhover(e); }}>
           <DeleteIcon />
         </button>
 

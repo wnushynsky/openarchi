@@ -35,7 +35,7 @@ export function detectModelFormatByFileName(fileName: string) {
   const lower = fileName.toLowerCase();
   if (lower.endsWith('.openarchi.json') || lower.endsWith('.json')) return registry.getById('openarchi-json');
   if (lower.endsWith('.coarchi.xml') || lower.endsWith('.coarchi')) return registry.getById('coarchi-xml');
-  if (lower.endsWith('.archimate.xml') || lower.endsWith('.archimate')) return registry.getById('archimate-exchange-xml');
+  if (lower.endsWith('.archimate.xml') || lower.endsWith('.archimate')) return registry.getById('coarchi-xml');
   return registry.detectByFileName(fileName);
 }
 

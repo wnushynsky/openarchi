@@ -49,6 +49,10 @@ export interface CanonicalViewNode {
   linkedViewId?: string;
   /** Source diagram style metadata (preserved for fidelity, optional) */
   style?: DiagramStyle;
+  /** ID of the parent viewNode in the diagram hierarchy (undefined for top-level nodes) */
+  parentNodeId?: string;
+  /** Nesting depth: 0 = top-level, 1 = child of a top-level node, etc. */
+  nestingDepth?: number;
 }
 
 export interface CanonicalViewConnection {

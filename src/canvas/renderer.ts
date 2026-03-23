@@ -28,8 +28,8 @@ export function rrect(ctx: CanvasRenderingContext2D, x: number, y: number, w: nu
 // Rounded Polyline — smooth arcs at bendpoints (matches Archi)
 // ============================================================
 
-const MAX_CURVE_RADIUS = 14;
-const CURVE_SEGMENTS = 6;
+const MAX_CURVE_RADIUS = 6;
+const CURVE_SEGMENTS = 4;
 
 /**
  * Draw a polyline with smooth arcs at each interior point.
@@ -403,22 +403,25 @@ export function getRelSegments(rel: ModelRelationship, elements: ModelElement[],
   return { relId: rel.id, segments };
 }
 
-const HOP_RADIUS = 6;
+const HOP_RADIUS = 5;
 
-/** Draw a polyline path with small arc hops at crossing points */
+/** Draw a rounded polyline path with small arc hops at crossing points */
 function drawPathWithHops(
   ctx: CanvasRenderingContext2D,
   allPts: { x: number; y: number }[],
   otherSegments: Seg[],
 ) {
-  // Collect all crossing points per segment
+  // First expand the polyline with rounded corners to get the actual rendered path
+  const expanded = expandRoundedPolyline(allPts);
+
+  // Build segments from the expanded path
   const mySegments: Seg[] = [];
-  for (let i = 0; i < allPts.length - 1; i++) {
-    mySegments.push({ x1: allPts[i].x, y1: allPts[i].y, x2: allPts[i + 1].x, y2: allPts[i + 1].y });
+  for (let i = 0; i < expanded.length - 1; i++) {
+    mySegments.push({ x1: expanded[i].x, y1: expanded[i].y, x2: expanded[i + 1].x, y2: expanded[i + 1].y });
   }
 
   ctx.beginPath();
-  ctx.moveTo(allPts[0].x, allPts[0].y);
+  ctx.moveTo(expanded[0].x, expanded[0].y);
 
   for (let i = 0; i < mySegments.length; i++) {
     const seg = mySegments[i];
@@ -427,28 +430,24 @@ function drawPathWithHops(
     if (segLen < 0.1) { ctx.lineTo(seg.x2, seg.y2); continue; }
 
     // Find crossings on this segment
-    const crossings: number[] = []; // parameter t values
+    const crossings: number[] = [];
     for (const other of otherSegments) {
       const hit = segIntersect(seg, other);
       if (!hit) continue;
       const t = ((hit.x - seg.x1) * dx + (hit.y - seg.y1) * dy) / (segLen * segLen);
-      crossings.push(t);
+      if (t > 0.02 && t < 0.98) crossings.push(t);
     }
     crossings.sort((a, b) => a - b);
 
     if (crossings.length === 0) {
       ctx.lineTo(seg.x2, seg.y2);
     } else {
-      // Unit normal perpendicular to segment (pointing "up" in screen space)
       const nx = -dy / segLen, ny = dx / segLen;
       const hopT = HOP_RADIUS / segLen;
 
       for (const t of crossings) {
         const tBefore = Math.max(0, t - hopT);
-        const tAfter = Math.min(1, t + hopT);
-        // Draw to just before the crossing
         ctx.lineTo(seg.x1 + tBefore * dx, seg.y1 + tBefore * dy);
-        // Draw arc hop (semicircle above the line)
         const cx = seg.x1 + t * dx, cy = seg.y1 + t * dy;
         const startAngle = Math.atan2(-nx, -ny);
         ctx.arc(cx, cy, HOP_RADIUS, startAngle, startAngle + Math.PI);
@@ -457,6 +456,38 @@ function drawPathWithHops(
     }
   }
   ctx.stroke();
+}
+
+/** Expand a polyline into points with rounded corners (for use in hop detection) */
+function expandRoundedPolyline(pts: { x: number; y: number }[]): { x: number; y: number }[] {
+  if (pts.length <= 2) return pts;
+  const result: { x: number; y: number }[] = [pts[0]];
+
+  for (let i = 1; i < pts.length - 1; i++) {
+    const prev = pts[i - 1], cur = pts[i], next = pts[i + 1];
+    const dIn = Math.hypot(cur.x - prev.x, cur.y - prev.y);
+    const dOut = Math.hypot(next.x - cur.x, next.y - cur.y);
+    if (dIn < 1 || dOut < 1) { result.push(cur); continue; }
+
+    const r = Math.min(MAX_CURVE_RADIUS, dIn / 2, dOut / 2);
+    const inDx = (cur.x - prev.x) / dIn, inDy = (cur.y - prev.y) / dIn;
+    const outDx = (next.x - cur.x) / dOut, outDy = (next.y - cur.y) / dOut;
+    const arcStartX = cur.x - inDx * r, arcStartY = cur.y - inDy * r;
+    const arcEndX = cur.x + outDx * r, arcEndY = cur.y + outDy * r;
+
+    result.push({ x: arcStartX, y: arcStartY });
+    for (let s = 1; s <= CURVE_SEGMENTS; s++) {
+      const t = s / CURVE_SEGMENTS;
+      const omt = 1 - t;
+      result.push({
+        x: omt * omt * arcStartX + 2 * omt * t * cur.x + t * t * arcEndX,
+        y: omt * omt * arcStartY + 2 * omt * t * cur.y + t * t * arcEndY,
+      });
+    }
+  }
+
+  result.push(pts[pts.length - 1]);
+  return result;
 }
 
 export function drawRelationship(ctx: CanvasRenderingContext2D, rel: ModelRelationship, elements: ModelElement[], isSel: boolean, isHov: boolean, otherSegments?: Seg[], elementMap?: Map<string, ModelElement>) {
@@ -545,19 +576,40 @@ export function drawRelationship(ctx: CanvasRenderingContext2D, rel: ModelRelati
     });
   }
 
-  // Label (larger)
+  // Label — positioned with perpendicular offset to avoid overlapping the line
   if (rel.name) {
     const lp = rel.labelPos ?? 0.5;
     const pt = pointOnPath(allPts, lp);
-    ctx.font = `400 12px ${FONT}`;
+
+    // Compute local direction at label position for perpendicular offset
+    const ptBefore = pointOnPath(allPts, Math.max(0, lp - 0.02));
+    const ptAfter = pointOnPath(allPts, Math.min(1, lp + 0.02));
+    const segDx = ptAfter.x - ptBefore.x;
+    const segDy = ptAfter.y - ptBefore.y;
+    const segLen = Math.hypot(segDx, segDy);
+
+    // Perpendicular offset (above the line)
+    const offsetDist = 10;
+    let labelX = pt.x, labelY = pt.y;
+    if (segLen > 0.1) {
+      // Normal vector pointing "up" (perpendicular to segment)
+      const nx = -segDy / segLen;
+      const ny = segDx / segLen;
+      labelX = pt.x + nx * offsetDist;
+      labelY = pt.y + ny * offsetDist;
+    } else {
+      labelY = pt.y - offsetDist;
+    }
+
+    ctx.font = `400 8px ${FONT}`;
     const measured = ctx.measureText(rel.name).width;
-    const padX = 6, padY = 3;
-    rrect(ctx, pt.x - measured / 2 - padX, pt.y - 8 - padY, measured + padX * 2, 16 + padY * 2, 3);
-    ctx.fillStyle = 'rgba(255,255,255,0.95)'; ctx.fill();
+    const padX = 3, padY = 1;
+    rrect(ctx, labelX - measured / 2 - padX, labelY - 5 - padY, measured + padX * 2, 10 + padY * 2, 2);
+    ctx.fillStyle = 'rgba(255,255,255,0.88)'; ctx.fill();
     if (isSel) { ctx.strokeStyle = 'rgba(74,85,104,0.25)'; ctx.lineWidth = 0.8; ctx.stroke(); }
-    ctx.fillStyle = isSel ? '#4a5568' : '#777';
+    ctx.fillStyle = isSel ? '#4a5568' : '#999';
     ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
-    ctx.fillText(rel.name, pt.x, pt.y);
+    ctx.fillText(rel.name, labelX, labelY);
   }
 
   ctx.restore();

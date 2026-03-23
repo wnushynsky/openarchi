@@ -59,191 +59,100 @@ const STRAIGHT_THRESH = 40;
  * When the direction is nearly diagonal, we bias toward the edge that aligns
  * with the dominant axis so connections don't flip sides unexpectedly.
  */
-function rectEdgeIntersect(
-  el: ModelElement,
-  target: Point,
-): Anchor {
-  const cx = el.x + el.w / 2, cy = el.y + el.h / 2;
-  const dx = target.x - cx, dy = target.y - cy;
-
-  // Degenerate case: target is at center
-  if (Math.abs(dx) < 0.01 && Math.abs(dy) < 0.01) {
-    return { x: cx, y: el.y, side: 'tc' };
-  }
-
-  const hw = el.w / 2, hh = el.h / 2;
-  const adx = Math.abs(dx), ady = Math.abs(dy);
-
-  // Decide which edge the line should exit from.
-  // Use the angle of the direction relative to the rect's aspect ratio.
-  // Bias toward top/bottom to match typical top-to-bottom ArchiMate flow:
-  // we only pick left/right when the direction is strongly horizontal.
-  const angle = Math.atan2(ady, adx); // 0 = horizontal, PI/2 = vertical
-  const aspectAngle = Math.atan2(hh, hw); // angle of the rect diagonal
-
-  let ix: number, iy: number, side: string;
-
-  if (angle >= aspectAngle) {
-    // Dominant vertical — exit through top or bottom, x follows the line
-    const t = hh / ady;
-    ix = cx + dx * t;
-    iy = dy > 0 ? el.y + el.h : el.y;
-    // Clamp x to stay within the element bounds
-    ix = Math.max(el.x, Math.min(el.x + el.w, ix));
-    side = dy > 0 ? 'bc' : 'tc';
-  } else {
-    // Dominant horizontal — exit through left or right, y follows the line
-    const t = hw / adx;
-    iy = cy + dy * t;
-    ix = dx > 0 ? el.x + el.w : el.x;
-    // Clamp y to stay within the element bounds
-    iy = Math.max(el.y, Math.min(el.y + el.h, iy));
-    side = dx > 0 ? 'mr' : 'ml';
-  }
-
-  return { x: ix, y: iy, side };
-}
+// ============================================================
+// Connection Anchoring — exact port of Archi's OrthogonalAnchor
+// ============================================================
+//
+// Archi's OrthogonalAnchor.getLocation() classifies the reference point
+// into a grid around the element figure and projects onto the nearest edge.
+// There is NO separate connection router — the anchor alone produces the
+// orthogonal look. Connections are just straight segments through
+// anchor → bendpoints → anchor.
 
 /**
- * Orthogonal anchor: exit perpendicular to the nearest element edge, aligned
- * with the reference point. This matches Archi's OrthogonalAnchor behavior
- * where connections always leave elements at right angles.
+ * OrthogonalAnchor — exact port from Archi.
+ *
+ * Given an element and a reference point (first/last bendpoint, or remote
+ * element center), returns the point on the element boundary where the
+ * connection attaches. The anchor always exits perpendicular to the chosen edge.
  */
 function orthogonalAnchor(el: ModelElement, ref: Point): Anchor {
-  const cx = el.x + el.w / 2, cy = el.y + el.h / 2;
-  const left = el.x, right = el.x + el.w, top = el.y, bottom = el.y + el.h;
+  const left = el.x, top = el.y;
+  const right = el.x + el.w, bottom = el.y + el.h;
 
-  // Determine which edge to exit from based on where the reference point is
-  // relative to the element
-  const dLeft = ref.x - left;
-  const dRight = right - ref.x;
-  const dTop = ref.y - top;
-  const dBottom = bottom - ref.y;
-
-  // If the reference point is inside the element, pick the nearest edge
-  const isInside = ref.x >= left && ref.x <= right && ref.y >= top && ref.y <= bottom;
-
-  if (isInside) {
-    const minDist = Math.min(dLeft, dRight, dTop, dBottom);
-    if (minDist === dTop) return { x: Math.max(left, Math.min(right, ref.x)), y: top, side: 'tc' };
-    if (minDist === dBottom) return { x: Math.max(left, Math.min(right, ref.x)), y: bottom, side: 'bc' };
-    if (minDist === dLeft) return { x: left, y: Math.max(top, Math.min(bottom, ref.y)), side: 'ml' };
-    return { x: right, y: Math.max(top, Math.min(bottom, ref.y)), side: 'mr' };
-  }
-
-  // Reference point is outside — determine which edge faces it
-  const refAbove = ref.y < top;
-  const refBelow = ref.y > bottom;
+  // Classify reference into which zone it falls in relative to the element.
+  // For each axis: is the reference to the left/above, overlapping, or to the right/below?
   const refLeft = ref.x < left;
   const refRight = ref.x > right;
+  const refAbove = ref.y < top;
+  const refBelow = ref.y > bottom;
 
-  // Corner cases: pick the edge that's more "faced" by the reference
-  if (refAbove && !refLeft && !refRight) {
+  // Straight-side cases: reference is directly above/below/left/right of the element
+  if (!refLeft && !refRight && refAbove) {
+    // Above — exit from top edge, x follows reference
     return { x: Math.max(left, Math.min(right, ref.x)), y: top, side: 'tc' };
   }
-  if (refBelow && !refLeft && !refRight) {
+  if (!refLeft && !refRight && refBelow) {
+    // Below — exit from bottom edge
     return { x: Math.max(left, Math.min(right, ref.x)), y: bottom, side: 'bc' };
   }
   if (refLeft && !refAbove && !refBelow) {
+    // Left — exit from left edge, y follows reference
     return { x: left, y: Math.max(top, Math.min(bottom, ref.y)), side: 'ml' };
   }
   if (refRight && !refAbove && !refBelow) {
+    // Right — exit from right edge
     return { x: right, y: Math.max(top, Math.min(bottom, ref.y)), side: 'mr' };
   }
 
-  // Diagonal quadrant: pick the edge that makes the path more orthogonal
-  // Use the dominant direction (which axis has more distance)
-  const absDx = Math.abs(ref.x - cx);
-  const absDy = Math.abs(ref.y - cy);
+  // Reference is inside the element — pick the nearest edge
+  if (!refLeft && !refRight && !refAbove && !refBelow) {
+    const dT = ref.y - top, dB = bottom - ref.y;
+    const dL = ref.x - left, dR = right - ref.x;
+    const min = Math.min(dT, dB, dL, dR);
+    if (min === dT) return { x: ref.x, y: top, side: 'tc' };
+    if (min === dB) return { x: ref.x, y: bottom, side: 'bc' };
+    if (min === dL) return { x: left, y: ref.y, side: 'ml' };
+    return { x: right, y: ref.y, side: 'mr' };
+  }
 
-  if (absDy >= absDx) {
-    // Dominant vertical — exit top or bottom
-    const exitY = ref.y < cy ? top : bottom;
-    return { x: Math.max(left, Math.min(right, ref.x)), y: exitY, side: ref.y < cy ? 'tc' : 'bc' };
+  // Diagonal quadrant (reference is in a corner zone — e.g., above-left).
+  // Archi picks the edge that faces the dominant direction of the reference.
+  const cx = el.x + el.w / 2, cy = el.y + el.h / 2;
+  const adx = Math.abs(ref.x - cx);
+  const ady = Math.abs(ref.y - cy);
+
+  // Normalize by element dimensions so aspect ratio doesn't bias the choice
+  const normDx = adx / (el.w / 2);
+  const normDy = ady / (el.h / 2);
+
+  if (normDy >= normDx) {
+    // More vertical — exit top or bottom, x at element center
+    if (refAbove) return { x: cx, y: top, side: 'tc' };
+    return { x: cx, y: bottom, side: 'bc' };
   } else {
-    // Dominant horizontal — exit left or right
-    const exitX = ref.x < cx ? left : right;
-    return { x: exitX, y: Math.max(top, Math.min(bottom, ref.y)), side: ref.x < cx ? 'ml' : 'mr' };
+    // More horizontal — exit left or right, y at element center
+    if (refLeft) return { x: left, y: cy, side: 'ml' };
+    return { x: right, y: cy, side: 'mr' };
   }
 }
 
 /**
  * Snap an arbitrary point to the nearest point on an element's boundary.
+ * Used for manually placed anchor points.
  */
 function snapToEdge(el: ModelElement, p: Point): Anchor {
-  const cx = el.x + el.w / 2, cy = el.y + el.h / 2;
-  // Candidates: project onto each of the 4 edges, pick closest
   const candidates: { x: number; y: number; side: string; d: number }[] = [];
-  // Top edge
   const tx = Math.max(el.x, Math.min(el.x + el.w, p.x));
   candidates.push({ x: tx, y: el.y, side: 'tc', d: Math.hypot(p.x - tx, p.y - el.y) });
-  // Bottom edge
   const bx = Math.max(el.x, Math.min(el.x + el.w, p.x));
   candidates.push({ x: bx, y: el.y + el.h, side: 'bc', d: Math.hypot(p.x - bx, p.y - (el.y + el.h)) });
-  // Left edge
   const ly = Math.max(el.y, Math.min(el.y + el.h, p.y));
   candidates.push({ x: el.x, y: ly, side: 'ml', d: Math.hypot(p.x - el.x, p.y - ly) });
-  // Right edge
   const ry = Math.max(el.y, Math.min(el.y + el.h, p.y));
   candidates.push({ x: el.x + el.w, y: ry, side: 'mr', d: Math.hypot(p.x - (el.x + el.w), p.y - ry) });
-
   candidates.sort((a, b) => a.d - b.d);
   return { x: candidates[0].x, y: candidates[0].y, side: candidates[0].side };
-}
-
-/**
- * Generate simple orthogonal (Manhattan) routing between two elements.
- * Produces 1–2 intermediate waypoints so all segments are horizontal or vertical.
- */
-function manhattanRoute(src: ModelElement, tgt: ModelElement): RelPath {
-  const sc = { x: src.x + src.w / 2, y: src.y + src.h / 2 };
-  const tc = { x: tgt.x + tgt.w / 2, y: tgt.y + tgt.h / 2 };
-  const gap = 12; // minimum gap from element edges
-
-  // Determine if elements overlap on each axis
-  const overlapX = src.x < tgt.x + tgt.w && tgt.x < src.x + src.w;
-  const overlapY = src.y < tgt.y + tgt.h && tgt.y < src.y + src.h;
-
-  // If one is clearly above/below the other (no horizontal overlap or dominant vertical)
-  if (!overlapX || Math.abs(tc.y - sc.y) > Math.abs(tc.x - sc.x)) {
-    // Route: source bottom/top → horizontal midpoint → target top/bottom
-    const goDown = tc.y > sc.y;
-    const exitY = goDown ? src.y + src.h : src.y;
-    const enterY = goDown ? tgt.y : tgt.y + tgt.h;
-    const midY = (exitY + enterY) / 2;
-
-    const sA: Anchor = { x: sc.x, y: exitY, side: goDown ? 'bc' : 'tc' };
-    const tA: Anchor = { x: tc.x, y: enterY, side: goDown ? 'tc' : 'bc' };
-
-    if (Math.abs(sc.x - tc.x) < 2) {
-      // Vertically aligned — straight vertical line
-      return { waypoints: [], start: sA, end: tA };
-    }
-
-    return {
-      waypoints: [{ x: sc.x, y: midY }, { x: tc.x, y: midY }],
-      start: sA, end: tA,
-    };
-  }
-
-  // Elements are side by side (no vertical overlap or dominant horizontal)
-  const goRight = tc.x > sc.x;
-  const exitX = goRight ? src.x + src.w : src.x;
-  const enterX = goRight ? tgt.x : tgt.x + tgt.w;
-  const midX = (exitX + enterX) / 2;
-
-  const sA: Anchor = { x: exitX, y: sc.y, side: goRight ? 'mr' : 'ml' };
-  const tA: Anchor = { x: enterX, y: tc.y, side: goRight ? 'ml' : 'mr' };
-
-  if (Math.abs(sc.y - tc.y) < 2) {
-    // Horizontally aligned — straight horizontal line
-    return { waypoints: [], start: sA, end: tA };
-  }
-
-  return {
-    waypoints: [{ x: midX, y: sc.y }, { x: midX, y: tc.y }],
-    start: sA, end: tA,
-  };
 }
 
 export function getRelPoints(rel: ModelRelationship, elements: ModelElement[], elementMap?: Map<string, ModelElement>): RelPath | null {
@@ -253,33 +162,38 @@ export function getRelPoints(rel: ModelRelationship, elements: ModelElement[], e
 
   const waypoints = (rel.waypoints || []).map(wp => ({ x: wp.x, y: wp.y }));
 
-  // No explicit waypoints and no manual anchors — use Manhattan routing
-  if (waypoints.length === 0 && !rel.sourceAnchor && !rel.targetAnchor) {
-    return manhattanRoute(src, tgt);
+  // Compute reference points for anchors.
+  // Archi: when the reference is the remote element center and the elements overlap,
+  // use the midpoint of the overlapping region instead.
+  function remoteRef(el: ModelElement, remote: ModelElement): Point {
+    const rc = { x: remote.x + remote.w / 2, y: remote.y + remote.h / 2 };
+    const oL = Math.max(el.x, remote.x), oR = Math.min(el.x + el.w, remote.x + remote.w);
+    const oT = Math.max(el.y, remote.y), oB = Math.min(el.y + el.h, remote.y + remote.h);
+    if (oL < oR && oT < oB) return { x: (oL + oR) / 2, y: (oT + oB) / 2 };
+    return rc;
   }
 
-  let sA: Anchor, tA: Anchor;
-
+  // Source anchor
+  let sA: Anchor;
   if (rel.sourceAnchor) {
     sA = snapToEdge(src, rel.sourceAnchor);
-  } else if (waypoints.length > 0) {
-    // Orthogonal anchor: exit perpendicular to element edge, aligned with first waypoint
-    sA = orthogonalAnchor(src, waypoints[0]);
   } else {
-    const tc = { x: tgt.x + tgt.w / 2, y: tgt.y + tgt.h / 2 };
-    sA = orthogonalAnchor(src, tc);
+    const ref = waypoints.length > 0 ? waypoints[0] : remoteRef(src, tgt);
+    sA = orthogonalAnchor(src, ref);
   }
 
+  // Target anchor
+  let tA: Anchor;
   if (rel.targetAnchor) {
     tA = snapToEdge(tgt, rel.targetAnchor);
-  } else if (waypoints.length > 0) {
-    // Orthogonal anchor: enter perpendicular to element edge, aligned with last waypoint
-    tA = orthogonalAnchor(tgt, waypoints[waypoints.length - 1]);
   } else {
-    const sc = { x: src.x + src.w / 2, y: src.y + src.h / 2 };
-    tA = orthogonalAnchor(tgt, sc);
+    const ref = waypoints.length > 0 ? waypoints[waypoints.length - 1] : remoteRef(tgt, src);
+    tA = orthogonalAnchor(tgt, ref);
   }
 
+  // No additional routing — Archi draws straight segments through
+  // anchor → waypoints → anchor. The orthogonal look comes from
+  // the anchor placement, not from a separate router.
   return { start: sA, end: tA, waypoints };
 }
 

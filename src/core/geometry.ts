@@ -105,6 +105,69 @@ function rectEdgeIntersect(
 }
 
 /**
+ * Orthogonal anchor: exit perpendicular to the nearest element edge, aligned
+ * with the reference point. This matches Archi's OrthogonalAnchor behavior
+ * where connections always leave elements at right angles.
+ */
+function orthogonalAnchor(el: ModelElement, ref: Point): Anchor {
+  const cx = el.x + el.w / 2, cy = el.y + el.h / 2;
+  const left = el.x, right = el.x + el.w, top = el.y, bottom = el.y + el.h;
+
+  // Determine which edge to exit from based on where the reference point is
+  // relative to the element
+  const dLeft = ref.x - left;
+  const dRight = right - ref.x;
+  const dTop = ref.y - top;
+  const dBottom = bottom - ref.y;
+
+  // If the reference point is inside the element, pick the nearest edge
+  const isInside = ref.x >= left && ref.x <= right && ref.y >= top && ref.y <= bottom;
+
+  if (isInside) {
+    const minDist = Math.min(dLeft, dRight, dTop, dBottom);
+    if (minDist === dTop) return { x: Math.max(left, Math.min(right, ref.x)), y: top, side: 'tc' };
+    if (minDist === dBottom) return { x: Math.max(left, Math.min(right, ref.x)), y: bottom, side: 'bc' };
+    if (minDist === dLeft) return { x: left, y: Math.max(top, Math.min(bottom, ref.y)), side: 'ml' };
+    return { x: right, y: Math.max(top, Math.min(bottom, ref.y)), side: 'mr' };
+  }
+
+  // Reference point is outside — determine which edge faces it
+  const refAbove = ref.y < top;
+  const refBelow = ref.y > bottom;
+  const refLeft = ref.x < left;
+  const refRight = ref.x > right;
+
+  // Corner cases: pick the edge that's more "faced" by the reference
+  if (refAbove && !refLeft && !refRight) {
+    return { x: Math.max(left, Math.min(right, ref.x)), y: top, side: 'tc' };
+  }
+  if (refBelow && !refLeft && !refRight) {
+    return { x: Math.max(left, Math.min(right, ref.x)), y: bottom, side: 'bc' };
+  }
+  if (refLeft && !refAbove && !refBelow) {
+    return { x: left, y: Math.max(top, Math.min(bottom, ref.y)), side: 'ml' };
+  }
+  if (refRight && !refAbove && !refBelow) {
+    return { x: right, y: Math.max(top, Math.min(bottom, ref.y)), side: 'mr' };
+  }
+
+  // Diagonal quadrant: pick the edge that makes the path more orthogonal
+  // Use the dominant direction (which axis has more distance)
+  const absDx = Math.abs(ref.x - cx);
+  const absDy = Math.abs(ref.y - cy);
+
+  if (absDy >= absDx) {
+    // Dominant vertical — exit top or bottom
+    const exitY = ref.y < cy ? top : bottom;
+    return { x: Math.max(left, Math.min(right, ref.x)), y: exitY, side: ref.y < cy ? 'tc' : 'bc' };
+  } else {
+    // Dominant horizontal — exit left or right
+    const exitX = ref.x < cx ? left : right;
+    return { x: exitX, y: Math.max(top, Math.min(bottom, ref.y)), side: ref.x < cx ? 'ml' : 'mr' };
+  }
+}
+
+/**
  * Snap an arbitrary point to the nearest point on an element's boundary.
  */
 function snapToEdge(el: ModelElement, p: Point): Anchor {
@@ -183,39 +246,14 @@ function manhattanRoute(src: ModelElement, tgt: ModelElement): RelPath {
   };
 }
 
-/**
- * Snap a polyline's segments to be orthogonal where they're nearly aligned.
- * If consecutive points have dx or dy within threshold, snap to exact alignment.
- */
-function snapToOrthogonal(points: Point[], threshold: number = 8): Point[] {
-  if (points.length < 2) return points;
-  const result = points.map(p => ({ ...p }));
-  for (let i = 0; i < result.length - 1; i++) {
-    const a = result[i], b = result[i + 1];
-    const dx = Math.abs(b.x - a.x), dy = Math.abs(b.y - a.y);
-    if (dx < threshold && dy > threshold) {
-      // Nearly vertical — snap x to average
-      const avgX = (a.x + b.x) / 2;
-      a.x = avgX; b.x = avgX;
-    } else if (dy < threshold && dx > threshold) {
-      // Nearly horizontal — snap y to average
-      const avgY = (a.y + b.y) / 2;
-      a.y = avgY; b.y = avgY;
-    }
-  }
-  return result;
-}
-
 export function getRelPoints(rel: ModelRelationship, elements: ModelElement[], elementMap?: Map<string, ModelElement>): RelPath | null {
   const src = elementMap ? elementMap.get(rel.sourceId) : elements.find(e => e.id === rel.sourceId);
   const tgt = elementMap ? elementMap.get(rel.targetId) : elements.find(e => e.id === rel.targetId);
   if (!src || !tgt) return null;
 
-  const sc = { x: src.x + src.w / 2, y: src.y + src.h / 2 };
-  const tc = { x: tgt.x + tgt.w / 2, y: tgt.y + tgt.h / 2 };
   const waypoints = (rel.waypoints || []).map(wp => ({ x: wp.x, y: wp.y }));
 
-  // No explicit waypoints and no manual anchors — use orthogonal routing
+  // No explicit waypoints and no manual anchors — use Manhattan routing
   if (waypoints.length === 0 && !rel.sourceAnchor && !rel.targetAnchor) {
     return manhattanRoute(src, tgt);
   }
@@ -224,28 +262,22 @@ export function getRelPoints(rel: ModelRelationship, elements: ModelElement[], e
 
   if (rel.sourceAnchor) {
     sA = snapToEdge(src, rel.sourceAnchor);
+  } else if (waypoints.length > 0) {
+    // Orthogonal anchor: exit perpendicular to element edge, aligned with first waypoint
+    sA = orthogonalAnchor(src, waypoints[0]);
   } else {
-    const srcTarget = waypoints.length > 0 ? waypoints[0] : tc;
-    sA = rectEdgeIntersect(src, srcTarget);
+    const tc = { x: tgt.x + tgt.w / 2, y: tgt.y + tgt.h / 2 };
+    sA = orthogonalAnchor(src, tc);
   }
 
   if (rel.targetAnchor) {
     tA = snapToEdge(tgt, rel.targetAnchor);
+  } else if (waypoints.length > 0) {
+    // Orthogonal anchor: enter perpendicular to element edge, aligned with last waypoint
+    tA = orthogonalAnchor(tgt, waypoints[waypoints.length - 1]);
   } else {
-    const tgtTarget = waypoints.length > 0 ? waypoints[waypoints.length - 1] : sc;
-    tA = rectEdgeIntersect(tgt, tgtTarget);
-  }
-
-  // Snap the full path (start + waypoints + end) to orthogonal segments,
-  // then extract the snapped waypoints back out
-  if (waypoints.length > 0) {
-    const fullPath = [{ x: sA.x, y: sA.y }, ...waypoints, { x: tA.x, y: tA.y }];
-    const snapped = snapToOrthogonal(fullPath);
-    // Update start/end from snapped path
-    sA = { x: snapped[0].x, y: snapped[0].y, side: sA.side };
-    tA = { x: snapped[snapped.length - 1].x, y: snapped[snapped.length - 1].y, side: tA.side };
-    const snappedWaypoints = snapped.slice(1, -1);
-    return { start: sA, end: tA, waypoints: snappedWaypoints };
+    const sc = { x: src.x + src.w / 2, y: src.y + src.h / 2 };
+    tA = orthogonalAnchor(tgt, sc);
   }
 
   return { start: sA, end: tA, waypoints };

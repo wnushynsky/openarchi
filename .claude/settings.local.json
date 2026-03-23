@@ -8,7 +8,8 @@
       "Bash(file /home/wnu/Repos/openarchi/*.archimate)",
       "Bash(node:*)",
       "WebFetch(domain:raw.githubusercontent.com)",
-      "WebFetch(domain:api.github.com)"
+      "WebFetch(domain:api.github.com)",
+      "Bash(gh api:*)"
     ]
   }
 }

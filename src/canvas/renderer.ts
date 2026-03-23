@@ -25,6 +25,81 @@ export function rrect(ctx: CanvasRenderingContext2D, x: number, y: number, w: nu
 }
 
 // ============================================================
+// Rounded Polyline — smooth arcs at bendpoints (matches Archi)
+// ============================================================
+
+const MAX_CURVE_RADIUS = 14;
+const CURVE_SEGMENTS = 6;
+
+/**
+ * Draw a polyline with smooth arcs at each interior point.
+ * Port of Archi's RoundedPolylineConnection.outlineShape().
+ * At each bendpoint, the sharp corner is replaced by an arc
+ * with radius up to MAX_CURVE_RADIUS (capped at half the shorter segment).
+ */
+function drawRoundedPolyline(ctx: CanvasRenderingContext2D, pts: { x: number; y: number }[]): void {
+  if (pts.length < 2) return;
+  ctx.beginPath();
+
+  if (pts.length === 2) {
+    ctx.moveTo(pts[0].x, pts[0].y);
+    ctx.lineTo(pts[1].x, pts[1].y);
+    ctx.stroke();
+    return;
+  }
+
+  ctx.moveTo(pts[0].x, pts[0].y);
+
+  for (let i = 1; i < pts.length - 1; i++) {
+    const prev = pts[i - 1];
+    const cur = pts[i];
+    const next = pts[i + 1];
+
+    // Lengths of incoming and outgoing segments
+    const dIn = Math.hypot(cur.x - prev.x, cur.y - prev.y);
+    const dOut = Math.hypot(next.x - cur.x, next.y - cur.y);
+
+    if (dIn < 1 || dOut < 1) {
+      // Degenerate segment — just line to the point
+      ctx.lineTo(cur.x, cur.y);
+      continue;
+    }
+
+    // Arc radius: min of MAX_CURVE_RADIUS and half the shorter segment
+    const r = Math.min(MAX_CURVE_RADIUS, dIn / 2, dOut / 2);
+
+    // Unit vectors for incoming and outgoing directions
+    const inDx = (cur.x - prev.x) / dIn;
+    const inDy = (cur.y - prev.y) / dIn;
+    const outDx = (next.x - cur.x) / dOut;
+    const outDy = (next.y - cur.y) / dOut;
+
+    // Points where the arc starts and ends (offset from the corner by radius)
+    const arcStartX = cur.x - inDx * r;
+    const arcStartY = cur.y - inDy * r;
+    const arcEndX = cur.x + outDx * r;
+    const arcEndY = cur.y + outDy * r;
+
+    // Draw line to arc start
+    ctx.lineTo(arcStartX, arcStartY);
+
+    // Approximate the arc with intermediate points
+    for (let s = 1; s <= CURVE_SEGMENTS; s++) {
+      const t = s / CURVE_SEGMENTS;
+      // Quadratic bezier-like interpolation through the corner
+      const oneMinusT = 1 - t;
+      const px = oneMinusT * oneMinusT * arcStartX + 2 * oneMinusT * t * cur.x + t * t * arcEndX;
+      const py = oneMinusT * oneMinusT * arcStartY + 2 * oneMinusT * t * cur.y + t * t * arcEndY;
+      ctx.lineTo(px, py);
+    }
+  }
+
+  // Final segment to last point
+  ctx.lineTo(pts[pts.length - 1].x, pts[pts.length - 1].y);
+  ctx.stroke();
+}
+
+// ============================================================
 // Grid
 // ============================================================
 
@@ -401,10 +476,7 @@ export function drawRelationship(ctx: CanvasRenderingContext2D, rel: ModelRelati
   if (otherSegments && otherSegments.length > 0) {
     drawPathWithHops(ctx, allPts, otherSegments);
   } else {
-    ctx.beginPath();
-    ctx.moveTo(allPts[0].x, allPts[0].y);
-    for (let i = 1; i < allPts.length; i++) ctx.lineTo(allPts[i].x, allPts[i].y);
-    ctx.stroke();
+    drawRoundedPolyline(ctx, allPts);
   }
   ctx.setLineDash([]);
 

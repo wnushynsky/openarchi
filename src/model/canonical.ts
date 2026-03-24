@@ -63,6 +63,8 @@ export interface CanonicalViewConnection {
   labelPosition: number;
   /** Source diagram style metadata (preserved for fidelity, optional) */
   style?: DiagramStyle;
+  /** Raw relative bendpoints from source format (startX/Y offsets from source center, endX/Y from target center) */
+  relativeBendpoints?: { startX: number; startY: number; endX: number; endY: number }[];
 }
 
 export interface CanonicalModelDocument {

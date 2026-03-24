@@ -7,15 +7,15 @@ import { CanvasIcon } from './CanvasIcon';
 const glassPanel: React.CSSProperties = {
   background: 'var(--glass-strong, rgba(255,255,255,0.92))',
   backdropFilter: 'var(--glass-blur, blur(20px) saturate(1.8))',
-  WebkitBackdropFilter: 'var(--glass-blur, blur(20px) saturate(1.8))' as string,
+  WebkitBackdropFilter: 'var(--glass-blur, blur(20px) saturate(1.8))',
   border: '1px solid var(--glass-border, rgba(255,255,255,0.55))',
 };
 
-const itemHover = (e: React.MouseEvent) => {
-  (e.currentTarget as HTMLElement).style.background = 'var(--surface-hover, rgba(0,0,0,0.035))';
+const itemHover = (e: React.MouseEvent<HTMLElement>) => {
+  e.currentTarget.style.background = 'var(--surface-hover, rgba(0,0,0,0.035))';
 };
-const itemUnhover = (e: React.MouseEvent) => {
-  (e.currentTarget as HTMLElement).style.background = 'transparent';
+const itemUnhover = (e: React.MouseEvent<HTMLElement>) => {
+  e.currentTarget.style.background = 'transparent';
 };
 
 // ============================================================
@@ -100,7 +100,8 @@ interface CtxMenuProps {
 
 function CtxMenuItemRow({ item, onClose }: { item: CtxMenuItem; onClose: () => void }) {
   const [subOpen, setSubOpen] = useState(false);
-  const hasChildren = item.children && item.children.length > 0;
+  const children = item.children ?? [];
+  const hasChildren = children.length > 0;
 
   if (item.separator) {
     return <div style={{ height: 1, background: 'var(--border, rgba(0,0,0,0.06))', margin: '3px 8px' }} />;
@@ -140,7 +141,7 @@ function CtxMenuItemRow({ item, onClose }: { item: CtxMenuItem; onClose: () => v
           minWidth: 200, maxHeight: 340, overflowY: 'auto',
           fontFamily: FONT,
         }}>
-          {item.children!.map((child, j) => (
+          {children.map((child, j) => (
             <CtxMenuItemRow key={j} item={child} onClose={onClose} />
           ))}
         </div>

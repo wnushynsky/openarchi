@@ -569,6 +569,11 @@ function resolvePendingViewConnections(ctx: ViewWalkContext): void {
       if (tgtNode) targetCenter = { x: tgtNode.x + tgtNode.width / 2, y: tgtNode.y + tgtNode.height / 2 };
     }
 
+    // Preserve raw relative bendpoints for dynamic resolution during drags
+    const relativeBendpoints = conn.rawBendpoints
+      .filter(bp => bp.startX !== undefined || bp.startY !== undefined || bp.endX !== undefined || bp.endY !== undefined)
+      .map(bp => ({ startX: bp.startX ?? 0, startY: bp.startY ?? 0, endX: bp.endX ?? 0, endY: bp.endY ?? 0 }));
+
     ctx.viewConnections.push({
       id: conn.id,
       viewId: conn.viewId,
@@ -576,6 +581,7 @@ function resolvePendingViewConnections(ctx: ViewWalkContext): void {
       waypoints: resolveBendpoints(conn.rawBendpoints, sourceCenter, targetCenter),
       labelPosition: conn.labelPosition,
       style: conn.style,
+      relativeBendpoints: relativeBendpoints.length > 0 ? relativeBendpoints : undefined,
     });
   }
 }
@@ -1055,7 +1061,6 @@ export function parseCoArchiFragments(xmlContents: string[], filePaths?: string[
 
   // Log skipped relationships (missing source/target) for diagnostics
   if (skippedRelCount > 0) {
-    console.warn('[OpenArchi] Skipped', skippedRelCount, 'relationships with missing source/target. Sample:', skippedRelSample);
     diagnostics.push({
       severity: 'warning',
       code: 'COARCHI_REL_MISSING_ENDPOINTS',
@@ -1068,18 +1073,6 @@ export function parseCoArchiFragments(xmlContents: string[], filePaths?: string[
   const viewNameById = new Map<string, string>();
   for (const dv of deferredViews) {
     viewNameById.set(dv.id, getName(dv.node) || dv.id);
-  }
-
-  // Log deferred views for debugging
-  if (deferredViews.length > 0) {
-    const sample = deferredViews.slice(0, 10).map(dv => ({
-      id: dv.id,
-      tag: localName(dv.node),
-      name: getName(dv.node),
-      type: getAttr(dv.node, ['xsi:type', 'type']),
-      path: dv.path,
-    }));
-    console.log('[OpenArchi] Deferred view candidates:', deferredViews.length, 'total. Sample:', sample);
   }
 
   for (const { node, id } of deferredViews) {
@@ -1115,7 +1108,6 @@ export function parseCoArchiFragments(xmlContents: string[], filePaths?: string[
     }
 
     // For each view, find views whose path is a direct child directory
-    const viewById = new Map(allViews.map(v => [v.id, v]));
     for (const parentView of allViews) {
       const parentPath = viewPathById.get(parentView.id);
       if (!parentPath) continue;
@@ -1165,40 +1157,6 @@ export function parseCoArchiFragments(xmlContents: string[], filePaths?: string[
       message: `${viewNodesWithoutElement.length} view nodes reference elements not in the model (synthetic diagram objects are expected).`,
     });
   }
-
-  // Build per-view element sets to check relationship coverage
-  const viewElementSets = new Map<string, Set<string>>();
-  for (const vn of allViewNodes) {
-    if (!viewElementSets.has(vn.viewId)) viewElementSets.set(vn.viewId, new Set());
-    viewElementSets.get(vn.viewId)!.add(vn.elementId);
-  }
-  const firstViewId = allViews[0]?.id;
-  const firstViewElSet = firstViewId ? viewElementSets.get(firstViewId) : undefined;
-  const relsInFirstView = firstViewElSet
-    ? allRelationships.filter(r => firstViewElSet.has(r.sourceId) && firstViewElSet.has(r.targetId)).length
-    : 0;
-
-  console.log('[OpenArchi] coArchi parse summary:', {
-    elements: allElements.length,
-    relationships: allRelationships.length,
-    views: allViews.length,
-    viewNodes: allViewNodes.length,
-    viewConnections: allViewConnections.length,
-    orphanedRelationships: orphanedRels.length,
-    deferredViewCount: deferredViews.length,
-    firstViewName: allViews[0]?.name,
-    firstViewElementCount: firstViewElSet?.size ?? 0,
-    relsFullyInFirstView: relsInFirstView,
-    elementIdsSample: Array.from(elementIds).slice(0, 5),
-    firstViewElementIdsSample: firstViewElSet ? Array.from(firstViewElSet).slice(0, 5) : [],
-    relEndpointsSample: allRelationships.slice(0, 5).map(r => ({
-      src: r.sourceId, tgt: r.targetId,
-      srcIsElement: elementIds.has(r.sourceId),
-      tgtIsElement: elementIds.has(r.targetId),
-      srcInFirstView: firstViewElSet?.has(r.sourceId) ?? false,
-      tgtInFirstView: firstViewElSet?.has(r.targetId) ?? false,
-    })),
-  });
 
   return finalizeCoArchiModel(allElements, allRelationships, allViews, allViewNodes, allViewConnections, diagnostics);
 }

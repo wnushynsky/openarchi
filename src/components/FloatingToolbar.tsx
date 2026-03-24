@@ -25,7 +25,7 @@ const LAYER_ORDER = ['strategy', 'business', 'application', 'technology', 'motiv
 const popoverGlass: React.CSSProperties = {
   background: 'var(--glass-strong, rgba(255,255,255,0.92))',
   backdropFilter: 'var(--glass-blur, blur(20px) saturate(1.8))',
-  WebkitBackdropFilter: 'var(--glass-blur, blur(20px) saturate(1.8))' as string,
+  WebkitBackdropFilter: 'var(--glass-blur, blur(20px) saturate(1.8))',
   border: '1px solid var(--glass-border, rgba(255,255,255,0.55))',
   boxShadow: 'var(--shadow-xl, 0 8px 40px rgba(0,0,0,0.10))',
 };
@@ -204,7 +204,8 @@ export function FloatingToolbar(props: FloatingToolbarProps) {
 
   useEffect(() => {
     const h = (e: MouseEvent) => {
-      if (ref.current && !ref.current.contains(e.target as Node)) {
+      if (!(e.target instanceof Node)) return;
+      if (ref.current && !ref.current.contains(e.target)) {
         setPickerLayer(null);
         setShowMenu(false);
       }
@@ -228,11 +229,11 @@ export function FloatingToolbar(props: FloatingToolbarProps) {
     opacity: disabled ? 0.4 : 1,
   });
 
-  const hover = (e: React.MouseEvent, active?: boolean) => {
-    if (!active) (e.currentTarget as HTMLElement).style.background = 'var(--surface-hover, rgba(0,0,0,0.035))';
+  const hover = (e: React.MouseEvent<HTMLButtonElement>, active?: boolean) => {
+    if (!active) e.currentTarget.style.background = 'var(--surface-hover, rgba(0,0,0,0.035))';
   };
-  const unhover = (e: React.MouseEvent, active?: boolean) => {
-    if (!active) (e.currentTarget as HTMLElement).style.background = 'transparent';
+  const unhover = (e: React.MouseEvent<HTMLButtonElement>, active?: boolean) => {
+    if (!active) e.currentTarget.style.background = 'transparent';
   };
 
   const div = <div style={{ width: 1, height: 20, background: 'var(--border, rgba(0,0,0,0.06))', margin: '0 3px', flexShrink: 0 }} />;
@@ -246,7 +247,7 @@ export function FloatingToolbar(props: FloatingToolbarProps) {
         display: 'flex', alignItems: 'center', gap: 4,
         background: 'var(--glass, rgba(255,255,255,0.82))',
         backdropFilter: 'var(--glass-blur, blur(20px) saturate(1.8))',
-        WebkitBackdropFilter: 'var(--glass-blur, blur(20px) saturate(1.8))' as string,
+        WebkitBackdropFilter: 'var(--glass-blur, blur(20px) saturate(1.8))',
         border: '1px solid var(--glass-border, rgba(255,255,255,0.55))',
         borderRadius: 14,
         boxShadow: 'var(--shadow-lg, 0 4px 24px rgba(0,0,0,0.08))',
@@ -271,6 +272,7 @@ export function FloatingToolbar(props: FloatingToolbarProps) {
           const L = LAYERS[k];
           const fill = L.fill === 'transparent' ? '#dddde0' : L.fill;
           const isOpen = pickerLayer === k;
+          const isActiveLayer = activeLayer === k;
           return (
             <button key={k}
               onClick={() => { if (!isViewMode) { setPickerLayer(prev => prev === k ? null : k); setShowMenu(false); } }}
@@ -278,17 +280,20 @@ export function FloatingToolbar(props: FloatingToolbarProps) {
               style={{
                 width: 24, height: 24, borderRadius: '50%', padding: 0, flexShrink: 0,
                 background: `radial-gradient(circle at 40% 35%, ${fill}, ${L.stroke}40)`,
-                border: isOpen ? `2px solid ${L.stroke}` : `1.5px solid ${L.stroke}60`,
+                border: isOpen || isActiveLayer ? `2px solid ${L.stroke}` : `1.5px solid ${L.stroke}60`,
                 cursor: isViewMode ? 'default' : 'pointer',
                 opacity: isViewMode ? 0.35 : 1,
                 transition: 'transform var(--transition-fast, 0.12s ease), border-color var(--transition-fast, 0.12s ease), box-shadow var(--transition-fast, 0.12s ease)',
                 boxSizing: 'border-box',
-                boxShadow: isOpen
+                boxShadow: isOpen || isActiveLayer
                   ? `0 0 0 3px ${L.accent}20, inset 0 1px 2px rgba(255,255,255,0.4)`
                   : 'inset 0 1px 2px rgba(255,255,255,0.3)',
               }}
               onMouseEnter={e => { e.currentTarget.style.transform = 'scale(1.15)'; e.currentTarget.style.borderColor = L.stroke; }}
-              onMouseLeave={e => { e.currentTarget.style.transform = 'scale(1)'; if (!isOpen) e.currentTarget.style.borderColor = `${L.stroke}60`; }}
+              onMouseLeave={e => {
+                e.currentTarget.style.transform = 'scale(1)';
+                if (!isOpen && !isActiveLayer) e.currentTarget.style.borderColor = `${L.stroke}60`;
+              }}
             />
           );
         })}

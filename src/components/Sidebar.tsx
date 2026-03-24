@@ -1,5 +1,5 @@
 import { useState, useMemo, useCallback, useRef, useEffect } from 'react';
-import type { ModelView, ModelElement, ModelRelationship, SelectionType } from '../types';
+import type { ModelView, ModelElement, ModelRelationship } from '../types';
 import { LAYERS, ELEMENT_TYPES, RELATIONSHIP_TYPES, FONT } from '../core';
 import { CanvasIcon } from './CanvasIcon';
 

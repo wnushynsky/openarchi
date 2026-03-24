@@ -9,7 +9,9 @@
       "Bash(node:*)",
       "WebFetch(domain:raw.githubusercontent.com)",
       "WebFetch(domain:api.github.com)",
-      "Bash(gh api:*)"
+      "Bash(gh api:*)",
+      "Bash(curl:*)",
+      "Bash(grep -r \"TODO\\\\|FIXME\\\\|BUG\\\\|HACK\" /home/wnu/Repos/openarchi/src --include=*.ts --include=*.tsx)"
     ]
   }
 }

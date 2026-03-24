@@ -31,6 +31,16 @@ export interface DirectoryState {
   files: OpenFileEntry[];
 }
 
+type FileWithRelativePath = File & {
+  webkitRelativePath?: string;
+};
+
+function getRelativePath(file: File): string {
+  const fileWithRelativePath: FileWithRelativePath = file;
+  const relativePath = fileWithRelativePath.webkitRelativePath;
+  return relativePath && relativePath.length > 0 ? relativePath : file.name;
+}
+
 // ---------------------------------------------------------------------------
 // File System Access API path (Chrome / Edge)
 // ---------------------------------------------------------------------------
@@ -59,10 +69,9 @@ async function scanDirectoryNative(
 ): Promise<void> {
   for await (const entry of handle.values()) {
     if (entry.kind === 'directory') {
-      const subDir = entry as FileSystemDirectoryHandle;
-      await scanDirectoryNative(subDir, `${pathPrefix}${subDir.name}/`, out);
+      await scanDirectoryNative(entry, `${pathPrefix}${entry.name}/`, out);
     } else if (entry.kind === 'file') {
-      const fileHandle = entry as FileSystemFileHandle;
+      const fileHandle = entry;
       if (!isValidFile(fileHandle.name)) continue;
       const relativePath = `${pathPrefix}${fileHandle.name}`;
       out.push({
@@ -105,7 +114,7 @@ export function openDirectoryFallback(): Promise<DirectoryState> {
       }
 
       // Derive directory name from the common root of webkitRelativePath
-      const firstPath = (fileList[0] as any).webkitRelativePath as string || fileList[0].name;
+      const firstPath = getRelativePath(fileList[0]);
       const directoryName = firstPath.split('/')[0] || 'directory';
 
       const files: OpenFileEntry[] = [];
@@ -114,7 +123,7 @@ export function openDirectoryFallback(): Promise<DirectoryState> {
         const file = fileList[i];
         if (!isValidFile(file.name)) continue;
 
-        const fullRelativePath = (file as any).webkitRelativePath as string || file.name;
+        const fullRelativePath = getRelativePath(file);
         // Strip the root directory name to get paths relative to the opened dir
         const parts = fullRelativePath.split('/');
         const relativePath = parts.length > 1 ? parts.slice(1).join('/') : parts[0];

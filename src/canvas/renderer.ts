@@ -161,7 +161,7 @@ function getLayerStyle(type: string): LayerDef {
   return LAYERS[ELEMENT_TYPES[type]?.layer] || LAYERS.composite;
 }
 
-export function drawElement(ctx: CanvasRenderingContext2D, el: ModelElement, isSel: boolean, isHov: boolean, showAnch: boolean, hasChildren: boolean = false) {
+export function drawElement(ctx: CanvasRenderingContext2D, el: ModelElement, isSel: boolean, showAnch: boolean, hasChildren: boolean = false) {
   const isNote = ELEMENT_TYPES[el.type]?.isNote;
   const isViewReference = el.type === 'viewReference';
   const isJunction = el.type === 'andJunction' || el.type === 'orJunction';
@@ -182,10 +182,10 @@ export function drawElement(ctx: CanvasRenderingContext2D, el: ModelElement, isS
   rrect(ctx, x, y, w, h, r);
 
   if (isNote) {
-    ctx.fillStyle = L.fill; ctx.fill();
+    ctx.fillStyle = el.style?.fillColor || L.fill; ctx.fill();
     ctx.shadowColor = 'transparent';
     ctx.lineWidth = isSel ? 2 : 1;
-    ctx.strokeStyle = isSel ? '#4a5568' : L.stroke;
+    ctx.strokeStyle = isSel ? '#4a5568' : (el.style?.lineColor || L.stroke);
     ctx.stroke();
 
     // Folded corner icon (top-right)
@@ -198,7 +198,7 @@ export function drawElement(ctx: CanvasRenderingContext2D, el: ModelElement, isS
     ctx.fillStyle = '#D8D8DC'; ctx.fill();
     ctx.strokeStyle = L.stroke; ctx.lineWidth = 0.6; ctx.stroke();
 
-    ctx.fillStyle = L.text;
+    ctx.fillStyle = el.style?.fontColor || L.text;
     ctx.font = `400 11px ${FONT}`;
     ctx.textAlign = 'left'; ctx.textBaseline = 'top';
     const pad = 8, mw = w - pad * 2;
@@ -228,10 +228,10 @@ export function drawElement(ctx: CanvasRenderingContext2D, el: ModelElement, isS
       ctx.fill();
     }
   } else if (isComposite) {
-    ctx.fillStyle = 'rgba(255,255,255,0.02)'; ctx.fill();
+    ctx.fillStyle = el.style?.fillColor || 'rgba(255,255,255,0.02)'; ctx.fill();
     ctx.shadowColor = 'transparent';
     ctx.setLineDash([5, 4]); ctx.lineWidth = 1.2;
-    ctx.strokeStyle = isSel ? '#4a5568' : '#b0b0b8';
+    ctx.strokeStyle = isSel ? '#4a5568' : (el.style?.lineColor || '#b0b0b8');
     ctx.stroke(); ctx.setLineDash([]);
 
     ctx.font = `400 11px ${FONT}`;
@@ -247,10 +247,10 @@ export function drawElement(ctx: CanvasRenderingContext2D, el: ModelElement, isS
       ctx.restore();
     }
   } else {
-    ctx.fillStyle = L.fill; ctx.fill();
+    ctx.fillStyle = el.style?.fillColor || L.fill; ctx.fill();
     ctx.shadowColor = 'transparent';
     ctx.lineWidth = isSel ? 2.2 : 1.2;
-    ctx.strokeStyle = isSel ? '#4a5568' : L.stroke;
+    ctx.strokeStyle = isSel ? '#4a5568' : (el.style?.lineColor || L.stroke);
     ctx.stroke();
 
     if (isViewReference) {
@@ -277,7 +277,7 @@ export function drawElement(ctx: CanvasRenderingContext2D, el: ModelElement, isS
     }
 
     // Label — move to top-left when children overlap this element
-    ctx.fillStyle = L.text;
+    ctx.fillStyle = el.style?.fontColor || L.text;
     ctx.font = `400 11px ${FONT}`;
     const mw = w - 24;
     const displayName = isViewReference ? `View: ${el.name || 'Untitled'}` : (el.name || '');
@@ -331,21 +331,17 @@ export function drawElement(ctx: CanvasRenderingContext2D, el: ModelElement, isS
     ctx.restore();
   }
 
-  // Anchors
+  // Anchors — 4 edge midpoints (Archi-style: any edge point is valid, these are visual indicators)
   if (showAnch && !isComposite && !isJunction) {
     const anchors = getAnchors(el);
-    anchors.forEach((a, i) => {
-      const isPrimary = i < 4;
-      const rad = isPrimary ? 5 : 3.5;
-      ctx.beginPath(); ctx.arc(a.x, a.y, rad, 0, Math.PI * 2);
+    for (const a of anchors) {
+      ctx.beginPath(); ctx.arc(a.x, a.y, 4, 0, Math.PI * 2);
       ctx.fillStyle = '#fff'; ctx.fill();
-      ctx.lineWidth = isPrimary ? 2 : 1.4;
+      ctx.lineWidth = 1.6;
       ctx.strokeStyle = '#4a5568'; ctx.stroke();
-      if (isPrimary) {
-        ctx.beginPath(); ctx.arc(a.x, a.y, 2, 0, Math.PI * 2);
-        ctx.fillStyle = '#4a5568'; ctx.fill();
-      }
-    });
+      ctx.beginPath(); ctx.arc(a.x, a.y, 1.5, 0, Math.PI * 2);
+      ctx.fillStyle = '#4a5568'; ctx.fill();
+    }
   }
 
   // Selection + resize handles
@@ -442,15 +438,28 @@ function drawPathWithHops(
     if (crossings.length === 0) {
       ctx.lineTo(seg.x2, seg.y2);
     } else {
-      const nx = -dy / segLen, ny = dx / segLen;
+      // Unit direction along the segment
+      const ux = dx / segLen, uy = dy / segLen;
       const hopT = HOP_RADIUS / segLen;
 
+      // Determine the arc sweep direction: always hop "above" (perpendicular to travel).
+      // The arc goes from the point before the crossing to the point after,
+      // curving away from the crossing. We use arcTo for a clean bump.
+      let prevT = 0;
       for (const t of crossings) {
-        const tBefore = Math.max(0, t - hopT);
+        const tBefore = Math.max(prevT, t - hopT);
+        const tAfter = Math.min(1, t + hopT);
+        // Draw line to just before the hop
         ctx.lineTo(seg.x1 + tBefore * dx, seg.y1 + tBefore * dy);
-        const cx = seg.x1 + t * dx, cy = seg.y1 + t * dy;
-        const startAngle = Math.atan2(-nx, -ny);
-        ctx.arc(cx, cy, HOP_RADIUS, startAngle, startAngle + Math.PI);
+        // Draw a small semicircular bump using quadratic bezier (cleaner than arc)
+        const bx = seg.x1 + t * dx, by = seg.y1 + t * dy;
+        // Control point is offset perpendicular to the segment
+        const perpX = -uy, perpY = ux; // perpendicular unit vector
+        const cpx = bx + perpX * HOP_RADIUS * 2;
+        const cpy = by + perpY * HOP_RADIUS * 2;
+        const endX = seg.x1 + tAfter * dx, endY = seg.y1 + tAfter * dy;
+        ctx.quadraticCurveTo(cpx, cpy, endX, endY);
+        prevT = tAfter;
       }
       ctx.lineTo(seg.x2, seg.y2);
     }
@@ -501,7 +510,7 @@ export function drawRelationship(ctx: CanvasRenderingContext2D, rel: ModelRelati
   ctx.save();
   ctx.strokeStyle = col; ctx.lineWidth = lw;
   ctx.lineJoin = 'round'; ctx.lineCap = 'round';
-  if (rd.dash) ctx.setLineDash([6, 4]);
+  if (rd.dash) ctx.setLineDash(rd.dashPattern || [6, 3]);
 
   const allPts = [start, ...waypoints, end];
   if (otherSegments && otherSegments.length > 0) {
@@ -511,52 +520,57 @@ export function drawRelationship(ctx: CanvasRenderingContext2D, rel: ModelRelati
   }
   ctx.setLineDash([]);
 
-  // Arrowheads — wider spread (0.5 rad ≈ 29°) for clear visual distinction
+  // Arrowheads — dimensions matched to Archi's PolygonDecoration/PolylineDecoration
   const last = allPts[allPts.length - 2] || start;
   const angle = Math.atan2(end.y - last.y, end.x - last.x);
-  const aL = 12;
-  const aSpread = 0.5;
 
   if (rd.head === 'filled_arrow') {
-    // Solid filled triangle — triggering, flow
+    // Solid filled triangle — triggering, flow (Archi: PolygonDecoration default scale)
+    const aL = 10, aW = 7;
+    const spread = Math.atan2(aW / 2, aL);
     ctx.beginPath(); ctx.moveTo(end.x, end.y);
-    ctx.lineTo(end.x - aL * Math.cos(angle - aSpread), end.y - aL * Math.sin(angle - aSpread));
-    ctx.lineTo(end.x - aL * Math.cos(angle + aSpread), end.y - aL * Math.sin(angle + aSpread));
+    ctx.lineTo(end.x - aL * Math.cos(angle - spread), end.y - aL * Math.sin(angle - spread));
+    ctx.lineTo(end.x - aL * Math.cos(angle + spread), end.y - aL * Math.sin(angle + spread));
     ctx.closePath(); ctx.fillStyle = col; ctx.fill();
   } else if (rd.head === 'open_arrow') {
-    // Open chevron — serving, access, influence
-    const oL = 11;
+    // Open chevron — serving, access, influence (Archi: PolylineDecoration — not filled)
+    const aL = 10, aW = 7;
+    const spread = Math.atan2(aW / 2, aL);
     ctx.beginPath();
-    ctx.moveTo(end.x - oL * Math.cos(angle - aSpread), end.y - oL * Math.sin(angle - aSpread));
+    ctx.moveTo(end.x - aL * Math.cos(angle - spread), end.y - aL * Math.sin(angle - spread));
     ctx.lineTo(end.x, end.y);
-    ctx.lineTo(end.x - oL * Math.cos(angle + aSpread), end.y - oL * Math.sin(angle + aSpread));
-    ctx.strokeStyle = col; ctx.lineWidth = isSel ? 2 : 1.4; ctx.stroke();
+    ctx.lineTo(end.x - aL * Math.cos(angle + spread), end.y - aL * Math.sin(angle + spread));
+    ctx.strokeStyle = col; ctx.lineWidth = isSel ? 1.8 : 1.2; ctx.stroke();
   } else if (rd.head === 'hollow_arrow') {
-    // Hollow triangle — realization, specialization
+    // Hollow triangle — realization, specialization (Archi: scale 10,7)
+    const aL = 10, aW = 7;
+    const spread = Math.atan2(aW / 2, aL);
     ctx.beginPath(); ctx.moveTo(end.x, end.y);
-    ctx.lineTo(end.x - aL * Math.cos(angle - aSpread), end.y - aL * Math.sin(angle - aSpread));
-    ctx.lineTo(end.x - aL * Math.cos(angle + aSpread), end.y - aL * Math.sin(angle + aSpread));
+    ctx.lineTo(end.x - aL * Math.cos(angle - spread), end.y - aL * Math.sin(angle - spread));
+    ctx.lineTo(end.x - aL * Math.cos(angle + spread), end.y - aL * Math.sin(angle + spread));
     ctx.closePath(); ctx.fillStyle = '#f5f6f8'; ctx.fill();
     ctx.strokeStyle = col; ctx.lineWidth = isSel ? 1.6 : 1.2; ctx.stroke();
   } else if (rd.head === 'diamond_filled' || rd.head === 'diamond') {
     // Diamond at source — composition (filled), aggregation (hollow)
+    // Archi: template (0,0),(-2,2),(-4,0),(-2,-2) scaled by (5,3) → 20×6 total
     const sA = Math.atan2(allPts[1].y - start.y, allPts[1].x - start.x);
-    const dW = 7; // half-width
-    const dLen = 12; // length along the line
-    const cx = start.x + dLen * 0.5 * Math.cos(sA);
-    const cy = start.y + dLen * 0.5 * Math.sin(sA);
+    const dLen = 10; // half of 20
+    const dW = 3;    // half of 6
+    const tip = { x: start.x, y: start.y };
+    const mid = { x: start.x + dLen * 0.5 * Math.cos(sA), y: start.y + dLen * 0.5 * Math.sin(sA) };
+    const tail = { x: start.x + dLen * Math.cos(sA), y: start.y + dLen * Math.sin(sA) };
     ctx.beginPath();
-    ctx.moveTo(start.x, start.y);
-    ctx.lineTo(cx + dW * Math.cos(sA - Math.PI / 2), cy + dW * Math.sin(sA - Math.PI / 2));
-    ctx.lineTo(start.x + dLen * Math.cos(sA), start.y + dLen * Math.sin(sA));
-    ctx.lineTo(cx + dW * Math.cos(sA + Math.PI / 2), cy + dW * Math.sin(sA + Math.PI / 2));
+    ctx.moveTo(tip.x, tip.y);
+    ctx.lineTo(mid.x + dW * Math.cos(sA - Math.PI / 2), mid.y + dW * Math.sin(sA - Math.PI / 2));
+    ctx.lineTo(tail.x, tail.y);
+    ctx.lineTo(mid.x + dW * Math.cos(sA + Math.PI / 2), mid.y + dW * Math.sin(sA + Math.PI / 2));
     ctx.closePath();
     ctx.fillStyle = rd.head === 'diamond_filled' ? col : '#f5f6f8'; ctx.fill();
-    ctx.strokeStyle = col; ctx.lineWidth = isSel ? 1.4 : 1.1; ctx.stroke();
+    ctx.strokeStyle = col; ctx.lineWidth = isSel ? 1.4 : 1; ctx.stroke();
   } else if (rd.head === 'filled_dot') {
-    // Filled circle at source — assignment
+    // Filled circle at source — assignment (Archi: BallEndpoint radius=3)
     const sA = Math.atan2(allPts[1].y - start.y, allPts[1].x - start.x);
-    const dotR = 5;
+    const dotR = 3;
     ctx.beginPath(); ctx.arc(start.x + (dotR + 1) * Math.cos(sA), start.y + (dotR + 1) * Math.sin(sA), dotR, 0, Math.PI * 2);
     ctx.fillStyle = col; ctx.fill();
   }

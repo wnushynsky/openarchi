@@ -8,7 +8,7 @@ import type {
   CanonicalViewNode,
 } from '../../model/canonical';
 import type { ModelDiagnostic } from '../../model/diagnostics';
-import type { ModelFormatAdapter, ParseResult, SerializeContext, SerializeResult } from '../adapter';
+import type { ModelFormatAdapter, ParseResult, SerializeResult } from '../adapter';
 
 const ELEMENT_TYPE_KEYS = new Set(Object.keys(ELEMENT_TYPES));
 const RELATIONSHIP_TYPE_KEYS = new Set(Object.keys(RELATIONSHIP_TYPES));
@@ -849,12 +849,20 @@ function serializeArchiMateExchangeXml(
     const viewNodesByView = new Map<string, CanonicalViewNode[]>();
     const viewConnectionsByView = new Map<string, CanonicalViewConnection[]>();
     for (const vn of model.viewNodes) {
-      if (!viewNodesByView.has(vn.viewId)) viewNodesByView.set(vn.viewId, []);
-      viewNodesByView.get(vn.viewId)!.push(vn);
+      let viewNodes = viewNodesByView.get(vn.viewId);
+      if (!viewNodes) {
+        viewNodes = [];
+        viewNodesByView.set(vn.viewId, viewNodes);
+      }
+      viewNodes.push(vn);
     }
     for (const vc of model.viewConnections) {
-      if (!viewConnectionsByView.has(vc.viewId)) viewConnectionsByView.set(vc.viewId, []);
-      viewConnectionsByView.get(vc.viewId)!.push(vc);
+      let viewConnections = viewConnectionsByView.get(vc.viewId);
+      if (!viewConnections) {
+        viewConnections = [];
+        viewConnectionsByView.set(vc.viewId, viewConnections);
+      }
+      viewConnections.push(vc);
     }
 
     // Build a lookup of relationship by id for connections

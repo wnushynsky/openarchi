@@ -1,5 +1,6 @@
 import type { OpenArchiModel } from '../types';
 import { AdapterRegistry } from '../io/adapter';
+import type { ModelFormatAdapter } from '../io/adapter';
 import { openArchiJsonAdapter } from '../io/adapters/openarchi-json';
 import { coArchiXmlAdapter, parseCoArchiFragments } from '../io/adapters/coarchi-xml';
 import { archiMateExchangeXmlAdapter } from '../io/adapters/archimate-exchange-xml';
@@ -27,11 +28,11 @@ export interface ModelExportResult {
   diagnostics: ModelDiagnostic[];
 }
 
-export function listModelFormats() {
+export function listModelFormats(): ModelFormatAdapter[] {
   return registry.list();
 }
 
-export function detectModelFormatByFileName(fileName: string) {
+export function detectModelFormatByFileName(fileName: string): ModelFormatAdapter | undefined {
   const lower = fileName.toLowerCase();
   if (lower.endsWith('.openarchi.json') || lower.endsWith('.json')) return registry.getById('openarchi-json');
   if (lower.endsWith('.coarchi.xml') || lower.endsWith('.coarchi')) return registry.getById('coarchi-xml');

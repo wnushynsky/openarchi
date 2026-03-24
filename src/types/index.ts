@@ -30,8 +30,16 @@ export interface ElementTypeDef {
 export interface RelationshipTypeDef {
   label: string;
   dash: boolean;
+  /** Dash pattern array for canvas setLineDash(). Only used when dash=true. */
+  dashPattern?: number[];
   head: 'diamond_filled' | 'diamond' | 'filled_dot' | 'hollow_arrow' | 'open_arrow' | 'filled_arrow' | 'none';
   desc: string;
+}
+
+export interface ElementStyle {
+  fillColor?: string;
+  lineColor?: string;
+  fontColor?: string;
 }
 
 export interface ModelElement {
@@ -45,11 +53,20 @@ export interface ModelElement {
   documentation: string;
   linkedViewId?: string;
   zIndex?: number;
+  style?: ElementStyle;
 }
 
 export interface Waypoint {
   x: number;
   y: number;
+}
+
+/** Archi-style relative bendpoint: offsets from source/target centers */
+export interface RelativeBendpoint {
+  startX: number;
+  startY: number;
+  endX: number;
+  endY: number;
 }
 
 export interface ModelRelationship {
@@ -64,6 +81,8 @@ export interface ModelRelationship {
   sourceAnchor?: Point;
   /** Manual anchor point on target element boundary (absolute coords, snapped to edge on render) */
   targetAnchor?: Point;
+  /** Archi-style relative bendpoints — resolved dynamically from source/target centers */
+  relativeBendpoints?: RelativeBendpoint[];
 }
 
 export interface ModelView {
@@ -120,6 +139,14 @@ export interface DragWPState {
 export interface DragEndpointState {
   relId: string;
   endpoint: 'source' | 'target';
+}
+
+export interface DragSegmentState {
+  relId: string;
+  segIdx: number;        // index of the segment being dragged (0 = start→wp0, etc.)
+  orientation: 'h' | 'v'; // whether dragging moves the segment vertically or horizontally
+  startWx: number;
+  startWy: number;
 }
 
 export interface DragLabelState {

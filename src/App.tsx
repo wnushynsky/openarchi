@@ -1,18 +1,18 @@
 import { useState, useRef, useCallback, useEffect, useMemo } from 'react';
 import type {
   ModelElement, ModelRelationship, ModelView,
-  Camera, DragState, PanState, DrawingRelState, DragWPState, DragEndpointState, DragLabelState,
-  RelPickerState, CtxMenuState, GridType, LeftPanel, SelectionType, ResizeState,
+  Camera, DragState, PanState, DrawingRelState, DragWPState, DragEndpointState, DragLabelState, DragSegmentState,
+  RelPickerState, CtxMenuState, CtxMenuItem, GridType, LeftPanel, SelectionType, ResizeState,
 } from './types';
 import type { CanonicalModelDocument } from './model/canonical';
 import {
   LAYERS, ELEMENT_TYPES, RELATIONSHIP_TYPES, FONT,
   snap, uid, GRID,
   nearestAnchor, getRelPoints, nearestTOnPath,
-  hitTestElement, hitTestAnchor, hitTestWaypoint, hitTestEndpoint, hitTestRelationship, hitTestLabel, hitTestPopout,
+  hitTestElement, hitTestAnchor, hitTestWaypoint, hitTestEndpoint, hitTestRelationship, hitTestLabel, hitTestPopout, getSegmentOrientation,
   hitTestResizeHandle, HANDLE_CURSORS,
   SAMPLE_ELEMENTS, SAMPLE_RELATIONSHIPS, SAMPLE_VIEWS,
-  snapToElements, snapResizeToElements, type SnapGuide,
+  snapToElements, type SnapGuide,
 } from './core';
 import { drawDotGrid, drawLineGrid, drawElement, drawRelationship, drawSnapGuides, getRelSegments, type RelSegments } from './canvas';
 import { RelPicker, CtxMenu, SearchPanel, ViewNav, PropertyPanel, Btn, CanvasIcon, FloatingToolbar } from './components';
@@ -29,6 +29,7 @@ import {
   type DirectoryState,
   type OpenFileEntry,
 } from './io/filesystem';
+import type { ModelDiagnostic } from './model/diagnostics';
 
 const getLayer = (type: string) => ELEMENT_TYPES[type]?.layer;
 const isNote = (type: string) => !!ELEMENT_TYPES[type]?.isNote;
@@ -41,11 +42,13 @@ interface ElementViewLayout {
   linkedViewId?: string;
   zIndex?: number;
   isParent?: boolean;
+  style?: import('./types').ElementStyle;
 }
 
 interface RelationshipViewLayout {
   waypoints: { x: number; y: number }[];
   labelPos: number;
+  relativeBendpoints?: import('./types').RelativeBendpoint[];
 }
 
 type ElementLayoutsByView = Record<string, Record<string, ElementViewLayout>>;
@@ -73,6 +76,7 @@ function buildLayoutsFromEditorModel(
         h: element.h,
         linkedViewId: element.linkedViewId,
         zIndex: element.zIndex,
+        style: element.style,
       };
     }
 
@@ -81,6 +85,7 @@ function buildLayoutsFromEditorModel(
       relationshipLayouts[view.id][relationship.id] = {
         waypoints: relationship.waypoints || [],
         labelPos: relationship.labelPos ?? 0.5,
+        relativeBendpoints: relationship.relativeBendpoints,
       };
     }
   }
@@ -114,6 +119,7 @@ function buildLayoutsFromCanonicalDocument(
       h: node.height,
       linkedViewId: node.linkedViewId,
       zIndex: node.nestingDepth ?? 0,
+      style: node.style ? { fillColor: node.style.fillColor, lineColor: node.style.lineColor, fontColor: node.style.fontColor } : undefined,
     };
   }
 
@@ -132,6 +138,7 @@ function buildLayoutsFromCanonicalDocument(
     relationshipLayouts[connection.viewId][connection.relationshipId] = {
       waypoints: connection.waypoints || [],
       labelPos: connection.labelPosition ?? 0.5,
+      relativeBendpoints: connection.relativeBendpoints,
     };
   }
 
@@ -162,6 +169,7 @@ export default function App() {
   const [dragWP, setDragWP] = useState<DragWPState | null>(null);
   const [dragEndpoint, setDragEndpoint] = useState<DragEndpointState | null>(null);
   const [dragLabel, setDragLabel] = useState<DragLabelState | null>(null);
+  const [dragSegment, setDragSegment] = useState<DragSegmentState | null>(null);
   const [resizing, setResizing] = useState<ResizeState | null>(null);
   const [relPicker, setRelPicker] = useState<RelPickerState | null>(null);
   const [ctxMenu, setCtxMenu] = useState<CtxMenuState | null>(null);
@@ -182,6 +190,24 @@ export default function App() {
   const [activeFileEntry, setActiveFileEntry] = useState<OpenFileEntry | null>(null);
   const [activeFormatId, setActiveFormatId] = useState<string | null>(null);
   const [isDirty, setIsDirty] = useState(false);
+
+  const showTransientDiagnostic = useCallback((message: string, timeoutMs: number = 8000) => {
+    setImportDiag(message);
+    setTimeout(() => {
+      setImportDiag(current => (current === message ? null : current));
+    }, timeoutMs);
+  }, []);
+
+  const summarizeDiagnostics = useCallback((scope: string, diagnostics: ModelDiagnostic[]) => {
+    if (diagnostics.length === 0) return;
+    const errors = diagnostics.filter(diagnostic => diagnostic.severity === 'error');
+    const warnings = diagnostics.filter(diagnostic => diagnostic.severity === 'warning');
+    const first = diagnostics[0];
+    const summary = `${scope}: ${first.message}`
+      + (errors.length > 0 ? ` | errors=${errors.length}` : '')
+      + (warnings.length > 0 ? ` | warnings=${warnings.length}` : '');
+    showTransientDiagnostic(summary);
+  }, [showTransientDiagnostic]);
 
   // Undo/Redo history — snapshots are pushed explicitly at interaction boundaries
   interface HistorySnapshot { elements: ModelElement[]; relationships: ModelRelationship[]; views: ModelView[] }
@@ -294,19 +320,22 @@ export default function App() {
 
         return true;
       });
-      if (relationships.length > 0 && visible.length === 0 && visibleElementIds.size > 0) {
-        const sample = relationships.slice(0, 3);
-        const elSample = Array.from(visibleElementIds).slice(0, 3);
-        const msg = `[Debug] ${relationships.length} relationships loaded but 0 match current view (${visibleElementIds.size} elements). `
-          + `Rel endpoints: ${sample.map(r => `${r.sourceId}→${r.targetId}`).join(', ')}. `
-          + `View element IDs: ${elSample.join(', ')}`;
-        console.warn('[OpenArchi]', msg);
-        setImportDiag(msg);
-      }
       return visible;
     },
     [relationships, visibleElementIds, elements],
   );
+
+  useEffect(() => {
+    if (relationships.length > 0 && visibleRelationships.length === 0 && visibleElementIds.size > 0) {
+      const sample = relationships.slice(0, 3);
+      const elSample = Array.from(visibleElementIds).slice(0, 3);
+      showTransientDiagnostic(
+        `${relationships.length} relationships loaded but none visible in current view (${visibleElementIds.size} elements). `
+        + `Sample endpoints: ${sample.map(relationship => `${relationship.sourceId}->${relationship.targetId}`).join(', ')}. `
+        + `Sample view element IDs: ${elSample.join(', ')}`,
+      );
+    }
+  }, [relationships, visibleRelationships, visibleElementIds, showTransientDiagnostic]);
 
   // Element lookup map for O(1) access in getRelPoints/drawRelationship
   const visibleElementMap = useMemo(
@@ -335,6 +364,7 @@ export default function App() {
         h: element.h,
         linkedViewId: element.linkedViewId,
         zIndex: element.zIndex,
+        style: element.style,
       };
     }
 
@@ -343,6 +373,7 @@ export default function App() {
       relationshipLayout[relationship.id] = {
         waypoints: relationship.waypoints || [],
         labelPos: relationship.labelPos ?? 0.5,
+        relativeBendpoints: relationship.relativeBendpoints,
       };
     }
 
@@ -371,6 +402,7 @@ export default function App() {
         h: layout.h,
         linkedViewId: layout.linkedViewId,
         zIndex: layout.zIndex ?? element.zIndex ?? 0,
+        style: layout.style ?? element.style,
       };
     }));
 
@@ -381,6 +413,7 @@ export default function App() {
         ...relationship,
         waypoints: layout.waypoints,
         labelPos: layout.labelPos,
+        relativeBendpoints: layout.relativeBendpoints,
       };
     }));
   }, []);
@@ -566,10 +599,24 @@ export default function App() {
     return ids;
   }, [visibleElements, currentViewId]);
 
-  const sortedElements = useMemo(
-    () => [...visibleElements].sort((a, b) => (a.zIndex ?? 0) - (b.zIndex ?? 0)),
-    [visibleElements],
-  );
+  // Archi draw order: containers behind children, composites behind non-composites.
+  // Sort by: 1) nesting depth (zIndex), 2) composites before non-composites, 3) area descending (larger behind smaller)
+  const sortedElements = useMemo(() => {
+    const isComp = (el: ModelElement) => {
+      const layer = ELEMENT_TYPES[el.type]?.layer;
+      return layer === 'composite' && el.type !== 'note';
+    };
+    return [...visibleElements].sort((a, b) => {
+      // Primary: lower zIndex draws first (parents behind children)
+      const za = a.zIndex ?? 0, zb = b.zIndex ?? 0;
+      if (za !== zb) return za - zb;
+      // Secondary: composites draw before non-composites at same depth
+      const ca = isComp(a) ? 0 : 1, cb = isComp(b) ? 0 : 1;
+      if (ca !== cb) return ca - cb;
+      // Tertiary: larger elements draw first (behind smaller ones)
+      return (b.w * b.h) - (a.w * a.h);
+    });
+  }, [visibleElements]);
 
   // Track canvas dimensions to avoid unnecessary reallocation
   const canvasDimsRef = useRef({ w: 0, h: 0 });
@@ -578,7 +625,8 @@ export default function App() {
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
-    const ctx = canvas.getContext('2d')!;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
     const dpr = window.devicePixelRatio || 1;
     const pw = cSize.w * dpr, ph = cSize.h * dpr;
     // Only resize canvas buffer when dimensions actually change (expensive operation)
@@ -615,7 +663,13 @@ export default function App() {
 
     // Elements — single pass sorted by zIndex (parents draw before children)
     for (const el of culledElements) {
-      drawElement(ctx, el, selType === 'element' && selectedId === el.id, hovElId === el.id, (selType === 'element' && selectedId === el.id) || hovElId === el.id, parentIds.has(el.id));
+      drawElement(
+        ctx,
+        el,
+        selType === 'element' && selectedId === el.id,
+        (selType === 'element' && selectedId === el.id) || hovElId === el.id,
+        parentIds.has(el.id),
+      );
     }
 
     // 3. Relationships (always on top of elements) — with crossing hops
@@ -693,7 +747,9 @@ export default function App() {
   const handleMouseDown = useCallback((e: React.MouseEvent) => {
     if (relPicker || ctxMenu) { setRelPicker(null); setCtxMenu(null); return; }
     if (editingElId) return;
-    const rect = canvasRef.current!.getBoundingClientRect();
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const rect = canvas.getBoundingClientRect();
     const sx = e.clientX - rect.left, sy = e.clientY - rect.top;
     const { x: wx, y: wy } = s2w(sx, sy);
 
@@ -721,7 +777,20 @@ export default function App() {
     const linked = hitTestPopout(visibleElements, wx, wy);
     if (linked) { navigateToView(linked); return; }
 
-    const anch = hitTestAnchor(visibleElements, wx, wy, getLayer, isNote);
+    // Resize handles take priority over everything (they overlap anchor zones at corners)
+    if (selType === 'element' && selectedId) {
+      const selEl = visibleElements.find(e => e.id === selectedId);
+      if (selEl) {
+        const handle = hitTestResizeHandle(selEl, wx, wy);
+        if (handle) {
+          pushHistory();
+          setResizing({ id: selEl.id, handle, startWx: wx, startWy: wy, origX: selEl.x, origY: selEl.y, origW: selEl.w, origH: selEl.h });
+          return;
+        }
+      }
+    }
+
+    const anch = hitTestAnchor(sortedElements, wx, wy, getLayer, isNote);
     if (anch) { setDrawingRel({ sourceId: anch.elId, mx: wx, my: wy, waypoints: [] }); return; }
 
     // Endpoint dragging — only when a relationship is selected
@@ -739,58 +808,150 @@ export default function App() {
     const lbl = hitTestLabel(visibleRelationships, visibleElements, wx, wy);
     if (lbl) { pushHistory(); setDragLabel({ relId: lbl.id }); setSelectedId(lbl.id); setSelType('relationship'); return; }
 
-    // Check resize handles on currently selected element first
-    if (selType === 'element' && selectedId) {
-      const selEl = visibleElements.find(e => e.id === selectedId);
-      if (selEl) {
-        const handle = hitTestResizeHandle(selEl, wx, wy);
-        if (handle) {
-          pushHistory();
-          setResizing({ id: selEl.id, handle, startWx: wx, startWy: wy, origX: selEl.x, origY: selEl.y, origW: selEl.w, origH: selEl.h });
-          return;
-        }
-      }
-    }
-
-    const el = hitTestElement(visibleElements, wx, wy, getLayer, isNote);
+    const el = hitTestElement(sortedElements, wx, wy, getLayer, isNote);
     if (el) {
       setSelectedId(el.id); setSelType('element');
       pushHistory();
       setDragging({ id: el.id, ox: wx - el.x, oy: wy - el.y });
     } else {
       const rh = hitTestRelationship(visibleRelationships, visibleElements, wx, wy);
-      if (rh) { setSelectedId(rh.rel.id); setSelType('relationship'); }
+      if (rh) {
+        setSelectedId(rh.rel.id); setSelType('relationship');
+        // If already selected, start segment drag
+        if (selType === 'relationship' && selectedId === rh.rel.id) {
+          const orient = getSegmentOrientation(rh.rel, visibleElements, rh.segIdx, visibleElementMap);
+          if (orient) {
+            pushHistory();
+            setDragSegment({ relId: rh.rel.id, segIdx: rh.segIdx, orientation: orient, startWx: wx, startWy: wy });
+          }
+        }
+      }
       else { setSelectedId(null); setSelType(null); setPanning({ sx: e.clientX, sy: e.clientY, cx: cam.x, cy: cam.y }); }
     }
   }, [s2w, visibleElements, visibleRelationships, cam, relPicker, ctxMenu, drawingRel, editingElId, navigateToView, selType, selectedId, pushHistory, isViewMode]);
 
   const handleMouseMove = useCallback((e: React.MouseEvent) => {
-    const rect = canvasRef.current!.getBoundingClientRect();
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const rect = canvas.getBoundingClientRect();
     const sx = e.clientX - rect.left, sy = e.clientY - rect.top;
     const { x: wx, y: wy } = s2w(sx, sy);
 
     if (resizing) {
       const dx = wx - resizing.startWx, dy = wy - resizing.startWy;
       const rh = resizing.handle;
-      let nx = resizing.origX, ny = resizing.origY, nw = resizing.origW, nh = resizing.origH;
-      if (rh.includes('w')) { nx = resizing.origX + dx; nw = resizing.origW - dx; }
-      if (rh.includes('e')) { nw = resizing.origW + dx; }
-      if (rh.includes('n')) { ny = resizing.origY + dy; nh = resizing.origH - dy; }
-      if (rh.includes('s')) { nh = resizing.origH + dy; }
-      nw = Math.max(60, nw); nh = Math.max(40, nh);
-      if (nw === 60 && rh.includes('w')) nx = resizing.origX + resizing.origW - 60;
-      if (nh === 40 && rh.includes('n')) ny = resizing.origY + resizing.origH - 40;
-      // Grid-snap first, then smart-snap to elements
-      nx = snap(nx); ny = snap(ny); nw = snap(nw); nh = snap(nh);
+      const fixedLeft = resizing.origX;
+      const fixedTop = resizing.origY;
+      const fixedRight = resizing.origX + resizing.origW;
+      const fixedBottom = resizing.origY + resizing.origH;
       const others = visibleElements.filter(el => el.id !== resizing.id);
-      const result = snapResizeToElements({ x: nx, y: ny, w: nw, h: nh }, rh, others);
-      setSnapGuides(result.guides);
-      setElements(prev => prev.map(el => el.id === resizing.id ? { ...el, x: result.x, y: result.y, w: result.w, h: result.h } : el));
+      const snapThresh = 6;
+
+      let left = fixedLeft, top = fixedTop, right = fixedRight, bottom = fixedBottom;
+      const guides: SnapGuide[] = [];
+
+      // For each moving edge: try snapping to other element edges, fall back to grid
+      if (rh.includes('w')) {
+        let raw = fixedLeft + dx;
+        let snapped = false;
+        for (const o of others) {
+          for (const t of [o.x, o.x + o.w]) {
+            if (Math.abs(raw - t) < snapThresh) { raw = t; snapped = true; guides.push({ axis: 'x', value: t, type: 'edge' }); break; }
+          }
+          if (snapped) break;
+        }
+        left = snapped ? raw : snap(raw);
+      }
+      if (rh.includes('e')) {
+        let raw = fixedRight + dx;
+        let snapped = false;
+        for (const o of others) {
+          for (const t of [o.x, o.x + o.w]) {
+            if (Math.abs(raw - t) < snapThresh) { raw = t; snapped = true; guides.push({ axis: 'x', value: t, type: 'edge' }); break; }
+          }
+          if (snapped) break;
+        }
+        right = snapped ? raw : snap(raw);
+      }
+      if (rh.includes('n')) {
+        let raw = fixedTop + dy;
+        let snapped = false;
+        for (const o of others) {
+          for (const t of [o.y, o.y + o.h]) {
+            if (Math.abs(raw - t) < snapThresh) { raw = t; snapped = true; guides.push({ axis: 'y', value: t, type: 'edge' }); break; }
+          }
+          if (snapped) break;
+        }
+        top = snapped ? raw : snap(raw);
+      }
+      if (rh.includes('s')) {
+        let raw = fixedBottom + dy;
+        let snapped = false;
+        for (const o of others) {
+          for (const t of [o.y, o.y + o.h]) {
+            if (Math.abs(raw - t) < snapThresh) { raw = t; snapped = true; guides.push({ axis: 'y', value: t, type: 'edge' }); break; }
+          }
+          if (snapped) break;
+        }
+        bottom = snapped ? raw : snap(raw);
+      }
+
+      // Enforce minimum size
+      if (right - left < 60) { if (rh.includes('w')) left = right - 60; else right = left + 60; }
+      if (bottom - top < 40) { if (rh.includes('n')) top = bottom - 40; else bottom = top + 40; }
+
+      setSnapGuides(guides);
+      setElements(prev => prev.map(el => el.id === resizing.id ? { ...el, x: left, y: top, w: right - left, h: bottom - top } : el));
       return;
     }
     if (drawingRel) { setDrawingRel(p => p ? { ...p, mx: wx, my: wy } : null); return; }
     if (dragWP) {
       setRelationships(prev => prev.map(r => r.id === dragWP.relId ? { ...r, waypoints: r.waypoints.map((w, i) => i === dragWP.wpIdx ? { x: snap(wx), y: snap(wy) } : w) } : r));
+      return;
+    }
+    if (dragSegment) {
+      setRelationships(prev => prev.map(r => {
+        if (r.id !== dragSegment.relId) return r;
+        const pts = getRelPoints(r, visibleElements, visibleElementMap);
+        if (!pts) return r;
+        const allPts = [pts.start, ...pts.waypoints, pts.end];
+        const si = dragSegment.segIdx;
+        const wpCount = pts.waypoints.length;
+
+        if (wpCount === 0) {
+          // No waypoints yet — create 2 waypoints to form a 3-segment orthogonal path
+          const a = allPts[0], b = allPts[allPts.length - 1];
+          if (dragSegment.orientation === 'h') {
+            // Horizontal segment → drag vertically → create Z-route
+            const newY = snap(wy);
+            return { ...r, waypoints: [{ x: a.x, y: newY }, { x: b.x, y: newY }], relativeBendpoints: undefined };
+          } else {
+            const newX = snap(wx);
+            return { ...r, waypoints: [{ x: newX, y: a.y }, { x: newX, y: b.y }], relativeBendpoints: undefined };
+          }
+        }
+
+        // Has waypoints — move the endpoints of the dragged segment
+        const newWaypoints = [...pts.waypoints];
+        // Segment si connects allPts[si] → allPts[si+1]
+        // allPts = [start, wp0, wp1, ..., end]
+        // wp index = allPts index - 1
+
+        if (dragSegment.orientation === 'h') {
+          // Horizontal segment → move vertically
+          const newY = snap(wy);
+          // Move the waypoint endpoints of this segment
+          if (si > 0 && si - 1 < wpCount) newWaypoints[si - 1] = { ...newWaypoints[si - 1], y: newY };
+          if (si < wpCount) newWaypoints[si] = { ...newWaypoints[si], y: newY };
+        } else {
+          // Vertical segment → move horizontally
+          const newX = snap(wx);
+          if (si > 0 && si - 1 < wpCount) newWaypoints[si - 1] = { ...newWaypoints[si - 1], x: newX };
+          if (si < wpCount) newWaypoints[si] = { ...newWaypoints[si], x: newX };
+        }
+
+        return { ...r, waypoints: newWaypoints, relativeBendpoints: undefined };
+      }));
       return;
     }
     if (dragEndpoint) {
@@ -818,6 +979,7 @@ export default function App() {
         const others = visibleElements.filter(el => el.id !== dragging.id);
         const result = snapToElements({ x: proposedX, y: proposedY, w: draggedEl.w, h: draggedEl.h }, others);
         setSnapGuides(result.guides);
+
         setElements(prev => prev.map(el => el.id === dragging.id ? { ...el, x: result.x, y: result.y } : el));
       }
     } else if (panning) {
@@ -828,7 +990,7 @@ export default function App() {
         if (selElHov) {
           const handle = hitTestResizeHandle(selElHov, wx, wy);
           if (handle) {
-            canvasRef.current!.style.cursor = HANDLE_CURSORS[handle];
+            canvas.style.cursor = HANDLE_CURSORS[handle];
             setHovElId(null); setHovRelId(null);
             return;
           }
@@ -840,13 +1002,15 @@ export default function App() {
         const rh = hitTestRelationship(visibleRelationships, visibleElements, wx, wy);
         setHovRelId(rh?.rel?.id || null);
       } else setHovRelId(null);
-      canvasRef.current!.style.cursor = 'default';
+      canvas.style.cursor = 'default';
     }
-  }, [s2w, dragging, panning, visibleElements, visibleRelationships, drawingRel, dragWP, dragEndpoint, dragLabel, resizing, selType, selectedId, setCamThrottled]);
+  }, [s2w, dragging, panning, visibleElements, visibleRelationships, visibleElementMap, drawingRel, dragWP, dragEndpoint, dragLabel, dragSegment, resizing, selType, selectedId, setCamThrottled]);
 
   const handleMouseUp = useCallback((e: React.MouseEvent) => {
     if (drawingRel) {
-      const rect = canvasRef.current!.getBoundingClientRect();
+      const canvas = canvasRef.current;
+      if (!canvas) return;
+      const rect = canvas.getBoundingClientRect();
       const { x: wx, y: wy } = s2w(e.clientX - rect.left, e.clientY - rect.top);
       const tgt = hitTestElement(visibleElements, wx, wy, getLayer, isNote);
       if (tgt && tgt.id !== drawingRel.sourceId) {
@@ -855,12 +1019,14 @@ export default function App() {
       }
       setDrawingRel(null); return;
     }
-    setDragging(null); setPanning(null); setDragWP(null); setDragEndpoint(null); setDragLabel(null); setResizing(null);
+    setDragging(null); setPanning(null); setDragWP(null); setDragEndpoint(null); setDragLabel(null); setDragSegment(null); setResizing(null);
     setSnapGuides([]);
   }, [drawingRel, s2w, visibleElements]);
 
   const handleDblClick = useCallback((e: React.MouseEvent) => {
-    const rect = canvasRef.current!.getBoundingClientRect();
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const rect = canvas.getBoundingClientRect();
     const { x: wx, y: wy } = s2w(e.clientX - rect.left, e.clientY - rect.top);
 
     const el = hitTestElement(visibleElements, wx, wy, getLayer, isNote);
@@ -887,12 +1053,14 @@ export default function App() {
         if (name !== null) { pushHistory(); setRelationships(prev => prev.map(r => r.id === rh.rel.id ? { ...r, name } : r)); }
       }
     }
-  }, [s2w, visibleElements, visibleRelationships, navigateToView, isViewMode]);
+  }, [s2w, visibleElements, visibleRelationships, navigateToView, isViewMode, pushHistory]);
 
   const handleContextMenu = useCallback((e: React.MouseEvent) => {
     e.preventDefault();
     if (isViewMode) return; // No context menu in view mode
-    const rect = canvasRef.current!.getBoundingClientRect();
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const rect = canvas.getBoundingClientRect();
     const sx = e.clientX - rect.left, sy = e.clientY - rect.top;
     const { x: wx, y: wy } = s2w(sx, sy);
 
@@ -910,7 +1078,7 @@ export default function App() {
         typesByLayer[layer].push([k, v]);
       }
 
-      const changeTypeChildren: typeof items = [];
+      const changeTypeChildren: CtxMenuItem[] = [];
       // Current layer first, then others
       const currentLayer = elTypeDef?.layer;
       const layerOrder = currentLayer
@@ -934,7 +1102,7 @@ export default function App() {
         }
       }
 
-      const items: { label: string; action?: () => void; children?: typeof changeTypeChildren; separator?: boolean; icon?: string; iconColor?: string }[] = [
+      const items: CtxMenuItem[] = [
         { label: 'Rename', action: () => { setEditingElId(el.id); setEditingName(el.name); } },
         { label: 'Change type', children: changeTypeChildren },
         { label: '', separator: true },
@@ -994,11 +1162,13 @@ export default function App() {
     if (wp) {
       setCtxMenu({ x: sx, y: sy, items: [{ label: 'Remove waypoint', action: () => { pushHistory(); setRelationships(prev => prev.map(r => r.id === wp.relId ? { ...r, waypoints: r.waypoints.filter((_, i) => i !== wp.wpIdx) } : r)); } }] });
     }
-  }, [s2w, visibleElements, visibleRelationships, selectedId, pushHistory]);
+  }, [s2w, visibleElements, visibleRelationships, selectedId, pushHistory, elements, isViewMode]);
 
   const handleWheel = useCallback((e: React.WheelEvent) => {
     e.preventDefault();
-    const rect = canvasRef.current!.getBoundingClientRect();
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const rect = canvas.getBoundingClientRect();
     const sx = e.clientX - rect.left, sy = e.clientY - rect.top;
     const f = e.deltaY < 0 ? 1.08 : 0.93;
     const ns = Math.min(3, Math.max(0.2, cam.s * f));
@@ -1066,19 +1236,21 @@ export default function App() {
       alert(firstError?.message || 'Export failed');
       return;
     }
-    if (result.diagnostics.length > 0) console.warn('Export diagnostics', result.diagnostics);
+    summarizeDiagnostics('Export', result.diagnostics);
 
     const blob = new Blob([result.content], { type: result.mimeType });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a'); a.href = url; a.download = result.suggestedFileName; a.click();
     URL.revokeObjectURL(url);
-  }, [elements, relationships, views, selectedFormatId]);
+  }, [elements, relationships, views, selectedFormatId, summarizeDiagnostics]);
 
   const importModel = useCallback(() => {
     const acceptedExtensions = Array.from(new Set(modelFormats.flatMap(format => format.extensions.map(extension => `.${extension}`))));
     const inp = document.createElement('input'); inp.type = 'file'; inp.accept = acceptedExtensions.join(',');
-    inp.onchange = (e: Event) => {
-      const f = (e.target as HTMLInputElement).files?.[0];
+    inp.onchange = async (e: Event) => {
+      const target = e.target;
+      if (!(target instanceof HTMLInputElement)) return;
+      const f = target.files?.[0];
       if (!f) return;
 
       const detectedFormat = detectModelFormatByFileName(f.name);
@@ -1088,50 +1260,48 @@ export default function App() {
         return;
       }
 
-      const r = new FileReader();
-      r.onload = (ev) => {
-        try {
-          const content = ev.target?.result as string;
-          const result = importEditorModelFromText(content, formatId);
-          if (!result.model) {
-            const firstError = result.diagnostics.find(diagnostic => diagnostic.severity === 'error');
-            alert(firstError?.message || 'Invalid file');
-            return;
-          }
-          if (result.diagnostics.length > 0) console.warn('Import diagnostics', result.diagnostics);
+      try {
+        const content = await f.text();
+        const result = importEditorModelFromText(content, formatId);
+        if (!result.model) {
+          const firstError = result.diagnostics.find(diagnostic => diagnostic.severity === 'error');
+          alert(firstError?.message || 'Invalid file');
+          return;
+        }
+        summarizeDiagnostics('Import', result.diagnostics);
 
-          const importedLayouts = result.document
-            ? buildLayoutsFromCanonicalDocument(result.document)
-            : buildLayoutsFromEditorModel(result.model.elements, result.model.relationships, result.model.views);
-          elementLayoutsByViewRef.current = importedLayouts.elementLayouts;
-          relationshipLayoutsByViewRef.current = importedLayouts.relationshipLayouts;
+        const importedLayouts = result.document
+          ? buildLayoutsFromCanonicalDocument(result.document)
+          : buildLayoutsFromEditorModel(result.model.elements, result.model.relationships, result.model.views);
+        elementLayoutsByViewRef.current = importedLayouts.elementLayouts;
+        relationshipLayoutsByViewRef.current = importedLayouts.relationshipLayouts;
 
-          setElements(result.model.elements);
-          setRelationships(result.model.relationships);
-          setViews(result.model.views);
-          if (result.model.views.length > 0) {
-            setCurrentViewId(result.model.views[0].id);
-            setOpenTabIds([result.model.views[0].id]);
-            applyViewLayout(result.model.views[0].id);
-          }
-          setSelectedId(null); setSelType(null);
-          // Fit camera to imported content using layout-resolved positions
-          const firstViewId = result.model.views[0]?.id;
-          const layoutEls = firstViewId ? importedLayouts.elementLayouts[firstViewId] : null;
-          if (layoutEls) {
-            const laidOut = result.model.elements
-              .filter(e => layoutEls[e.id])
-              .map(e => ({ ...e, ...layoutEls[e.id], w: layoutEls[e.id].w, h: layoutEls[e.id].h }));
-            fitToContent(laidOut);
-          } else {
-            fitToContent(result.model.elements);
-          }
-        } catch { alert('Invalid file'); }
-      };
-      r.readAsText(f);
+        setElements(result.model.elements);
+        setRelationships(result.model.relationships);
+        setViews(result.model.views);
+        if (result.model.views.length > 0) {
+          setCurrentViewId(result.model.views[0].id);
+          setOpenTabIds([result.model.views[0].id]);
+          applyViewLayout(result.model.views[0].id);
+        }
+        setSelectedId(null); setSelType(null);
+        // Fit camera to imported content using layout-resolved positions
+        const firstViewId = result.model.views[0]?.id;
+        const layoutEls = firstViewId ? importedLayouts.elementLayouts[firstViewId] : null;
+        if (layoutEls) {
+          const laidOut = result.model.elements
+            .filter(element => layoutEls[element.id])
+            .map(element => ({ ...element, ...layoutEls[element.id], w: layoutEls[element.id].w, h: layoutEls[element.id].h }));
+          fitToContent(laidOut);
+        } else {
+          fitToContent(result.model.elements);
+        }
+      } catch {
+        alert('Invalid file');
+      }
     };
     inp.click();
-  }, [ioFormatId, modelFormats, applyViewLayout, fitToContent]);
+  }, [ioFormatId, modelFormats, applyViewLayout, fitToContent, summarizeDiagnostics]);
 
   // ---------------------------------------------------------------------------
   // Filesystem: Open Directory, Open File, Save
@@ -1150,17 +1320,7 @@ export default function App() {
         alert(firstError?.message || 'Invalid file');
         return;
       }
-      if (result.diagnostics.length > 0) console.warn('Import diagnostics', result.diagnostics);
-
-      // Debug: log model summary for troubleshooting
-      console.log(`[OpenArchi] File import summary (${formatId}):`, {
-        elements: result.model.elements.length,
-        relationships: result.model.relationships.length,
-        views: result.model.views.length,
-        viewElementIds: result.model.views.map(v => ({ id: v.id, name: v.name, elementCount: v.elementIds.length })),
-        canonicalViewNodes: result.document?.viewNodes.length ?? 'n/a',
-        canonicalViewConnections: result.document?.viewConnections.length ?? 'n/a',
-      });
+      summarizeDiagnostics('Import', result.diagnostics);
 
       const importedLayouts = result.document
         ? buildLayoutsFromCanonicalDocument(result.document)
@@ -1196,7 +1356,7 @@ export default function App() {
     } catch (err) {
       alert(`Failed to open file: ${err}`);
     }
-  }, [applyViewLayout, fitToContent]);
+  }, [applyViewLayout, fitToContent, summarizeDiagnostics]);
 
   const loadFragmentedModel = useCallback(async (files: OpenFileEntry[]) => {
     try {
@@ -1207,33 +1367,7 @@ export default function App() {
         alert(firstError?.message || 'Failed to import fragmented model');
         return;
       }
-      if (result.diagnostics.length > 0) console.warn('Import diagnostics', result.diagnostics);
-
-      // Debug: log model summary for troubleshooting
-      const firstView = result.model.views[0];
-      const firstViewElIds = firstView ? new Set(firstView.elementIds) : new Set<string>();
-      const relsInFirstView = result.model.relationships.filter(
-        r => firstViewElIds.has(r.sourceId) && firstViewElIds.has(r.targetId),
-      );
-      const relsPartialInFirstView = result.model.relationships.filter(
-        r => firstViewElIds.has(r.sourceId) || firstViewElIds.has(r.targetId),
-      );
-      console.log('[OpenArchi] Fragmented import summary:', {
-        elements: result.model.elements.length,
-        relationships: result.model.relationships.length,
-        views: result.model.views.length,
-        firstView: firstView ? { id: firstView.id, name: firstView.name, elementCount: firstView.elementIds.length } : null,
-        relsFullyInFirstView: relsInFirstView.length,
-        relsPartiallyInFirstView: relsPartialInFirstView.length,
-        canonicalViewNodes: result.document?.viewNodes.length ?? 'n/a',
-        canonicalViewConnections: result.document?.viewConnections.length ?? 'n/a',
-        sampleRelEndpoints: result.model.relationships.slice(0, 3).map(r => ({
-          id: r.id, src: r.sourceId, tgt: r.targetId,
-          srcInView: firstViewElIds.has(r.sourceId),
-          tgtInView: firstViewElIds.has(r.targetId),
-        })),
-        sampleElementIds: Array.from(firstViewElIds).slice(0, 5),
-      });
+      summarizeDiagnostics('Import', result.diagnostics);
 
       const importedLayouts = result.document
         ? buildLayoutsFromCanonicalDocument(result.document)
@@ -1260,8 +1394,7 @@ export default function App() {
       const relsMatch = m.relationships.filter(r => fvEls.has(r.sourceId) && fvEls.has(r.targetId)).length;
       const summary = `Imported: ${m.elements.length} elements, ${m.relationships.length} relationships, ${m.views.length} views. `
         + `First view "${fv?.name || '?'}": ${fv?.elementIds.length ?? 0} els, ${relsMatch} rels match.`;
-      setImportDiag(summary);
-      setTimeout(() => setImportDiag(prev => prev === summary ? null : prev), 8000);
+      showTransientDiagnostic(summary);
 
       // Fit camera to imported content
       const firstViewId = result.model.views[0]?.id;
@@ -1277,20 +1410,15 @@ export default function App() {
     } catch (err) {
       alert(`Failed to import fragmented model: ${err}`);
     }
-  }, [applyViewLayout, fitToContent]);
+  }, [applyViewLayout, fitToContent, showTransientDiagnostic, summarizeDiagnostics]);
 
   const handleOpenDirectory = useCallback(async () => {
     try {
       const state = await openDirectory();
       setDirState(state);
 
-      console.log('[OpenArchi] Directory opened:', state.directoryName,
-        'Files:', state.files.length,
-        'Paths:', state.files.map(f => f.relativePath));
-
       // Detect fragmented coArchi directory (individual XML files per element)
       const isFragmented = isFragmentedModelDirectory(state.files);
-      console.log('[OpenArchi] isFragmentedModelDirectory:', isFragmented);
 
       if (isFragmented) {
         await loadFragmentedModel(state.files);
@@ -1299,17 +1427,16 @@ export default function App() {
 
       // Auto-open the first archimate/xml/json file
       if (state.files.length > 0) {
-        console.log('[OpenArchi] Opening first file:', state.files[0].relativePath);
         await loadFileEntry(state.files[0]);
       } else {
-        console.warn('[OpenArchi] No valid files found in directory');
+        showTransientDiagnostic(`No supported model files found in '${state.directoryName}'.`);
       }
     } catch (err) {
       // User cancelled the picker
       if (err instanceof DOMException && err.name === 'AbortError') return;
       alert(`Failed to open directory: ${err}`);
     }
-  }, [loadFileEntry, loadFragmentedModel]);
+  }, [loadFileEntry, loadFragmentedModel, showTransientDiagnostic]);
 
   const handleSave = useCallback(async () => {
     if (!activeFileEntry || !activeFormatId) {
@@ -1352,22 +1479,28 @@ export default function App() {
   }, [elements, relationships, views, activeFileEntry]);
 
   // Keyboard
+  const isTextInputActive = useCallback((): boolean => {
+    const activeElement = document.activeElement;
+    if (!(activeElement instanceof HTMLElement)) return false;
+    return ['INPUT', 'TEXTAREA', 'SELECT'].includes(activeElement.tagName);
+  }, []);
+
   useEffect(() => {
     const h = (e: KeyboardEvent) => {
       if (e.key === 'Delete' || e.key === 'Backspace') {
-        if (['INPUT', 'TEXTAREA', 'SELECT'].includes((document.activeElement as HTMLElement)?.tagName)) return;
+        if (isTextInputActive()) return;
         if (interactionMode !== 'view') deleteSelected();
       }
       if (e.key === 'Escape') { setRelPicker(null); setCtxMenu(null); setShowSearch(false); setDrawingRel(null); cancelEditing(); }
       if ((e.metaKey || e.ctrlKey) && e.key === 'k') { e.preventDefault(); setShowSearch(s => !s); }
       if ((e.metaKey || e.ctrlKey) && e.key === 's') { e.preventDefault(); handleSave(); }
       if ((e.metaKey || e.ctrlKey) && e.key === 'z') {
-        if (['INPUT', 'TEXTAREA', 'SELECT'].includes((document.activeElement as HTMLElement)?.tagName)) return;
+        if (isTextInputActive()) return;
         e.preventDefault();
         if (e.shiftKey) redo(); else undo();
       }
       if ((e.metaKey || e.ctrlKey) && e.key === 'y') {
-        if (['INPUT', 'TEXTAREA', 'SELECT'].includes((document.activeElement as HTMLElement)?.tagName)) return;
+        if (isTextInputActive()) return;
         e.preventDefault();
         redo();
       }
@@ -1379,7 +1512,7 @@ export default function App() {
     };
     window.addEventListener('keydown', h);
     return () => window.removeEventListener('keydown', h);
-  }, [deleteSelected, cancelEditing, goBack, goForward, handleSave, undo, redo, fitToContent, interactionMode]);
+  }, [deleteSelected, cancelEditing, goBack, goForward, handleSave, undo, redo, fitToContent, interactionMode, isTextInputActive]);
 
   useEffect(() => {
     if (!selectedId) return;
@@ -1607,7 +1740,7 @@ export default function App() {
             onMouseUp={handleMouseUp}
             onDoubleClick={handleDblClick}
             onContextMenu={handleContextMenu}
-            onMouseLeave={() => { setDragging(null); setPanning(null); setDragWP(null); setDragEndpoint(null); setDragLabel(null); setResizing(null); setHovElId(null); setHovRelId(null); setSnapGuides([]); }}
+            onMouseLeave={() => { setDragging(null); setPanning(null); setDragWP(null); setDragEndpoint(null); setDragLabel(null); setDragSegment(null); setResizing(null); setHovElId(null); setHovRelId(null); setSnapGuides([]); }}
             onWheel={handleWheel}
           />
 

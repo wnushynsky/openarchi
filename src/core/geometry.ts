@@ -12,8 +12,13 @@ export function uid(): string {
 }
 
 // ============================================================
-// Anchor points (8 per element)
+// Anchor points — Archi-style dynamic edge anchors
 // ============================================================
+//
+// Archi doesn't use fixed anchor dots. Any point on the element
+// edge is a valid connection point. getAnchors() returns 4 cardinal
+// anchor indicators (midpoints of each edge) for visual feedback.
+// nearestAnchor() snaps to the nearest point on the element boundary.
 
 export function getAnchors(el: ModelElement): Anchor[] {
   return [
@@ -21,21 +26,12 @@ export function getAnchors(el: ModelElement): Anchor[] {
     { x: el.x + el.w / 2, y: el.y + el.h, side: 'bc' },
     { x: el.x, y: el.y + el.h / 2, side: 'ml' },
     { x: el.x + el.w, y: el.y + el.h / 2, side: 'mr' },
-    { x: el.x + el.w * 0.25, y: el.y, side: 'tl' },
-    { x: el.x + el.w * 0.75, y: el.y, side: 'tr' },
-    { x: el.x + el.w * 0.25, y: el.y + el.h, side: 'bl' },
-    { x: el.x + el.w * 0.75, y: el.y + el.h, side: 'br' },
   ];
 }
 
 export function nearestAnchor(el: ModelElement, px: number, py: number): Anchor {
-  let best: Anchor | null = null;
-  let bd = Infinity;
-  for (const a of getAnchors(el)) {
-    const d = Math.hypot(a.x - px, a.y - py);
-    if (d < bd) { bd = d; best = a; }
-  }
-  return best!;
+  // Snap to the nearest point on the element boundary (any edge position)
+  return snapToEdge(el, { x: px, y: py });
 }
 
 // ============================================================
@@ -48,8 +44,6 @@ export interface RelPath {
   waypoints: Point[];
 }
 
-const STRAIGHT_THRESH = 40;
-
 /**
  * Compute the point where a ray from the center of a rect toward a target
  * intersects the rect boundary. Keeps lines straight regardless of element position.
@@ -57,71 +51,241 @@ const STRAIGHT_THRESH = 40;
  * When the direction is nearly diagonal, we bias toward the edge that aligns
  * with the dominant axis so connections don't flip sides unexpectedly.
  */
-function rectEdgeIntersect(
-  el: ModelElement,
-  target: Point,
-): Anchor {
-  const cx = el.x + el.w / 2, cy = el.y + el.h / 2;
-  const dx = target.x - cx, dy = target.y - cy;
+// ============================================================
+// ============================================================
+// Connection Anchoring — 1:1 port of Archi's OrthogonalAnchor.java
+// by Jean-Baptiste Sarrodie (MIT License)
+// ============================================================
+//
+// Archi uses a 5×5 position grid (LEFT/LEFT_CORNER/MIDDLE/RIGHT_CORNER/RIGHT
+// × TOP/TOP_CORNER/CENTER/BOTTOM_CORNER/BOTTOM) to classify where the
+// reference point falls relative to the element. Each of the 25 cases
+// produces a specific anchor point on the element boundary.
+//
+// Corner zones are defined by the element's corner arc (default 10px for
+// ArchiMate elements). For the corner cases, the anchor sits on the
+// elliptical arc of the rounded corner.
 
-  // Degenerate case: target is at center
-  if (Math.abs(dx) < 0.01 && Math.abs(dy) < 0.01) {
+// Archi's default corner arc for element figures
+const CORNER_W = 10;
+const CORNER_H = 10;
+const COSPI4 = Math.cos(Math.PI / 4); // ≈ 0.7071
+
+// Bitwise position flags (matching Archi's OrthogonalAnchor constants)
+const LEFT = 1, LEFT_CORNER = 2, MIDDLE = 4, RIGHT_CORNER = 8, RIGHT = 16;
+const TOP = 32, TOP_CORNER = 64, CENTER = 128, BOTTOM_CORNER = 256, BOTTOM = 512;
+
+/**
+ * OrthogonalAnchor — 1:1 port of Archi's OrthogonalAnchor.getLocation().
+ *
+ * @param el     The element figure (bounding box)
+ * @param ref    Reference point (first/last bendpoint, or remote element center)
+ * @param remote Optional remote element — when provided and overlapping, the
+ *               reference is adjusted to the midpoint of the overlapping region
+ */
+function orthogonalAnchor(el: ModelElement, ref: Point, remote?: ModelElement): Anchor {
+  const bx = el.x, by = el.y, bw = el.w - 1, bh = el.h - 1; // -1 matches Archi's resize(-1,-1)
+  const cw = CORNER_W, ch = CORNER_H;
+
+  // If reference comes from a remote figure center and figures overlap,
+  // adjust reference to the midpoint of the overlapping region
+  let rx = ref.x, ry = ref.y;
+  if (remote) {
+    const rbx = remote.x, rby = remote.y, rbw = remote.w, rbh = remote.h;
+    // Check if reference is near the remote figure's center (5px tolerance, matching Archi)
+    const rcx = rbx + rbw / 2, rcy = rby + rbh / 2;
+    if (Math.abs(rx - rcx) <= 3 && Math.abs(ry - rcy) <= 3) {
+      // Compute overlap region midpoint
+      const oL = Math.max(bx, rbx), oR = Math.min(bx + bw, rbx + rbw);
+      const oT = Math.max(by, rby), oB = Math.min(by + bh, rby + rbh);
+      if (oL < oR && oT < oB) {
+        rx = (oL + oR) / 2;
+        ry = (oT + oB) / 2;
+      }
+    }
+  }
+
+  // Classify X position
+  let xPos: number;
+  if (rx < bx) xPos = LEFT;
+  else if (rx < bx + cw / 2) xPos = LEFT_CORNER;
+  else if (rx < bx + bw - cw / 2) xPos = MIDDLE;
+  else if (rx < bx + bw) xPos = RIGHT_CORNER;
+  else xPos = RIGHT;
+
+  // Classify Y position
+  let yPos: number;
+  if (ry < by) yPos = TOP;
+  else if (ry < by + ch / 2) yPos = TOP_CORNER;
+  else if (ry < by + bh - ch / 2) yPos = CENTER;
+  else if (ry < by + bh) yPos = BOTTOM_CORNER;
+  else yPos = BOTTOM;
+
+  const pos = xPos | yPos;
+
+  // Compute anchor point for each of the 25 position cases
+  let ax: number, ay: number;
+  let side: string;
+
+  switch (pos) {
+    // --- 4 pure corners: anchor at 45° point on corner arc ---
+    case LEFT | TOP:
+      ax = bx + cw / 2 - COSPI4 * (cw / 2);
+      ay = by + ch / 2 - COSPI4 * (ch / 2);
+      side = 'tc'; break;
+    case RIGHT | TOP:
+      ax = bx + bw - cw / 2 + COSPI4 * (cw / 2);
+      ay = by + ch / 2 - COSPI4 * (ch / 2);
+      side = 'tr'; break;
+    case LEFT | BOTTOM:
+      ax = bx + cw / 2 - COSPI4 * (cw / 2);
+      ay = by + bh - ch / 2 + COSPI4 * (ch / 2);
+      side = 'bc'; break;
+    case RIGHT | BOTTOM:
+      ax = bx + bw - cw / 2 + COSPI4 * (cw / 2);
+      ay = by + bh - ch / 2 + COSPI4 * (ch / 2);
+      side = 'br'; break;
+
+    // --- 4 straight edges: project reference onto edge ---
+    case MIDDLE | TOP:
+      ax = rx; ay = by; side = 'tc'; break;
+    case MIDDLE | BOTTOM:
+      ax = rx; ay = by + bh; side = 'bc'; break;
+    case LEFT | CENTER:
+      ax = bx; ay = ry; side = 'ml'; break;
+    case RIGHT | CENTER:
+      ax = bx + bw; ay = ry; side = 'mr'; break;
+
+    // --- 8 corner-edge transitions: anchor on the corner ellipse arc ---
+    case LEFT_CORNER | TOP: {
+      const dx = bx + cw / 2 - rx;
+      ax = rx;
+      ay = by + ch / 2 - Math.sin(Math.acos(Math.min(1, dx / (cw / 2)))) * (ch / 2);
+      side = 'tc'; break;
+    }
+    case RIGHT_CORNER | TOP: {
+      const dx = bx + bw - cw / 2 - rx;
+      ax = rx;
+      ay = by + ch / 2 - Math.sin(Math.acos(Math.min(1, Math.abs(dx) / (cw / 2)))) * (ch / 2);
+      side = 'tc'; break;
+    }
+    case LEFT_CORNER | BOTTOM: {
+      const dx = bx + cw / 2 - rx;
+      ax = rx;
+      ay = by + bh - ch / 2 + Math.sin(Math.acos(Math.min(1, dx / (cw / 2)))) * (ch / 2);
+      side = 'bc'; break;
+    }
+    case RIGHT_CORNER | BOTTOM: {
+      const dx = bx + bw - cw / 2 - rx;
+      ax = rx;
+      ay = by + bh - ch / 2 + Math.sin(Math.acos(Math.min(1, Math.abs(dx) / (cw / 2)))) * (ch / 2);
+      side = 'bc'; break;
+    }
+    case LEFT | TOP_CORNER: {
+      const dy = by + ch / 2 - ry;
+      ax = bx + cw / 2 - Math.cos(Math.asin(Math.min(1, dy / (ch / 2)))) * (cw / 2);
+      ay = ry;
+      side = 'ml'; break;
+    }
+    case RIGHT | TOP_CORNER: {
+      const dy = by + ch / 2 - ry;
+      ax = bx + bw - cw / 2 + Math.cos(Math.asin(Math.min(1, dy / (ch / 2)))) * (cw / 2);
+      ay = ry;
+      side = 'mr'; break;
+    }
+    case LEFT | BOTTOM_CORNER: {
+      const dy = by + bh - ch / 2 - ry;
+      ax = bx + cw / 2 - Math.cos(Math.asin(Math.min(1, Math.abs(dy) / (ch / 2)))) * (cw / 2);
+      ay = ry;
+      side = 'ml'; break;
+    }
+    case RIGHT | BOTTOM_CORNER: {
+      const dy = by + bh - ch / 2 - ry;
+      ax = bx + bw - cw / 2 + Math.cos(Math.asin(Math.min(1, Math.abs(dy) / (ch / 2)))) * (cw / 2);
+      ay = ry;
+      side = 'mr'; break;
+    }
+
+    // --- 8 inner zones (reference inside the element) ---
+    // These produce the same result as adjacent straight edges
+    case MIDDLE | CENTER:
+      ax = bx + bw / 2; ay = by; side = 'tc'; break;
+    case LEFT_CORNER | CENTER:
+      ax = bx; ay = ry; side = 'ml'; break;
+    case RIGHT_CORNER | CENTER:
+      ax = bx + bw; ay = ry; side = 'mr'; break;
+    case MIDDLE | TOP_CORNER:
+      ax = rx; ay = by; side = 'tc'; break;
+    case MIDDLE | BOTTOM_CORNER:
+      ax = rx; ay = by + bh; side = 'bc'; break;
+    case LEFT_CORNER | TOP_CORNER:
+      ax = bx; ay = by; side = 'tc'; break;
+    case RIGHT_CORNER | TOP_CORNER:
+      ax = bx + bw; ay = by; side = 'tr'; break;
+    case LEFT_CORNER | BOTTOM_CORNER:
+      ax = bx; ay = by + bh; side = 'bc'; break;
+    case RIGHT_CORNER | BOTTOM_CORNER:
+      ax = bx + bw; ay = by + bh; side = 'br'; break;
+
+    default:
+      ax = bx + bw / 2; ay = by; side = 'tc'; break;
+  }
+
+  return { x: ax, y: ay, side };
+}
+
+/**
+ * ChopboxAnchor — smooth line-intersection anchor (Archi's default for connections
+ * without USE_ORTHOGONAL_ANCHOR preference). Draws a line from element center to
+ * the reference point and finds where it intersects the element boundary.
+ * The exit point slides smoothly along edges — no jumping between edges.
+ */
+function chopboxAnchor(el: ModelElement, ref: Point): Anchor {
+  const cx = el.x + el.w / 2, cy = el.y + el.h / 2;
+  const dx = ref.x - cx, dy = ref.y - cy;
+
+  if (Math.abs(dx) < 0.5 && Math.abs(dy) < 0.5) {
     return { x: cx, y: el.y, side: 'tc' };
   }
 
   const hw = el.w / 2, hh = el.h / 2;
-  const adx = Math.abs(dx), ady = Math.abs(dy);
+  // Find intersection of center→ref line with rectangle boundary
+  // Scale factors to reach each edge
+  const tx = hw / Math.abs(dx || 0.001);
+  const ty = hh / Math.abs(dy || 0.001);
+  const t = Math.min(tx, ty);
 
-  // Decide which edge the line should exit from.
-  // Use the angle of the direction relative to the rect's aspect ratio.
-  // Bias toward top/bottom to match typical top-to-bottom ArchiMate flow:
-  // we only pick left/right when the direction is strongly horizontal.
-  const angle = Math.atan2(ady, adx); // 0 = horizontal, PI/2 = vertical
-  const aspectAngle = Math.atan2(hh, hw); // angle of the rect diagonal
+  let ix = cx + dx * t;
+  let iy = cy + dy * t;
 
-  let ix: number, iy: number, side: string;
+  // Clamp to bounds (numerical safety)
+  ix = Math.max(el.x, Math.min(el.x + el.w, ix));
+  iy = Math.max(el.y, Math.min(el.y + el.h, iy));
 
-  if (angle >= aspectAngle) {
-    // Dominant vertical — exit through top or bottom, x follows the line
-    const t = hh / ady;
-    ix = cx + dx * t;
-    iy = dy > 0 ? el.y + el.h : el.y;
-    // Clamp x to stay within the element bounds
-    ix = Math.max(el.x, Math.min(el.x + el.w, ix));
-    side = dy > 0 ? 'bc' : 'tc';
-  } else {
-    // Dominant horizontal — exit through left or right, y follows the line
-    const t = hw / adx;
-    iy = cy + dy * t;
-    ix = dx > 0 ? el.x + el.w : el.x;
-    // Clamp y to stay within the element bounds
-    iy = Math.max(el.y, Math.min(el.y + el.h, iy));
-    side = dx > 0 ? 'mr' : 'ml';
-  }
+  // Determine side
+  let side: string;
+  if (Math.abs(iy - el.y) < 0.5) side = 'tc';
+  else if (Math.abs(iy - (el.y + el.h)) < 0.5) side = 'bc';
+  else if (Math.abs(ix - el.x) < 0.5) side = 'ml';
+  else side = 'mr';
 
   return { x: ix, y: iy, side };
 }
 
 /**
  * Snap an arbitrary point to the nearest point on an element's boundary.
+ * Used for manually placed anchor points.
  */
 function snapToEdge(el: ModelElement, p: Point): Anchor {
-  const cx = el.x + el.w / 2, cy = el.y + el.h / 2;
-  // Candidates: project onto each of the 4 edges, pick closest
   const candidates: { x: number; y: number; side: string; d: number }[] = [];
-  // Top edge
   const tx = Math.max(el.x, Math.min(el.x + el.w, p.x));
   candidates.push({ x: tx, y: el.y, side: 'tc', d: Math.hypot(p.x - tx, p.y - el.y) });
-  // Bottom edge
   const bx = Math.max(el.x, Math.min(el.x + el.w, p.x));
   candidates.push({ x: bx, y: el.y + el.h, side: 'bc', d: Math.hypot(p.x - bx, p.y - (el.y + el.h)) });
-  // Left edge
   const ly = Math.max(el.y, Math.min(el.y + el.h, p.y));
   candidates.push({ x: el.x, y: ly, side: 'ml', d: Math.hypot(p.x - el.x, p.y - ly) });
-  // Right edge
   const ry = Math.max(el.y, Math.min(el.y + el.h, p.y));
   candidates.push({ x: el.x + el.w, y: ry, side: 'mr', d: Math.hypot(p.x - (el.x + el.w), p.y - ry) });
-
   candidates.sort((a, b) => a.d - b.d);
   return { x: candidates[0].x, y: candidates[0].y, side: candidates[0].side };
 }
@@ -131,25 +295,100 @@ export function getRelPoints(rel: ModelRelationship, elements: ModelElement[], e
   const tgt = elementMap ? elementMap.get(rel.targetId) : elements.find(e => e.id === rel.targetId);
   if (!src || !tgt) return null;
 
-  const sc = { x: src.x + src.w / 2, y: src.y + src.h / 2 };
-  const tc = { x: tgt.x + tgt.w / 2, y: tgt.y + tgt.h / 2 };
-  const waypoints = (rel.waypoints || []).map(wp => ({ x: wp.x, y: wp.y }));
+  const tgtCenter = { x: tgt.x + tgt.w / 2, y: tgt.y + tgt.h / 2 };
+  const srcCenter = { x: src.x + src.w / 2, y: src.y + src.h / 2 };
+
+  // Resolve waypoints: if we have Archi-style relative bendpoints, resolve them
+  // dynamically from CURRENT source/target centers. This is how Archi works —
+  // bendpoints are offsets, not absolute positions, so they track element movement.
+  let waypoints: Point[];
+  if (rel.relativeBendpoints && rel.relativeBendpoints.length > 0) {
+    const total = rel.relativeBendpoints.length;
+    waypoints = rel.relativeBendpoints.map((bp, i) => {
+      const weight = (i + 1) / (total + 1);
+      const fromSrc = { x: srcCenter.x + bp.startX, y: srcCenter.y + bp.startY };
+      const fromTgt = { x: tgtCenter.x + bp.endX, y: tgtCenter.y + bp.endY };
+      return {
+        x: fromSrc.x * (1 - weight) + fromTgt.x * weight,
+        y: fromSrc.y * (1 - weight) + fromTgt.y * weight,
+      };
+    });
+  } else {
+    waypoints = (rel.waypoints || []).map(wp => ({ x: wp.x, y: wp.y }));
+  }
 
   let sA: Anchor, tA: Anchor;
 
-  if (rel.sourceAnchor) {
-    // Manual anchor — snap to nearest edge point
-    sA = snapToEdge(src, rel.sourceAnchor);
+  if (waypoints.length > 0) {
+    // Connections WITH waypoints: OrthogonalAnchor for clean 90° routing
+    sA = rel.sourceAnchor ? snapToEdge(src, rel.sourceAnchor) : orthogonalAnchor(src, waypoints[0]);
+    tA = rel.targetAnchor ? snapToEdge(tgt, rel.targetAnchor) : orthogonalAnchor(tgt, waypoints[waypoints.length - 1]);
+  } else if (rel.sourceAnchor || rel.targetAnchor) {
+    sA = rel.sourceAnchor ? snapToEdge(src, rel.sourceAnchor) : chopboxAnchor(src, tgtCenter);
+    tA = rel.targetAnchor ? snapToEdge(tgt, rel.targetAnchor) : chopboxAnchor(tgt, srcCenter);
   } else {
-    const srcTarget = waypoints.length > 0 ? waypoints[0] : tc;
-    sA = rectEdgeIntersect(src, srcTarget);
-  }
+    // Connections WITHOUT waypoints: forced orthogonal routing.
+    // Determine dominant axis from element centers and create a straight
+    // horizontal or vertical connection that stays on-axis.
+    const dx = tgtCenter.x - srcCenter.x;
+    const dy = tgtCenter.y - srcCenter.y;
 
-  if (rel.targetAnchor) {
-    tA = snapToEdge(tgt, rel.targetAnchor);
-  } else {
-    const tgtTarget = waypoints.length > 0 ? waypoints[waypoints.length - 1] : sc;
-    tA = rectEdgeIntersect(tgt, tgtTarget);
+    // Check if elements overlap on each axis
+    const overlapX = src.x < tgt.x + tgt.w && tgt.x < src.x + src.w;
+    const overlapY = src.y < tgt.y + tgt.h && tgt.y < src.y + src.h;
+
+    if (overlapX && !overlapY) {
+      // Vertically stacked — vertical connection at shared X
+      const sharedX = Math.max(src.x, tgt.x) + (Math.min(src.x + src.w, tgt.x + tgt.w) - Math.max(src.x, tgt.x)) / 2;
+      const clampedSrcX = Math.max(src.x, Math.min(src.x + src.w, sharedX));
+      const clampedTgtX = Math.max(tgt.x, Math.min(tgt.x + tgt.w, sharedX));
+      if (dy > 0) {
+        sA = { x: clampedSrcX, y: src.y + src.h, side: 'bc' };
+        tA = { x: clampedTgtX, y: tgt.y, side: 'tc' };
+      } else {
+        sA = { x: clampedSrcX, y: src.y, side: 'tc' };
+        tA = { x: clampedTgtX, y: tgt.y + tgt.h, side: 'bc' };
+      }
+    } else if (overlapY && !overlapX) {
+      // Side by side — horizontal connection at shared Y
+      const sharedY = Math.max(src.y, tgt.y) + (Math.min(src.y + src.h, tgt.y + tgt.h) - Math.max(src.y, tgt.y)) / 2;
+      const clampedSrcY = Math.max(src.y, Math.min(src.y + src.h, sharedY));
+      const clampedTgtY = Math.max(tgt.y, Math.min(tgt.y + tgt.h, sharedY));
+      if (dx > 0) {
+        sA = { x: src.x + src.w, y: clampedSrcY, side: 'mr' };
+        tA = { x: tgt.x, y: clampedTgtY, side: 'ml' };
+      } else {
+        sA = { x: src.x, y: clampedSrcY, side: 'ml' };
+        tA = { x: tgt.x + tgt.w, y: clampedTgtY, side: 'mr' };
+      }
+    } else {
+      // No axis overlap or full overlap — use dominant direction
+      if (Math.abs(dx) >= Math.abs(dy)) {
+        // Horizontal dominant — exit right/left, shared Y at midpoint
+        const midY = (srcCenter.y + tgtCenter.y) / 2;
+        const clampedSrcY = Math.max(src.y, Math.min(src.y + src.h, midY));
+        const clampedTgtY = Math.max(tgt.y, Math.min(tgt.y + tgt.h, midY));
+        if (dx > 0) {
+          sA = { x: src.x + src.w, y: clampedSrcY, side: 'mr' };
+          tA = { x: tgt.x, y: clampedTgtY, side: 'ml' };
+        } else {
+          sA = { x: src.x, y: clampedSrcY, side: 'ml' };
+          tA = { x: tgt.x + tgt.w, y: clampedTgtY, side: 'mr' };
+        }
+      } else {
+        // Vertical dominant — exit bottom/top, shared X at midpoint
+        const midX = (srcCenter.x + tgtCenter.x) / 2;
+        const clampedSrcX = Math.max(src.x, Math.min(src.x + src.w, midX));
+        const clampedTgtX = Math.max(tgt.x, Math.min(tgt.x + tgt.w, midX));
+        if (dy > 0) {
+          sA = { x: clampedSrcX, y: src.y + src.h, side: 'bc' };
+          tA = { x: clampedTgtX, y: tgt.y, side: 'tc' };
+        } else {
+          sA = { x: clampedSrcX, y: src.y, side: 'tc' };
+          tA = { x: clampedTgtX, y: tgt.y + tgt.h, side: 'bc' };
+        }
+      }
+    }
   }
 
   return { start: sA, end: tA, waypoints };
@@ -219,28 +458,30 @@ export function nearestTOnPath(allPts: Point[], wx: number, wy: number): number 
 // Hit testing
 // ============================================================
 
-export function hitTestElement(elements: ModelElement[], wx: number, wy: number, getLayer: (type: string) => string | undefined, isNote: (type: string) => boolean): ModelElement | null {
-  // Non-composite first (they're on top)
+export function hitTestElement(elements: ModelElement[], wx: number, wy: number, _getLayer: (type: string) => string | undefined, _isNote: (type: string) => boolean): ModelElement | null {
+  // Elements array is sorted by draw order (back to front).
+  // Iterate in reverse to hit the topmost (frontmost) element first.
   for (let i = elements.length - 1; i >= 0; i--) {
     const el = elements[i];
-    if (getLayer(el.type) === 'composite' && !isNote(el.type)) continue;
-    if (wx >= el.x && wx <= el.x + el.w && wy >= el.y && wy <= el.y + el.h) return el;
-  }
-  // Then composite
-  for (let i = elements.length - 1; i >= 0; i--) {
-    const el = elements[i];
-    if (!(getLayer(el.type) === 'composite' && !isNote(el.type))) continue;
     if (wx >= el.x && wx <= el.x + el.w && wy >= el.y && wy <= el.y + el.h) return el;
   }
   return null;
 }
 
-export function hitTestAnchor(elements: ModelElement[], wx: number, wy: number, getLayer: (type: string) => string | undefined, isNote: (type: string) => boolean): { elId: string; side: string } | null {
+export function hitTestAnchor(elements: ModelElement[], wx: number, wy: number, _getLayer: (type: string) => string | undefined, _isNote: (type: string) => boolean): { elId: string; side: string } | null {
+  // Archi-style: detect when cursor is near an element's edge (within margin).
+  // Any point on the edge is a valid connection anchor.
+  // Iterate in reverse draw order (topmost first).
+  const edgeMargin = 8;
   for (let i = elements.length - 1; i >= 0; i--) {
     const el = elements[i];
-    if (getLayer(el.type) === 'composite' && !isNote(el.type)) continue;
-    for (const a of getAnchors(el)) {
-      if (Math.hypot(a.x - wx, a.y - wy) < 8) return { elId: el.id, side: a.side };
+    const inOuter = wx >= el.x - edgeMargin && wx <= el.x + el.w + edgeMargin &&
+                    wy >= el.y - edgeMargin && wy <= el.y + el.h + edgeMargin;
+    const inInner = wx > el.x + edgeMargin && wx < el.x + el.w - edgeMargin &&
+                    wy > el.y + edgeMargin && wy < el.y + el.h - edgeMargin;
+    if (inOuter && !inInner) {
+      const snapped = snapToEdge(el, { x: wx, y: wy });
+      return { elId: el.id, side: snapped.side };
     }
   }
   return null;
@@ -282,6 +523,18 @@ export function hitTestRelationship(relationships: ModelRelationship[], elements
   return null;
 }
 
+/** Determine if a relationship segment is horizontal or vertical */
+export function getSegmentOrientation(rel: ModelRelationship, elements: ModelElement[], segIdx: number, elementMap?: Map<string, ModelElement>): 'h' | 'v' | null {
+  const pts = getRelPoints(rel, elements, elementMap);
+  if (!pts) return null;
+  const all = [pts.start, ...pts.waypoints, pts.end];
+  if (segIdx < 0 || segIdx >= all.length - 1) return null;
+  const a = all[segIdx], b = all[segIdx + 1];
+  const dx = Math.abs(b.x - a.x), dy = Math.abs(b.y - a.y);
+  // Horizontal segment → drag moves it vertically; Vertical → drag moves horizontally
+  return dx >= dy ? 'h' : 'v';
+}
+
 export function hitTestLabel(relationships: ModelRelationship[], elements: ModelElement[], wx: number, wy: number): ModelRelationship | null {
   for (const rel of relationships) {
     if (!rel.name) continue;
@@ -315,7 +568,7 @@ export function getResizeHandles(el: ModelElement): { handle: ResizeHandle; x: n
 
 export function hitTestResizeHandle(el: ModelElement, wx: number, wy: number): ResizeHandle | null {
   for (const h of getResizeHandles(el)) {
-    if (Math.hypot(h.x - wx, h.y - wy) < 7) return h.handle;
+    if (Math.hypot(h.x - wx, h.y - wy) < 9) return h.handle;
   }
   return null;
 }
@@ -461,60 +714,151 @@ export function snapResizeToElements(
   handle: ResizeHandle,
   others: ModelElement[],
   threshold: number = SNAP_THRESHOLD,
+  resizingType?: string,
 ): SnapResult & { w: number; h: number } {
   const guides: SnapGuide[] = [];
   let { x, y, w, h } = proposed;
 
-  // Which edges are being resized?
   const resizingLeft   = handle.includes('w');
   const resizingRight  = handle.includes('e');
   const resizingTop    = handle.includes('n');
   const resizingBottom = handle.includes('s');
+  const resizingW = resizingLeft || resizingRight;
+  const resizingH = resizingTop || resizingBottom;
+
+  // Phase 1: Snap to SIZE of same-type elements first.
+  // When resizing, match the width/height of elements with the same ArchiMate type/layer.
+  // This is prioritized over edge alignment.
+  let bestWidthSnap: { target: number; dist: number } | null = null;
+  let bestHeightSnap: { target: number; dist: number } | null = null;
+
+  if (resizingType) {
+    for (const other of others) {
+      if (other.type === resizingType) {
+        // Match width
+        if (resizingW) {
+          const d = Math.abs(w - other.w);
+          if (d < threshold && d > 0 && (!bestWidthSnap || d < bestWidthSnap.dist)) {
+            bestWidthSnap = { target: other.w, dist: d };
+          }
+        }
+        // Match height
+        if (resizingH) {
+          const d = Math.abs(h - other.h);
+          if (d < threshold && d > 0 && (!bestHeightSnap || d < bestHeightSnap.dist)) {
+            bestHeightSnap = { target: other.h, dist: d };
+          }
+        }
+      }
+    }
+  }
+
+  // Also try matching size of ANY element (lower priority — only if no same-type match)
+  if (!bestWidthSnap && resizingW) {
+    for (const other of others) {
+      const d = Math.abs(w - other.w);
+      if (d < threshold && d > 0 && (!bestWidthSnap || d < bestWidthSnap.dist)) {
+        bestWidthSnap = { target: other.w, dist: d };
+      }
+    }
+  }
+  if (!bestHeightSnap && resizingH) {
+    for (const other of others) {
+      const d = Math.abs(h - other.h);
+      if (d < threshold && d > 0 && (!bestHeightSnap || d < bestHeightSnap.dist)) {
+        bestHeightSnap = { target: other.h, dist: d };
+      }
+    }
+  }
+
+  // Apply size snaps
+  if (bestWidthSnap) {
+    if (resizingLeft) { x = x + w - bestWidthSnap.target; }
+    w = bestWidthSnap.target;
+  }
+  if (bestHeightSnap) {
+    if (resizingTop) { y = y + h - bestHeightSnap.target; }
+    h = bestHeightSnap.target;
+  }
+
+  // Phase 2: Snap resizing edges to other element edges/centers
+  let bestLeftSnap: { target: number; dist: number } | null = null;
+  let bestRightSnap: { target: number; dist: number } | null = null;
+  let bestTopSnap: { target: number; dist: number } | null = null;
+  let bestBottomSnap: { target: number; dist: number } | null = null;
+
+  const pRight = x + w, pBottom = y + h;
 
   for (const other of others) {
-    const oLeft   = other.x;
-    const oRight  = other.x + other.w;
-    const oTop    = other.y;
-    const oBottom = other.y + other.h;
+    const oLeft = other.x, oRight = other.x + other.w;
+    const oTop = other.y, oBottom = other.y + other.h;
+    const oCx = other.x + other.w / 2, oCy = other.y + other.h / 2;
 
     if (resizingLeft) {
-      for (const target of [oLeft, oRight]) {
-        if (Math.abs(x - target) < threshold) {
-          const diff = target - x;
-          x += diff;
-          w -= diff;
-          guides.push({ axis: 'x', value: target, type: 'edge' });
-        }
+      for (const t of [oLeft, oRight, oCx]) {
+        const d = Math.abs(x - t);
+        if (d < threshold && (!bestLeftSnap || d < bestLeftSnap.dist)) bestLeftSnap = { target: t, dist: d };
       }
     }
     if (resizingRight) {
-      const right = x + w;
-      for (const target of [oLeft, oRight]) {
-        if (Math.abs(right - target) < threshold) {
-          w = target - x;
-          guides.push({ axis: 'x', value: target, type: 'edge' });
-        }
+      for (const t of [oLeft, oRight, oCx]) {
+        const d = Math.abs(pRight - t);
+        if (d < threshold && (!bestRightSnap || d < bestRightSnap.dist)) bestRightSnap = { target: t, dist: d };
       }
     }
     if (resizingTop) {
-      for (const target of [oTop, oBottom]) {
-        if (Math.abs(y - target) < threshold) {
-          const diff = target - y;
-          y += diff;
-          h -= diff;
-          guides.push({ axis: 'y', value: target, type: 'edge' });
-        }
+      for (const t of [oTop, oBottom, oCy]) {
+        const d = Math.abs(y - t);
+        if (d < threshold && (!bestTopSnap || d < bestTopSnap.dist)) bestTopSnap = { target: t, dist: d };
       }
     }
     if (resizingBottom) {
-      const bottom = y + h;
-      for (const target of [oTop, oBottom]) {
-        if (Math.abs(bottom - target) < threshold) {
-          h = target - y;
-          guides.push({ axis: 'y', value: target, type: 'edge' });
-        }
+      for (const t of [oTop, oBottom, oCy]) {
+        const d = Math.abs(pBottom - t);
+        if (d < threshold && (!bestBottomSnap || d < bestBottomSnap.dist)) bestBottomSnap = { target: t, dist: d };
       }
     }
+  }
+
+  // Apply edge snaps (only if closer than size snap)
+  if (bestLeftSnap) { const diff = bestLeftSnap.target - x; x += diff; w -= diff; }
+  if (bestRightSnap) { w = bestRightSnap.target - x; }
+  if (bestTopSnap) { const diff = bestTopSnap.target - y; y += diff; h -= diff; }
+  if (bestBottomSnap) { h = bestBottomSnap.target - y; }
+
+  // Build guide lines
+  const snappedRight = x + w, snappedBottom = y + h;
+
+  // Size-match guides: show guides on elements whose size was matched
+  if (bestWidthSnap) {
+    for (const other of others) {
+      if (Math.abs(w - other.w) < 1) {
+        guides.push({ axis: 'x', value: other.x, type: 'edge' });
+        guides.push({ axis: 'x', value: other.x + other.w, type: 'edge' });
+      }
+    }
+  }
+  if (bestHeightSnap) {
+    for (const other of others) {
+      if (Math.abs(h - other.h) < 1) {
+        guides.push({ axis: 'y', value: other.y, type: 'edge' });
+        guides.push({ axis: 'y', value: other.y + other.h, type: 'edge' });
+      }
+    }
+  }
+
+  // Edge-alignment guides
+  for (const other of others) {
+    const oLeft = other.x, oRight = other.x + other.w, oCx = other.x + other.w / 2;
+    const oTop = other.y, oBottom = other.y + other.h, oCy = other.y + other.h / 2;
+    if (bestLeftSnap && (Math.abs(x - oLeft) < 1 || Math.abs(x - oRight) < 1)) guides.push({ axis: 'x', value: x, type: 'edge' });
+    if (bestLeftSnap && Math.abs(x - oCx) < 1) guides.push({ axis: 'x', value: x, type: 'center' });
+    if (bestRightSnap && (Math.abs(snappedRight - oLeft) < 1 || Math.abs(snappedRight - oRight) < 1)) guides.push({ axis: 'x', value: snappedRight, type: 'edge' });
+    if (bestRightSnap && Math.abs(snappedRight - oCx) < 1) guides.push({ axis: 'x', value: snappedRight, type: 'center' });
+    if (bestTopSnap && (Math.abs(y - oTop) < 1 || Math.abs(y - oBottom) < 1)) guides.push({ axis: 'y', value: y, type: 'edge' });
+    if (bestTopSnap && Math.abs(y - oCy) < 1) guides.push({ axis: 'y', value: y, type: 'center' });
+    if (bestBottomSnap && (Math.abs(snappedBottom - oTop) < 1 || Math.abs(snappedBottom - oBottom) < 1)) guides.push({ axis: 'y', value: snappedBottom, type: 'edge' });
+    if (bestBottomSnap && Math.abs(snappedBottom - oCy) < 1) guides.push({ axis: 'y', value: snappedBottom, type: 'center' });
   }
 
   // Also snap to match width/height of other elements

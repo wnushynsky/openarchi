@@ -1,13 +1,13 @@
 import type { ModelElement, ModelRelationship, LayerDef } from '../types';
-import { LAYERS, NOTE_STYLE, ELEMENT_TYPES, RELATIONSHIP_TYPES, ICONS, ICON_MAP } from '../core/metamodel';
+import { LAYERS, NOTE_STYLE, ELEMENT_TYPES, RELATIONSHIP_TYPES, ICON_MAP, drawIcon } from '../core/metamodel';
 import { GRID, FONT, getAnchors, getRelPoints, pointOnPath, getResizeHandles, type SnapGuide } from '../core/geometry';
 
 const VIEW_REFERENCE_STYLE: LayerDef = {
   label: 'View',
-  fill: '#ECEDEF',
-  stroke: '#A8ACB2',
-  accent: '#7E848D',
-  text: '#4C525B',
+  fill: '#E4E6EA',
+  stroke: '#8A9098',
+  accent: '#687078',
+  text: '#3A4048',
 };
 
 // ============================================================
@@ -22,6 +22,81 @@ export function rrect(ctx: CanvasRenderingContext2D, x: number, y: number, w: nu
   ctx.quadraticCurveTo(x, y + h, x, y + h - r); ctx.lineTo(x, y + r);
   ctx.quadraticCurveTo(x, y, x + r, y);
   ctx.closePath();
+}
+
+// ============================================================
+// Rounded Polyline — smooth arcs at bendpoints (matches Archi)
+// ============================================================
+
+const MAX_CURVE_RADIUS = 6;
+const CURVE_SEGMENTS = 4;
+
+/**
+ * Draw a polyline with smooth arcs at each interior point.
+ * Port of Archi's RoundedPolylineConnection.outlineShape().
+ * At each bendpoint, the sharp corner is replaced by an arc
+ * with radius up to MAX_CURVE_RADIUS (capped at half the shorter segment).
+ */
+function drawRoundedPolyline(ctx: CanvasRenderingContext2D, pts: { x: number; y: number }[]): void {
+  if (pts.length < 2) return;
+  ctx.beginPath();
+
+  if (pts.length === 2) {
+    ctx.moveTo(pts[0].x, pts[0].y);
+    ctx.lineTo(pts[1].x, pts[1].y);
+    ctx.stroke();
+    return;
+  }
+
+  ctx.moveTo(pts[0].x, pts[0].y);
+
+  for (let i = 1; i < pts.length - 1; i++) {
+    const prev = pts[i - 1];
+    const cur = pts[i];
+    const next = pts[i + 1];
+
+    // Lengths of incoming and outgoing segments
+    const dIn = Math.hypot(cur.x - prev.x, cur.y - prev.y);
+    const dOut = Math.hypot(next.x - cur.x, next.y - cur.y);
+
+    if (dIn < 1 || dOut < 1) {
+      // Degenerate segment — just line to the point
+      ctx.lineTo(cur.x, cur.y);
+      continue;
+    }
+
+    // Arc radius: min of MAX_CURVE_RADIUS and half the shorter segment
+    const r = Math.min(MAX_CURVE_RADIUS, dIn / 2, dOut / 2);
+
+    // Unit vectors for incoming and outgoing directions
+    const inDx = (cur.x - prev.x) / dIn;
+    const inDy = (cur.y - prev.y) / dIn;
+    const outDx = (next.x - cur.x) / dOut;
+    const outDy = (next.y - cur.y) / dOut;
+
+    // Points where the arc starts and ends (offset from the corner by radius)
+    const arcStartX = cur.x - inDx * r;
+    const arcStartY = cur.y - inDy * r;
+    const arcEndX = cur.x + outDx * r;
+    const arcEndY = cur.y + outDy * r;
+
+    // Draw line to arc start
+    ctx.lineTo(arcStartX, arcStartY);
+
+    // Approximate the arc with intermediate points
+    for (let s = 1; s <= CURVE_SEGMENTS; s++) {
+      const t = s / CURVE_SEGMENTS;
+      // Quadratic bezier-like interpolation through the corner
+      const oneMinusT = 1 - t;
+      const px = oneMinusT * oneMinusT * arcStartX + 2 * oneMinusT * t * cur.x + t * t * arcEndX;
+      const py = oneMinusT * oneMinusT * arcStartY + 2 * oneMinusT * t * cur.y + t * t * arcEndY;
+      ctx.lineTo(px, py);
+    }
+  }
+
+  // Final segment to last point
+  ctx.lineTo(pts[pts.length - 1].x, pts[pts.length - 1].y);
+  ctx.stroke();
 }
 
 // ============================================================
@@ -71,16 +146,26 @@ export function drawLineGrid(ctx: CanvasRenderingContext2D, w: number, h: number
 // Element rendering
 // ============================================================
 
+const JUNCTION_STYLE: LayerDef = {
+  label: 'Junction',
+  fill: '#444',
+  stroke: '#222',
+  accent: '#666',
+  text: '#fff',
+};
+
 function getLayerStyle(type: string): LayerDef {
   if (ELEMENT_TYPES[type]?.isNote) return NOTE_STYLE;
   if (type === 'viewReference') return VIEW_REFERENCE_STYLE;
+  if (type === 'andJunction' || type === 'orJunction') return JUNCTION_STYLE;
   return LAYERS[ELEMENT_TYPES[type]?.layer] || LAYERS.composite;
 }
 
-export function drawElement(ctx: CanvasRenderingContext2D, el: ModelElement, isSel: boolean, isHov: boolean, showAnch: boolean, hasChildren: boolean = false) {
+export function drawElement(ctx: CanvasRenderingContext2D, el: ModelElement, isSel: boolean, showAnch: boolean, hasChildren: boolean = false) {
   const isNote = ELEMENT_TYPES[el.type]?.isNote;
   const isViewReference = el.type === 'viewReference';
-  const isComposite = ELEMENT_TYPES[el.type]?.layer === 'composite' && !isNote;
+  const isJunction = el.type === 'andJunction' || el.type === 'orJunction';
+  const isComposite = ELEMENT_TYPES[el.type]?.layer === 'composite' && !isNote && !isJunction;
   const L = getLayerStyle(el.type);
   const { x, y, w, h } = el;
   const r = isNote ? 3 : (ELEMENT_TYPES[el.type]?.shape === 'round' ? 10 : 3);
@@ -89,18 +174,18 @@ export function drawElement(ctx: CanvasRenderingContext2D, el: ModelElement, isS
 
   // Shadow
   if (!isComposite) {
-    ctx.shadowColor = isSel ? 'rgba(37,99,235,0.14)' : 'rgba(0,0,0,0.05)';
-    ctx.shadowBlur = isSel ? 12 : 4;
-    ctx.shadowOffsetY = isSel ? 1 : 1;
+    ctx.shadowColor = isSel ? 'rgba(74,85,104,0.18)' : 'rgba(0,0,0,0.10)';
+    ctx.shadowBlur = isSel ? 14 : 6;
+    ctx.shadowOffsetY = isSel ? 2 : 1;
   }
 
   rrect(ctx, x, y, w, h, r);
 
   if (isNote) {
-    ctx.fillStyle = L.fill; ctx.fill();
+    ctx.fillStyle = el.style?.fillColor || L.fill; ctx.fill();
     ctx.shadowColor = 'transparent';
     ctx.lineWidth = isSel ? 2 : 1;
-    ctx.strokeStyle = isSel ? '#2563eb' : L.stroke;
+    ctx.strokeStyle = isSel ? '#4a5568' : (el.style?.lineColor || L.stroke);
     ctx.stroke();
 
     // Folded corner icon (top-right)
@@ -113,10 +198,10 @@ export function drawElement(ctx: CanvasRenderingContext2D, el: ModelElement, isS
     ctx.fillStyle = '#D8D8DC'; ctx.fill();
     ctx.strokeStyle = L.stroke; ctx.lineWidth = 0.6; ctx.stroke();
 
-    ctx.fillStyle = L.text;
-    ctx.font = `400 14px ${FONT}`;
+    ctx.fillStyle = el.style?.fontColor || L.text;
+    ctx.font = `400 11px ${FONT}`;
     ctx.textAlign = 'left'; ctx.textBaseline = 'top';
-    const pad = 12, mw = w - pad * 2;
+    const pad = 8, mw = w - pad * 2;
     const words = (el.name || 'Note').split(' ');
     const lines: string[] = [];
     let cur = '';
@@ -126,54 +211,75 @@ export function drawElement(ctx: CanvasRenderingContext2D, el: ModelElement, isS
     }
     if (cur) lines.push(cur);
     lines.forEach((ln, i) => ctx.fillText(ln, x + pad, y + pad + i * 19));
+  } else if (isJunction) {
+    // Junction: small filled circle (AND=black, OR=white with border)
+    ctx.shadowColor = 'transparent';
+    const cx = x + w / 2, cy = y + h / 2;
+    const radius = Math.min(w, h) / 2.5;
+    ctx.beginPath();
+    ctx.arc(cx, cy, radius, 0, Math.PI * 2);
+    if (el.type === 'orJunction') {
+      ctx.fillStyle = '#fff'; ctx.fill();
+      ctx.lineWidth = isSel ? 2.5 : 2;
+      ctx.strokeStyle = isSel ? '#4a5568' : '#444';
+      ctx.stroke();
+    } else {
+      ctx.fillStyle = isSel ? '#4a5568' : '#444';
+      ctx.fill();
+    }
   } else if (isComposite) {
-    ctx.fillStyle = 'rgba(255,255,255,0.02)'; ctx.fill();
+    ctx.fillStyle = el.style?.fillColor || 'rgba(255,255,255,0.02)'; ctx.fill();
     ctx.shadowColor = 'transparent';
     ctx.setLineDash([5, 4]); ctx.lineWidth = 1.2;
-    ctx.strokeStyle = isSel ? '#2563eb' : '#b0b0b8';
+    ctx.strokeStyle = isSel ? '#4a5568' : (el.style?.lineColor || '#b0b0b8');
     ctx.stroke(); ctx.setLineDash([]);
 
-    ctx.font = `400 14px ${FONT}`;
+    ctx.font = `400 11px ${FONT}`;
     ctx.fillStyle = '#606060'; ctx.textAlign = 'left'; ctx.textBaseline = 'top';
-    ctx.fillText(el.name || 'Group', x + 12, y + 10);
+    ctx.fillText(el.name || 'Group', x + 8, y + 8);
 
     // Icon (top-right corner)
     const cIconKey = ICON_MAP[el.type];
     if (cIconKey) {
-      const cDrawFn = ICONS[cIconKey];
-      if (cDrawFn) {
-        ctx.save();
-        ctx.beginPath();
-        cDrawFn(ctx, x + w - 15, y + 14, 9);
-        ctx.strokeStyle = '#999'; ctx.lineWidth = 1.5;
-        ctx.lineJoin = 'round'; ctx.lineCap = 'round';
-        ctx.setLineDash([]); ctx.stroke();
-        ctx.restore();
-      }
+      ctx.save();
+      ctx.setLineDash([]);
+      drawIcon(ctx, cIconKey, x + w - 14, y + 13, 16, '#606068');
+      ctx.restore();
     }
   } else {
-    ctx.fillStyle = L.fill; ctx.fill();
+    ctx.fillStyle = el.style?.fillColor || L.fill; ctx.fill();
     ctx.shadowColor = 'transparent';
-    ctx.lineWidth = isSel ? 2 : 1;
-    ctx.strokeStyle = isSel ? '#2563eb' : L.stroke;
+    ctx.lineWidth = isSel ? 2.2 : 1.2;
+    ctx.strokeStyle = isSel ? '#4a5568' : (el.style?.lineColor || L.stroke);
     ctx.stroke();
 
-    if (!isViewReference) {
-      const iconKey = ICON_MAP[el.type] || 'generic';
-      const drawFn = ICONS[iconKey] || ICONS.generic;
+    if (isViewReference) {
+      // View reference: draw a small "navigate" arrow icon (top-right)
       ctx.save();
+      const ix = x + w - 16, iy = y + 15, s = 8;
       ctx.beginPath();
-      drawFn(ctx, x + w - 15, y + 14, 9);
-      ctx.strokeStyle = L.accent; ctx.lineWidth = 1.2;
+      // Folder tab shape
+      ctx.moveTo(ix - s, iy - s * 0.5);
+      ctx.lineTo(ix - s, iy - s);
+      ctx.lineTo(ix - s * 0.2, iy - s);
+      ctx.lineTo(ix + s * 0.1, iy - s * 0.5);
+      ctx.lineTo(ix + s, iy - s * 0.5);
+      ctx.lineTo(ix + s, iy + s);
+      ctx.lineTo(ix - s, iy + s);
+      ctx.closePath();
+      ctx.strokeStyle = L.accent; ctx.lineWidth = 1.4;
       ctx.lineJoin = 'round'; ctx.lineCap = 'round';
       ctx.stroke();
       ctx.restore();
+    } else {
+      const iconKey = ICON_MAP[el.type] || 'generic';
+      drawIcon(ctx, iconKey, x + w - 14, y + 13, 16, L.stroke);
     }
 
     // Label — move to top-left when children overlap this element
-    ctx.fillStyle = L.text;
-    ctx.font = `400 13px ${FONT}`;
-    const mw = w - 28;
+    ctx.fillStyle = el.style?.fontColor || L.text;
+    ctx.font = `400 11px ${FONT}`;
+    const mw = w - 24;
     const displayName = isViewReference ? `View: ${el.name || 'Untitled'}` : (el.name || '');
     const words = displayName.split(' ');
     const lines: string[] = [];
@@ -183,8 +289,8 @@ export function drawElement(ctx: CanvasRenderingContext2D, el: ModelElement, isS
       if (ctx.measureText(t).width > mw && cur) { lines.push(cur); cur = word; } else cur = t;
     }
     if (cur) lines.push(cur);
-    const lh = 17;
-    const availableHeight = Math.max(lh, h - (hasChildren ? 20 : 10));
+    const lh = 14;
+    const availableHeight = Math.max(lh, h - (hasChildren ? 18 : 8));
     const maxLines = Math.max(1, Math.floor(availableHeight / lh));
     const renderLines = lines.slice(0, maxLines);
     if (lines.length > maxLines) {
@@ -210,7 +316,7 @@ export function drawElement(ctx: CanvasRenderingContext2D, el: ModelElement, isS
   }
 
   // Pop-out icon (larger, more visible)
-  if (el.linkedViewId) {
+  if (el.linkedViewId && !isJunction) {
     const px = x + w - 16, py = y + h - 16;
     ctx.save();
     rrect(ctx, px - 8, py - 8, 16, 16, 3);
@@ -225,26 +331,22 @@ export function drawElement(ctx: CanvasRenderingContext2D, el: ModelElement, isS
     ctx.restore();
   }
 
-  // Anchors
-  if (showAnch && !isComposite) {
+  // Anchors — 4 edge midpoints (Archi-style: any edge point is valid, these are visual indicators)
+  if (showAnch && !isComposite && !isJunction) {
     const anchors = getAnchors(el);
-    anchors.forEach((a, i) => {
-      const isPrimary = i < 4;
-      const rad = isPrimary ? 5 : 3.5;
-      ctx.beginPath(); ctx.arc(a.x, a.y, rad, 0, Math.PI * 2);
+    for (const a of anchors) {
+      ctx.beginPath(); ctx.arc(a.x, a.y, 4, 0, Math.PI * 2);
       ctx.fillStyle = '#fff'; ctx.fill();
-      ctx.lineWidth = isPrimary ? 2 : 1.4;
-      ctx.strokeStyle = '#3b82f6'; ctx.stroke();
-      if (isPrimary) {
-        ctx.beginPath(); ctx.arc(a.x, a.y, 2, 0, Math.PI * 2);
-        ctx.fillStyle = '#3b82f6'; ctx.fill();
-      }
-    });
+      ctx.lineWidth = 1.6;
+      ctx.strokeStyle = '#4a5568'; ctx.stroke();
+      ctx.beginPath(); ctx.arc(a.x, a.y, 1.5, 0, Math.PI * 2);
+      ctx.fillStyle = '#4a5568'; ctx.fill();
+    }
   }
 
   // Selection + resize handles
   if (isSel) {
-    ctx.setLineDash([4, 3]); ctx.strokeStyle = 'rgba(37,99,235,0.35)'; ctx.lineWidth = 1;
+    ctx.setLineDash([4, 3]); ctx.strokeStyle = 'rgba(74,85,104,0.35)'; ctx.lineWidth = 1;
     rrect(ctx, x - 5, y - 5, w + 10, h + 10, r + 3);
     ctx.stroke(); ctx.setLineDash([]);
 
@@ -253,7 +355,7 @@ export function drawElement(ctx: CanvasRenderingContext2D, el: ModelElement, isS
     for (const hd of handles) {
       const sz = 4;
       ctx.fillStyle = '#fff';
-      ctx.strokeStyle = '#2563eb';
+      ctx.strokeStyle = '#4a5568';
       ctx.lineWidth = 1.4;
       ctx.beginPath();
       ctx.rect(hd.x - sz, hd.y - sz, sz * 2, sz * 2);
@@ -297,22 +399,25 @@ export function getRelSegments(rel: ModelRelationship, elements: ModelElement[],
   return { relId: rel.id, segments };
 }
 
-const HOP_RADIUS = 6;
+const HOP_RADIUS = 5;
 
-/** Draw a polyline path with small arc hops at crossing points */
+/** Draw a rounded polyline path with small arc hops at crossing points */
 function drawPathWithHops(
   ctx: CanvasRenderingContext2D,
   allPts: { x: number; y: number }[],
   otherSegments: Seg[],
 ) {
-  // Collect all crossing points per segment
+  // First expand the polyline with rounded corners to get the actual rendered path
+  const expanded = expandRoundedPolyline(allPts);
+
+  // Build segments from the expanded path
   const mySegments: Seg[] = [];
-  for (let i = 0; i < allPts.length - 1; i++) {
-    mySegments.push({ x1: allPts[i].x, y1: allPts[i].y, x2: allPts[i + 1].x, y2: allPts[i + 1].y });
+  for (let i = 0; i < expanded.length - 1; i++) {
+    mySegments.push({ x1: expanded[i].x, y1: expanded[i].y, x2: expanded[i + 1].x, y2: expanded[i + 1].y });
   }
 
   ctx.beginPath();
-  ctx.moveTo(allPts[0].x, allPts[0].y);
+  ctx.moveTo(expanded[0].x, expanded[0].y);
 
   for (let i = 0; i < mySegments.length; i++) {
     const seg = mySegments[i];
@@ -321,31 +426,40 @@ function drawPathWithHops(
     if (segLen < 0.1) { ctx.lineTo(seg.x2, seg.y2); continue; }
 
     // Find crossings on this segment
-    const crossings: number[] = []; // parameter t values
+    const crossings: number[] = [];
     for (const other of otherSegments) {
       const hit = segIntersect(seg, other);
       if (!hit) continue;
       const t = ((hit.x - seg.x1) * dx + (hit.y - seg.y1) * dy) / (segLen * segLen);
-      crossings.push(t);
+      if (t > 0.02 && t < 0.98) crossings.push(t);
     }
     crossings.sort((a, b) => a - b);
 
     if (crossings.length === 0) {
       ctx.lineTo(seg.x2, seg.y2);
     } else {
-      // Unit normal perpendicular to segment (pointing "up" in screen space)
-      const nx = -dy / segLen, ny = dx / segLen;
+      // Unit direction along the segment
+      const ux = dx / segLen, uy = dy / segLen;
       const hopT = HOP_RADIUS / segLen;
 
+      // Determine the arc sweep direction: always hop "above" (perpendicular to travel).
+      // The arc goes from the point before the crossing to the point after,
+      // curving away from the crossing. We use arcTo for a clean bump.
+      let prevT = 0;
       for (const t of crossings) {
-        const tBefore = Math.max(0, t - hopT);
+        const tBefore = Math.max(prevT, t - hopT);
         const tAfter = Math.min(1, t + hopT);
-        // Draw to just before the crossing
+        // Draw line to just before the hop
         ctx.lineTo(seg.x1 + tBefore * dx, seg.y1 + tBefore * dy);
-        // Draw arc hop (semicircle above the line)
-        const cx = seg.x1 + t * dx, cy = seg.y1 + t * dy;
-        const startAngle = Math.atan2(-nx, -ny);
-        ctx.arc(cx, cy, HOP_RADIUS, startAngle, startAngle + Math.PI);
+        // Draw a small semicircular bump using quadratic bezier (cleaner than arc)
+        const bx = seg.x1 + t * dx, by = seg.y1 + t * dy;
+        // Control point is offset perpendicular to the segment
+        const perpX = -uy, perpY = ux; // perpendicular unit vector
+        const cpx = bx + perpX * HOP_RADIUS * 2;
+        const cpy = by + perpY * HOP_RADIUS * 2;
+        const endX = seg.x1 + tAfter * dx, endY = seg.y1 + tAfter * dy;
+        ctx.quadraticCurveTo(cpx, cpy, endX, endY);
+        prevT = tAfter;
       }
       ctx.lineTo(seg.x2, seg.y2);
     }
@@ -353,76 +467,110 @@ function drawPathWithHops(
   ctx.stroke();
 }
 
+/** Expand a polyline into points with rounded corners (for use in hop detection) */
+function expandRoundedPolyline(pts: { x: number; y: number }[]): { x: number; y: number }[] {
+  if (pts.length <= 2) return pts;
+  const result: { x: number; y: number }[] = [pts[0]];
+
+  for (let i = 1; i < pts.length - 1; i++) {
+    const prev = pts[i - 1], cur = pts[i], next = pts[i + 1];
+    const dIn = Math.hypot(cur.x - prev.x, cur.y - prev.y);
+    const dOut = Math.hypot(next.x - cur.x, next.y - cur.y);
+    if (dIn < 1 || dOut < 1) { result.push(cur); continue; }
+
+    const r = Math.min(MAX_CURVE_RADIUS, dIn / 2, dOut / 2);
+    const inDx = (cur.x - prev.x) / dIn, inDy = (cur.y - prev.y) / dIn;
+    const outDx = (next.x - cur.x) / dOut, outDy = (next.y - cur.y) / dOut;
+    const arcStartX = cur.x - inDx * r, arcStartY = cur.y - inDy * r;
+    const arcEndX = cur.x + outDx * r, arcEndY = cur.y + outDy * r;
+
+    result.push({ x: arcStartX, y: arcStartY });
+    for (let s = 1; s <= CURVE_SEGMENTS; s++) {
+      const t = s / CURVE_SEGMENTS;
+      const omt = 1 - t;
+      result.push({
+        x: omt * omt * arcStartX + 2 * omt * t * cur.x + t * t * arcEndX,
+        y: omt * omt * arcStartY + 2 * omt * t * cur.y + t * t * arcEndY,
+      });
+    }
+  }
+
+  result.push(pts[pts.length - 1]);
+  return result;
+}
+
 export function drawRelationship(ctx: CanvasRenderingContext2D, rel: ModelRelationship, elements: ModelElement[], isSel: boolean, isHov: boolean, otherSegments?: Seg[], elementMap?: Map<string, ModelElement>) {
   const pts = getRelPoints(rel, elements, elementMap);
   if (!pts) return;
   const { start, end, waypoints } = pts;
   const rd = RELATIONSHIP_TYPES[rel.type] || RELATIONSHIP_TYPES.association;
-  const col = isSel ? '#2563eb' : isHov ? '#555' : '#777';
-  const lw = isSel ? 1.6 : 1.1;
+  const col = isSel ? '#4a5568' : isHov ? '#444' : '#555';
+  const lw = isSel ? 1.8 : 1.2;
 
   ctx.save();
   ctx.strokeStyle = col; ctx.lineWidth = lw;
   ctx.lineJoin = 'round'; ctx.lineCap = 'round';
-  if (rd.dash) ctx.setLineDash([6, 4]);
+  if (rd.dash) ctx.setLineDash(rd.dashPattern || [6, 3]);
 
   const allPts = [start, ...waypoints, end];
   if (otherSegments && otherSegments.length > 0) {
     drawPathWithHops(ctx, allPts, otherSegments);
   } else {
-    ctx.beginPath();
-    ctx.moveTo(allPts[0].x, allPts[0].y);
-    for (let i = 1; i < allPts.length; i++) ctx.lineTo(allPts[i].x, allPts[i].y);
-    ctx.stroke();
+    drawRoundedPolyline(ctx, allPts);
   }
   ctx.setLineDash([]);
 
-  // Arrowheads — wider spread (0.5 rad ≈ 29°) for clear visual distinction
+  // Arrowheads — dimensions matched to Archi's PolygonDecoration/PolylineDecoration
   const last = allPts[allPts.length - 2] || start;
   const angle = Math.atan2(end.y - last.y, end.x - last.x);
-  const aL = 12;
-  const aSpread = 0.5;
 
   if (rd.head === 'filled_arrow') {
-    // Solid filled triangle — triggering, flow
+    // Solid filled triangle — triggering, flow (Archi: PolygonDecoration default scale)
+    const aL = 10, aW = 7;
+    const spread = Math.atan2(aW / 2, aL);
     ctx.beginPath(); ctx.moveTo(end.x, end.y);
-    ctx.lineTo(end.x - aL * Math.cos(angle - aSpread), end.y - aL * Math.sin(angle - aSpread));
-    ctx.lineTo(end.x - aL * Math.cos(angle + aSpread), end.y - aL * Math.sin(angle + aSpread));
+    ctx.lineTo(end.x - aL * Math.cos(angle - spread), end.y - aL * Math.sin(angle - spread));
+    ctx.lineTo(end.x - aL * Math.cos(angle + spread), end.y - aL * Math.sin(angle + spread));
     ctx.closePath(); ctx.fillStyle = col; ctx.fill();
   } else if (rd.head === 'open_arrow') {
-    // Open chevron — serving, access, influence
-    const oL = 11;
+    // Open chevron — serving, access, influence (Archi: PolylineDecoration — not filled)
+    const aL = 10, aW = 7;
+    const spread = Math.atan2(aW / 2, aL);
     ctx.beginPath();
-    ctx.moveTo(end.x - oL * Math.cos(angle - aSpread), end.y - oL * Math.sin(angle - aSpread));
+    ctx.moveTo(end.x - aL * Math.cos(angle - spread), end.y - aL * Math.sin(angle - spread));
     ctx.lineTo(end.x, end.y);
-    ctx.lineTo(end.x - oL * Math.cos(angle + aSpread), end.y - oL * Math.sin(angle + aSpread));
-    ctx.strokeStyle = col; ctx.lineWidth = isSel ? 2 : 1.4; ctx.stroke();
+    ctx.lineTo(end.x - aL * Math.cos(angle + spread), end.y - aL * Math.sin(angle + spread));
+    ctx.strokeStyle = col; ctx.lineWidth = isSel ? 1.8 : 1.2; ctx.stroke();
   } else if (rd.head === 'hollow_arrow') {
-    // Hollow triangle — realization, specialization
+    // Hollow triangle — realization, specialization (Archi: scale 10,7)
+    const aL = 10, aW = 7;
+    const spread = Math.atan2(aW / 2, aL);
     ctx.beginPath(); ctx.moveTo(end.x, end.y);
-    ctx.lineTo(end.x - aL * Math.cos(angle - aSpread), end.y - aL * Math.sin(angle - aSpread));
-    ctx.lineTo(end.x - aL * Math.cos(angle + aSpread), end.y - aL * Math.sin(angle + aSpread));
+    ctx.lineTo(end.x - aL * Math.cos(angle - spread), end.y - aL * Math.sin(angle - spread));
+    ctx.lineTo(end.x - aL * Math.cos(angle + spread), end.y - aL * Math.sin(angle + spread));
     ctx.closePath(); ctx.fillStyle = '#f5f6f8'; ctx.fill();
     ctx.strokeStyle = col; ctx.lineWidth = isSel ? 1.6 : 1.2; ctx.stroke();
   } else if (rd.head === 'diamond_filled' || rd.head === 'diamond') {
     // Diamond at source — composition (filled), aggregation (hollow)
+    // Archi: template (0,0),(-2,2),(-4,0),(-2,-2) scaled by (5,3) → 20×6 total
     const sA = Math.atan2(allPts[1].y - start.y, allPts[1].x - start.x);
-    const dW = 7; // half-width
-    const dLen = 12; // length along the line
-    const cx = start.x + dLen * 0.5 * Math.cos(sA);
-    const cy = start.y + dLen * 0.5 * Math.sin(sA);
+    const dLen = 10; // half of 20
+    const dW = 3;    // half of 6
+    const tip = { x: start.x, y: start.y };
+    const mid = { x: start.x + dLen * 0.5 * Math.cos(sA), y: start.y + dLen * 0.5 * Math.sin(sA) };
+    const tail = { x: start.x + dLen * Math.cos(sA), y: start.y + dLen * Math.sin(sA) };
     ctx.beginPath();
-    ctx.moveTo(start.x, start.y);
-    ctx.lineTo(cx + dW * Math.cos(sA - Math.PI / 2), cy + dW * Math.sin(sA - Math.PI / 2));
-    ctx.lineTo(start.x + dLen * Math.cos(sA), start.y + dLen * Math.sin(sA));
-    ctx.lineTo(cx + dW * Math.cos(sA + Math.PI / 2), cy + dW * Math.sin(sA + Math.PI / 2));
+    ctx.moveTo(tip.x, tip.y);
+    ctx.lineTo(mid.x + dW * Math.cos(sA - Math.PI / 2), mid.y + dW * Math.sin(sA - Math.PI / 2));
+    ctx.lineTo(tail.x, tail.y);
+    ctx.lineTo(mid.x + dW * Math.cos(sA + Math.PI / 2), mid.y + dW * Math.sin(sA + Math.PI / 2));
     ctx.closePath();
     ctx.fillStyle = rd.head === 'diamond_filled' ? col : '#f5f6f8'; ctx.fill();
-    ctx.strokeStyle = col; ctx.lineWidth = isSel ? 1.4 : 1.1; ctx.stroke();
+    ctx.strokeStyle = col; ctx.lineWidth = isSel ? 1.4 : 1; ctx.stroke();
   } else if (rd.head === 'filled_dot') {
-    // Filled circle at source — assignment
+    // Filled circle at source — assignment (Archi: BallEndpoint radius=3)
     const sA = Math.atan2(allPts[1].y - start.y, allPts[1].x - start.x);
-    const dotR = 5;
+    const dotR = 3;
     ctx.beginPath(); ctx.arc(start.x + (dotR + 1) * Math.cos(sA), start.y + (dotR + 1) * Math.sin(sA), dotR, 0, Math.PI * 2);
     ctx.fillStyle = col; ctx.fill();
   }
@@ -432,29 +580,50 @@ export function drawRelationship(ctx: CanvasRenderingContext2D, rel: ModelRelati
     waypoints.forEach(wp => {
       ctx.beginPath(); ctx.arc(wp.x, wp.y, 4.5, 0, Math.PI * 2);
       ctx.fillStyle = '#fff'; ctx.fill();
-      ctx.lineWidth = 1.6; ctx.strokeStyle = '#2563eb'; ctx.stroke();
+      ctx.lineWidth = 1.6; ctx.strokeStyle = '#4a5568'; ctx.stroke();
     });
     // Endpoint handles (start & end)
     [start, end].forEach(pt => {
       ctx.beginPath(); ctx.arc(pt.x, pt.y, 5, 0, Math.PI * 2);
-      ctx.fillStyle = '#2563eb'; ctx.fill();
+      ctx.fillStyle = '#4a5568'; ctx.fill();
       ctx.lineWidth = 1.6; ctx.strokeStyle = '#fff'; ctx.stroke();
     });
   }
 
-  // Label (larger)
+  // Label — positioned with perpendicular offset to avoid overlapping the line
   if (rel.name) {
     const lp = rel.labelPos ?? 0.5;
     const pt = pointOnPath(allPts, lp);
-    ctx.font = `400 12px ${FONT}`;
+
+    // Compute local direction at label position for perpendicular offset
+    const ptBefore = pointOnPath(allPts, Math.max(0, lp - 0.02));
+    const ptAfter = pointOnPath(allPts, Math.min(1, lp + 0.02));
+    const segDx = ptAfter.x - ptBefore.x;
+    const segDy = ptAfter.y - ptBefore.y;
+    const segLen = Math.hypot(segDx, segDy);
+
+    // Perpendicular offset (above the line)
+    const offsetDist = 10;
+    let labelX = pt.x, labelY = pt.y;
+    if (segLen > 0.1) {
+      // Normal vector pointing "up" (perpendicular to segment)
+      const nx = -segDy / segLen;
+      const ny = segDx / segLen;
+      labelX = pt.x + nx * offsetDist;
+      labelY = pt.y + ny * offsetDist;
+    } else {
+      labelY = pt.y - offsetDist;
+    }
+
+    ctx.font = `400 8px ${FONT}`;
     const measured = ctx.measureText(rel.name).width;
-    const padX = 6, padY = 3;
-    rrect(ctx, pt.x - measured / 2 - padX, pt.y - 8 - padY, measured + padX * 2, 16 + padY * 2, 3);
-    ctx.fillStyle = 'rgba(255,255,255,0.95)'; ctx.fill();
-    if (isSel) { ctx.strokeStyle = 'rgba(37,99,235,0.25)'; ctx.lineWidth = 0.8; ctx.stroke(); }
-    ctx.fillStyle = isSel ? '#2563eb' : '#777';
+    const padX = 3, padY = 1;
+    rrect(ctx, labelX - measured / 2 - padX, labelY - 5 - padY, measured + padX * 2, 10 + padY * 2, 2);
+    ctx.fillStyle = 'rgba(255,255,255,0.88)'; ctx.fill();
+    if (isSel) { ctx.strokeStyle = 'rgba(74,85,104,0.25)'; ctx.lineWidth = 0.8; ctx.stroke(); }
+    ctx.fillStyle = isSel ? '#4a5568' : '#999';
     ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
-    ctx.fillText(rel.name, pt.x, pt.y);
+    ctx.fillText(rel.name, labelX, labelY);
   }
 
   ctx.restore();
@@ -471,7 +640,7 @@ export function drawSnapGuides(ctx: CanvasRenderingContext2D, guides: SnapGuide[
   ctx.lineWidth = 1 / sc; // constant pixel width regardless of zoom
 
   for (const guide of guides) {
-    ctx.strokeStyle = guide.type === 'center' ? '#e855a0' : '#3b82f6';
+    ctx.strokeStyle = guide.type === 'center' ? '#e855a0' : '#4a5568';
     ctx.beginPath();
     // Extend lines across the visible viewport
     const vLeft   = -ox / sc;

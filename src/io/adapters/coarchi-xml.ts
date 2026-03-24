@@ -31,6 +31,23 @@ function getAttr(node: Element, names: string[]): string | undefined {
 }
 
 /**
+ * Strip path prefix from an href-style value (e.g. "file.xml#id-abc" → "id-abc").
+ * If there's no '#', return the value as-is (it's already a plain ID).
+ */
+function cleanHref(value: string): string {
+  // If href contains #, extract the fragment (element ID)
+  if (value.includes('#')) return value.replace(/^.*#/, '').trim();
+  // If it looks like a file path (contains .xml), try to extract an embedded ID
+  // GRAFICO filenames are like "BusinessActor_id-abc123.xml"
+  const trimmed = value.trim();
+  if (/\.xml$/i.test(trimmed)) {
+    const match = trimmed.match(/(id-[0-9a-f-]+)/i);
+    if (match) return match[1];
+  }
+  return trimmed;
+}
+
+/**
  * Get a referenced element ID from a child element (GRAFICO format).
  * e.g. <archimateElement href="id-xxx"/> or <archimateElement xsi:type="..." href="id-xxx"/>
  */
@@ -41,13 +58,24 @@ function getChildElementRef(node: Element, childNames: string[]): string | undef
       // Try href attribute first, then xlink:href
       const href = child.getAttribute('href') || child.getAttribute('xlink:href');
       if (href) {
-        // Strip leading # or path prefix if present
-        const cleaned = href.replace(/^.*#/, '').trim();
+        const cleaned = cleanHref(href);
         return cleaned || undefined;
       }
     }
   }
   return undefined;
+}
+
+/**
+ * Get a reference ID from either a direct attribute or a child element href (GRAFICO format).
+ * Handles both `<node source="id-abc"/>` and `<node><source href="file.xml#id-abc"/></node>`.
+ */
+function getRef(node: Element, attrNames: string[], childNames?: string[]): string | undefined {
+  // First try direct attributes
+  const attrVal = getAttr(node, attrNames);
+  if (attrVal) return cleanHref(attrVal);
+  // Then try child element hrefs
+  return getChildElementRef(node, childNames ?? attrNames);
 }
 
 function getName(node: Element): string {
@@ -77,6 +105,20 @@ function getDocumentation(node: Element): string {
   return '';
 }
 
+/** Extract text from a <content> child element (used by DiagramModelNote) */
+function getContentText(node: Element): string {
+  const byAttr = getAttr(node, ['content']);
+  if (byAttr) return byAttr;
+
+  for (const child of Array.from(node.children)) {
+    if (localName(child).toLowerCase() === 'content') {
+      return child.textContent?.trim() || '';
+    }
+  }
+
+  return '';
+}
+
 function extractTypeName(rawType: string | undefined): string {
   if (!rawType) return '';
   const noPrefix = rawType.includes(':') ? rawType.split(':').pop() || '' : rawType;
@@ -88,7 +130,7 @@ function toCamelLower(name: string): string {
   return name.charAt(0).toLowerCase() + name.slice(1);
 }
 
-function mapElementType(rawType: string | undefined): string | undefined {
+function mapElementType(rawType: string | undefined, node?: Element): string | undefined {
   const base = extractTypeName(rawType).replace(/Element$/, '');
   if (!base || /relationship$/i.test(base)) return undefined;
   if (/diagrammodel|diagramobject|diagramconnection|diagramreference/i.test(base)) return undefined;
@@ -96,23 +138,39 @@ function mapElementType(rawType: string | undefined): string | undefined {
   if (/^(folder|property|feature|metadata|model|children|child|connection|bounds|bendpoint|point|documentation|name|purpose|content|label|source|target)$/i.test(base)) return undefined;
 
   const candidate = toCamelLower(base);
+
+  // Junction handling: In GRAFICO format, junction fragments use the tag name
+  // (e.g. <archimate:Junction>) with a root `type="or"` attribute for subtype.
+  // The generic type detection picks up `type="or"` as rawType instead of the tag.
+  // Detect junction from either the candidate or the tag name.
+  const tagLower = node ? localName(node).toLowerCase() : '';
+  if (candidate === 'junction' || tagLower.endsWith('junction')) {
+    const junctionType = (node ? getAttr(node, ['type']) : undefined)?.toLowerCase();
+    if (junctionType === 'or') return 'orJunction';
+    return 'andJunction'; // default junction semantics
+  }
+
   if (ELEMENT_TYPE_KEYS.has(candidate)) return candidate;
 
   return undefined;
 }
 
-function mapRelationshipType(rawType: string | undefined): string | undefined {
-  const base = extractTypeName(rawType).replace(/Relationship$/, '');
-  if (!base) return undefined;
+function mapRelationshipType(rawType: string | undefined, tagName?: string): string | undefined {
+  // Try rawType first, then fall back to tag name
+  // (GRAFICO fragments may have a `type` attribute that shadows the tag name)
+  for (const src of [rawType, tagName]) {
+    const base = extractTypeName(src).replace(/Relationship$/, '');
+    if (!base) continue;
 
-  const candidate = toCamelLower(base);
-  if (RELATIONSHIP_TYPE_KEYS.has(candidate)) return candidate;
+    const candidate = toCamelLower(base);
+    if (RELATIONSHIP_TYPE_KEYS.has(candidate)) return candidate;
 
-  const aliases: Record<string, string> = {
-    usedBy: 'serving',
-  };
+    const aliases: Record<string, string> = {
+      usedBy: 'serving',
+    };
 
-  if (aliases[candidate]) return aliases[candidate];
+    if (aliases[candidate]) return aliases[candidate];
+  }
 
   return undefined;
 }
@@ -121,6 +179,49 @@ function asNumber(value: string | undefined): number | undefined {
   if (!value) return undefined;
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+/** Extract optional visual style metadata from a diagram element */
+function parseStyle(node: Element): import('../../model/canonical').DiagramStyle | undefined {
+  const fillColor = getAttr(node, ['fillColor']);
+  const lineColor = getAttr(node, ['lineColor']);
+  const fontColor = getAttr(node, ['fontColor']);
+  const font = getAttr(node, ['font']);
+  const textAlignment = asNumber(getAttr(node, ['textAlignment']));
+  const textPosition = asNumber(getAttr(node, ['textPosition']));
+  const lineWidth = asNumber(getAttr(node, ['lineWidth']));
+  const lineStyle = getAttr(node, ['lineStyle']);
+  const gradient = asNumber(getAttr(node, ['gradient']));
+  const alpha = asNumber(getAttr(node, ['alpha']));
+  const lineAlpha = asNumber(getAttr(node, ['lineAlpha']));
+  const nameVisibleRaw = getAttr(node, ['nameVisible']);
+  const nameVisible = nameVisibleRaw === 'false' ? false : nameVisibleRaw === 'true' ? true : undefined;
+  const labelExpression = getAttr(node, ['labelExpression']);
+
+  // Only return style object if at least one property was found
+  if (fillColor === undefined && lineColor === undefined && fontColor === undefined &&
+    font === undefined && textAlignment === undefined && textPosition === undefined &&
+    lineWidth === undefined && lineStyle === undefined && gradient === undefined &&
+    alpha === undefined && lineAlpha === undefined && nameVisible === undefined &&
+    labelExpression === undefined) {
+    return undefined;
+  }
+
+  return {
+    ...(fillColor !== undefined && { fillColor }),
+    ...(lineColor !== undefined && { lineColor }),
+    ...(fontColor !== undefined && { fontColor }),
+    ...(font !== undefined && { font }),
+    ...(textAlignment !== undefined && { textAlignment }),
+    ...(textPosition !== undefined && { textPosition }),
+    ...(lineWidth !== undefined && { lineWidth }),
+    ...(lineStyle !== undefined && { lineStyle }),
+    ...(gradient !== undefined && { gradient }),
+    ...(alpha !== undefined && { alpha }),
+    ...(lineAlpha !== undefined && { lineAlpha }),
+    ...(nameVisible !== undefined && { nameVisible }),
+    ...(labelExpression !== undefined && { labelExpression }),
+  };
 }
 
 function parseBounds(node: Element): { x: number; y: number; width: number; height: number } | null {
@@ -196,14 +297,21 @@ function resolveBendpoints(
   sourceCenter: { x: number; y: number } | null,
   targetCenter: { x: number; y: number } | null,
 ): { x: number; y: number }[] {
-  return raw.flatMap(bp => {
+  const total = raw.length;
+  return raw.flatMap((bp, i) => {
     if (bp.x !== undefined && bp.y !== undefined) {
       return [{ x: bp.x, y: bp.y }];
     }
+    // Archi uses weighted interpolation: weight = (i+1) / (N+1)
+    // For 1 bendpoint: weight=0.5. For 2: weights=0.33,0.67. For 3: 0.25,0.5,0.75.
     if (sourceCenter && targetCenter) {
+      const weight = (i + 1) / (total + 1);
       const fromSource = { x: sourceCenter.x + (bp.startX ?? 0), y: sourceCenter.y + (bp.startY ?? 0) };
       const fromTarget = { x: targetCenter.x + (bp.endX ?? 0), y: targetCenter.y + (bp.endY ?? 0) };
-      return [{ x: (fromSource.x + fromTarget.x) / 2, y: (fromSource.y + fromTarget.y) / 2 }];
+      return [{
+        x: fromSource.x * (1 - weight) + fromTarget.x * weight,
+        y: fromSource.y * (1 - weight) + fromTarget.y * weight,
+      }];
     }
     return [];
   });
@@ -212,6 +320,15 @@ function resolveBendpoints(
 // ---------------------------------------------------------------------------
 // Recursive view tree walker — handles nested children with relative coords
 // ---------------------------------------------------------------------------
+
+interface PendingConnection {
+  id: string;
+  viewId: string;
+  relationshipId: string;
+  rawBendpoints: RawBendpoint[];
+  labelPosition: number;
+  style?: import('../../model/canonical').DiagramStyle;
+}
 
 interface ViewWalkContext {
   viewId: string;
@@ -222,7 +339,13 @@ interface ViewWalkContext {
   viewNodes: CanonicalViewNode[];
   viewConnections: CanonicalViewConnection[];
   relationships: CanonicalRelationship[];
+  /** Mutable elements array — synthetic elements (notes, view refs, groups) are added here */
+  elements: CanonicalElement[];
+  /** View name lookup for view references */
+  viewNameById: Map<string, string>;
   fallbackIndex: number;
+  /** Connections deferred until all nodes are collected */
+  pendingConnections: PendingConnection[];
 }
 
 /**
@@ -235,6 +358,8 @@ function walkViewChildren(
   parentX: number,
   parentY: number,
   ctx: ViewWalkContext,
+  parentNodeId?: string,
+  depth: number = 0,
 ): void {
   // Direct <children> (Archi format) or <child> elements
   const childNodes = Array.from(parentEl.children).filter(c => {
@@ -248,93 +373,216 @@ function walkViewChildren(
     const absY = parentY + (bounds?.y ?? 0);
     const width = bounds?.width ?? 160;
     const height = bounds?.height ?? 72;
+    const style = parseStyle(child);
 
     // Check if this node references a semantic element
-    const elementId = getAttr(child, ['archimateElement', 'elementRef', 'modelElement', 'conceptRef'])
-      || getChildElementRef(child, ['archimateElement', 'elementRef', 'modelElement']);
+    const elementId = getRef(child,
+      ['archimateElement', 'elementRef', 'modelElement', 'conceptRef'],
+      ['archimateElement', 'elementRef', 'modelElement']);
 
     if (elementId && ctx.elementIds.has(elementId)) {
-      const key = `${ctx.viewId}::${elementId}`;
-      if (!ctx.viewNodeKeys.has(key)) {
+      // Use the diagram object's own ID as dedup key to preserve multiple
+      // instances of the same semantic element in the same view
+      const nodeId = getAttr(child, ['identifier', 'id'])
+        || `${ctx.viewId}::${elementId}::${ctx.fallbackIndex}`;
+      if (!ctx.viewNodeKeys.has(nodeId)) {
         ctx.viewNodes.push({
-          id: getAttr(child, ['identifier', 'id']) || key,
+          id: nodeId,
           viewId: ctx.viewId,
           elementId,
           x: absX,
           y: absY,
           width,
           height,
+          style,
+          parentNodeId,
+          nestingDepth: depth,
         });
-        ctx.viewNodeKeys.add(key);
+        ctx.viewNodeKeys.add(nodeId);
         ctx.fallbackIndex += 1;
       }
     }
 
-    // Check if this node is a connection
-    const relId = getAttr(child, ['archimateRelationship', 'relationshipRef', 'relationship'])
-      || getChildElementRef(child, ['archimateRelationship', 'relationshipRef']);
+    // Check if this node is a connection — defer resolution until all nodes are collected
+    const relId = getRef(child,
+      ['archimateRelationship', 'relationshipRef', 'relationship'],
+      ['archimateRelationship', 'relationshipRef']);
     if (relId && ctx.relationshipIds.has(relId)) {
-      const key = `${ctx.viewId}::${relId}`;
-      if (!ctx.viewConnectionKeys.has(key)) {
-        const rawBendpoints = parseRawBendpoints(child);
-        const rel = ctx.relationships.find(r => r.id === relId);
-        let sourceCenter: { x: number; y: number } | null = null;
-        let targetCenter: { x: number; y: number } | null = null;
-        if (rel) {
-          const srcNode = ctx.viewNodes.find(vn => vn.viewId === ctx.viewId && vn.elementId === rel.sourceId);
-          const tgtNode = ctx.viewNodes.find(vn => vn.viewId === ctx.viewId && vn.elementId === rel.targetId);
-          if (srcNode) sourceCenter = { x: srcNode.x + srcNode.width / 2, y: srcNode.y + srcNode.height / 2 };
-          if (tgtNode) targetCenter = { x: tgtNode.x + tgtNode.width / 2, y: tgtNode.y + tgtNode.height / 2 };
-        }
-
-        ctx.viewConnections.push({
-          id: getAttr(child, ['identifier', 'id']) || key,
+      const connId = getAttr(child, ['identifier', 'id'])
+        || `${ctx.viewId}::${relId}::${ctx.fallbackIndex}`;
+      if (!ctx.viewConnectionKeys.has(connId)) {
+        ctx.pendingConnections.push({
+          id: connId,
           viewId: ctx.viewId,
           relationshipId: relId,
-          waypoints: resolveBendpoints(rawBendpoints, sourceCenter, targetCenter),
+          rawBendpoints: parseRawBendpoints(child),
           labelPosition: asNumber(getAttr(child, ['labelPos', 'labelPosition'])) ?? 0.5,
+          style,
         });
-        ctx.viewConnectionKeys.add(key);
+        ctx.viewConnectionKeys.add(connId);
+      }
+    }
+
+    // Check for non-semantic diagram objects (view references, notes, groups)
+    // These don't reference a semantic element but are visual objects in the diagram.
+    if (!elementId || !ctx.elementIds.has(elementId)) {
+      const rawType = getAttr(child, ['xsi:type', 'type']) || localName(child);
+      const typeLower = extractTypeName(rawType).toLowerCase();
+      const diagramObjectId = getAttr(child, ['identifier', 'id']);
+
+      // Type detection: .archimate format uses short names (Group, Note)
+      // while coArchi/GRAFICO uses long names (DiagramModelGroup, DiagramModelNote)
+      const tagLowerChild = localName(child).toLowerCase();
+      const isViewRef = typeLower.includes('diagrammodelreference')
+        || tagLowerChild.includes('diagrammodelreference');
+      const isNote = typeLower.includes('note') || tagLowerChild.includes('note');
+      const isGroup = typeLower.includes('group') || tagLowerChild.includes('group');
+
+      if (isViewRef && diagramObjectId) {
+        // View reference — navigable link to another view
+        const targetViewId = getAttr(child, ['model', 'viewRef', 'targetView'])
+          || getChildElementRef(child, ['model']);
+        if (targetViewId) {
+          if (!ctx.elementIds.has(diagramObjectId)) {
+            const targetName = ctx.viewNameById.get(targetViewId) || 'View';
+            ctx.elements.push({
+              id: diagramObjectId,
+              type: 'viewReference',
+              name: targetName,
+              documentation: `Navigation reference to view '${targetViewId}'.`,
+            });
+            ctx.elementIds.add(diagramObjectId);
+          }
+          if (!ctx.viewNodeKeys.has(diagramObjectId)) {
+            ctx.viewNodes.push({
+              id: diagramObjectId,
+              viewId: ctx.viewId,
+              elementId: diagramObjectId,
+              x: absX, y: absY, width, height,
+              linkedViewId: targetViewId,
+              parentNodeId,
+              nestingDepth: depth,
+            });
+            ctx.viewNodeKeys.add(diagramObjectId);
+            ctx.fallbackIndex += 1;
+          }
+        }
+      } else if (isNote && diagramObjectId) {
+        // Note — free-text annotation
+        const noteText = getContentText(child) || getName(child) || 'Note';
+        if (!ctx.elementIds.has(diagramObjectId)) {
+          ctx.elements.push({
+            id: diagramObjectId,
+            type: 'note',
+            name: noteText,
+            documentation: '',
+          });
+          ctx.elementIds.add(diagramObjectId);
+        }
+        if (!ctx.viewNodeKeys.has(diagramObjectId)) {
+          ctx.viewNodes.push({
+            id: diagramObjectId,
+            viewId: ctx.viewId,
+            elementId: diagramObjectId,
+            x: absX, y: absY, width, height,
+            parentNodeId,
+            nestingDepth: depth,
+          });
+          ctx.viewNodeKeys.add(diagramObjectId);
+          ctx.fallbackIndex += 1;
+        }
+      } else if (isGroup && diagramObjectId) {
+        // Group — visual container
+        const groupName = getName(child) || 'Group';
+        if (!ctx.elementIds.has(diagramObjectId)) {
+          ctx.elements.push({
+            id: diagramObjectId,
+            type: 'grouping',
+            name: groupName,
+            documentation: getDocumentation(child),
+          });
+          ctx.elementIds.add(diagramObjectId);
+        }
+        if (!ctx.viewNodeKeys.has(diagramObjectId)) {
+          ctx.viewNodes.push({
+            id: diagramObjectId,
+            viewId: ctx.viewId,
+            elementId: diagramObjectId,
+            x: absX, y: absY, width, height,
+            parentNodeId,
+            nestingDepth: depth,
+          });
+          ctx.viewNodeKeys.add(diagramObjectId);
+          ctx.fallbackIndex += 1;
+        }
       }
     }
 
     // Recurse into nested children (they'll be offset relative to this node)
-    walkViewChildren(child, absX, absY, ctx);
+    // Determine the current node's ID for parent tracking
+    const currentNodeId = (elementId && ctx.elementIds.has(elementId))
+      ? (getAttr(child, ['identifier', 'id']) || `${ctx.viewId}::${elementId}::${ctx.fallbackIndex - 1}`)
+      : (getAttr(child, ['identifier', 'id']) || parentNodeId);
+    walkViewChildren(child, absX, absY, ctx, currentNodeId, depth + 1);
   }
 
-  // Also handle <sourceConnection> / <connection> elements at this level
+  // Also handle <sourceConnection(s)> / <connection(s)> elements at this level
+  // GRAFICO uses plural "sourceConnections" while some formats use singular
   const connectionNodes = Array.from(parentEl.children).filter(c => {
     const tag = localName(c).toLowerCase();
-    return tag === 'sourceconnection' || tag === 'connection' || tag === 'connections';
+    return tag === 'sourceconnection' || tag === 'sourceconnections'
+      || tag === 'connection' || tag === 'connections';
   });
 
   for (const conn of connectionNodes) {
-    const relId = getAttr(conn, ['archimateRelationship', 'relationshipRef', 'relationship'])
-      || getChildElementRef(conn, ['archimateRelationship', 'relationshipRef']);
+    const relId = getRef(conn,
+      ['archimateRelationship', 'relationshipRef', 'relationship'],
+      ['archimateRelationship', 'relationshipRef']);
     if (relId && ctx.relationshipIds.has(relId)) {
-      const key = `${ctx.viewId}::${relId}`;
-      if (!ctx.viewConnectionKeys.has(key)) {
-        const rawBendpoints = parseRawBendpoints(conn);
-        const rel = ctx.relationships.find(r => r.id === relId);
-        let sourceCenter: { x: number; y: number } | null = null;
-        let targetCenter: { x: number; y: number } | null = null;
-        if (rel) {
-          const srcNode = ctx.viewNodes.find(vn => vn.viewId === ctx.viewId && vn.elementId === rel.sourceId);
-          const tgtNode = ctx.viewNodes.find(vn => vn.viewId === ctx.viewId && vn.elementId === rel.targetId);
-          if (srcNode) sourceCenter = { x: srcNode.x + srcNode.width / 2, y: srcNode.y + srcNode.height / 2 };
-          if (tgtNode) targetCenter = { x: tgtNode.x + tgtNode.width / 2, y: tgtNode.y + tgtNode.height / 2 };
-        }
-
-        ctx.viewConnections.push({
-          id: getAttr(conn, ['identifier', 'id']) || key,
+      const connId = getAttr(conn, ['identifier', 'id'])
+        || `${ctx.viewId}::${relId}::${ctx.fallbackIndex}`;
+      if (!ctx.viewConnectionKeys.has(connId)) {
+        ctx.pendingConnections.push({
+          id: connId,
           viewId: ctx.viewId,
           relationshipId: relId,
-          waypoints: resolveBendpoints(rawBendpoints, sourceCenter, targetCenter),
+          rawBendpoints: parseRawBendpoints(conn),
           labelPosition: asNumber(getAttr(conn, ['labelPos', 'labelPosition'])) ?? 0.5,
+          style: parseStyle(conn),
         });
-        ctx.viewConnectionKeys.add(key);
+        ctx.viewConnectionKeys.add(connId);
       }
     }
+  }
+}
+
+/** Resolve all pending connections now that every node position is known */
+function resolvePendingViewConnections(ctx: ViewWalkContext): void {
+  for (const conn of ctx.pendingConnections) {
+    const rel = ctx.relationships.find(r => r.id === conn.relationshipId);
+    let sourceCenter: { x: number; y: number } | null = null;
+    let targetCenter: { x: number; y: number } | null = null;
+    if (rel) {
+      const srcNode = ctx.viewNodes.find(vn => vn.viewId === ctx.viewId && vn.elementId === rel.sourceId);
+      const tgtNode = ctx.viewNodes.find(vn => vn.viewId === ctx.viewId && vn.elementId === rel.targetId);
+      if (srcNode) sourceCenter = { x: srcNode.x + srcNode.width / 2, y: srcNode.y + srcNode.height / 2 };
+      if (tgtNode) targetCenter = { x: tgtNode.x + tgtNode.width / 2, y: tgtNode.y + tgtNode.height / 2 };
+    }
+
+    // Preserve raw relative bendpoints for dynamic resolution during drags
+    const relativeBendpoints = conn.rawBendpoints
+      .filter(bp => bp.startX !== undefined || bp.startY !== undefined || bp.endX !== undefined || bp.endY !== undefined)
+      .map(bp => ({ startX: bp.startX ?? 0, startY: bp.startY ?? 0, endX: bp.endX ?? 0, endY: bp.endY ?? 0 }));
+
+    ctx.viewConnections.push({
+      id: conn.id,
+      viewId: conn.viewId,
+      relationshipId: conn.relationshipId,
+      waypoints: resolveBendpoints(conn.rawBendpoints, sourceCenter, targetCenter),
+      labelPosition: conn.labelPosition,
+      style: conn.style,
+      relativeBendpoints: relativeBendpoints.length > 0 ? relativeBendpoints : undefined,
+    });
   }
 }
 
@@ -388,14 +636,14 @@ function parseCoArchiXml(raw: string): ParseResult {
     const rawType = getAttr(node, ['xsi:type', 'type']) || tag;
     const typeName = extractTypeName(rawType).toLowerCase();
 
-    const isRelationshipByTag = tagLower === 'relationship';
+    const isRelationshipByTag = tagLower === 'relationship' || tagLower.endsWith('relationship');
     const isRelationshipByType = typeName.endsWith('relationship');
 
     if (isRelationshipByTag || isRelationshipByType) {
       if (relationshipIds.has(id)) continue;
 
-      const sourceId = getAttr(node, ['source', 'sourceRef']);
-      const targetId = getAttr(node, ['target', 'targetRef']);
+      const sourceId = getRef(node, ['source', 'sourceRef']);
+      const targetId = getRef(node, ['target', 'targetRef']);
       if (!sourceId || !targetId) {
         diagnostics.push({
           severity: 'warning',
@@ -406,7 +654,7 @@ function parseCoArchiXml(raw: string): ParseResult {
         continue;
       }
 
-      const mappedType = mapRelationshipType(rawType);
+      const mappedType = mapRelationshipType(rawType, tag);
       if (!mappedType) {
         diagnostics.push({
           severity: 'warning',
@@ -427,7 +675,12 @@ function parseCoArchiXml(raw: string): ParseResult {
       continue;
     }
 
-    const mappedType = mapElementType(rawType);
+    // Skip diagram objects (<child> elements inside views) — they're not semantic elements.
+    // In monolithic .archimate format, <child xsi:type="archimate:Note"> or <child xsi:type="archimate:Group">
+    // would falsely match 'note'/'grouping' element types if not excluded here.
+    if (tagLower === 'child' || tagLower === 'children') continue;
+
+    const mappedType = mapElementType(rawType, node);
     if (!mappedType) continue;
     if (elementIds.has(id)) continue;
 
@@ -446,11 +699,25 @@ function parseCoArchiXml(raw: string): ParseResult {
 
     const tag = localName(node);
     const tagLower = tag.toLowerCase();
-    const rawType = getAttr(node, ['xsi:type', 'type']) || tag;
-    const typeName = extractTypeName(rawType);
+    const rawType = getAttr(node, ['xsi:type', 'type']);
+    const typeName = extractTypeName(rawType).toLowerCase();
 
-    return tagLower === 'view' || /diagrammodel/i.test(typeName) || /diagrammodel/i.test(tag);
+    // Exclude non-view diagram objects (references, notes, groups, child objects, connections)
+    const isNonViewDiagramObj = /diagrammodel(reference|note|group)/i.test(tag)
+      || /diagrammodel(reference|note|group)/i.test(typeName)
+      || /diagramobject|diagramconnection/i.test(typeName);
+    if (isNonViewDiagramObj) return false;
+
+    // Match views by tag name OR xsi:type (monolithic .archimate uses <element xsi:type="...DiagramModel">)
+    return tagLower === 'view' || /diagrammodel/i.test(tag) || /diagrammodel/i.test(typeName);
   });
+
+  // Build view name lookup for view references
+  const viewNameById = new Map<string, string>();
+  for (const vc of viewCandidates) {
+    const vcId = getAttr(vc, ['identifier', 'id']);
+    if (vcId) viewNameById.set(vcId, getName(vc) || vcId);
+  }
 
   for (const viewNode of viewCandidates) {
     const id = getAttr(viewNode, ['identifier', 'id']);
@@ -473,10 +740,85 @@ function parseCoArchiXml(raw: string): ParseResult {
       viewNodes,
       viewConnections,
       relationships: semanticRelationships,
+      elements: semanticElements,
+      viewNameById,
       fallbackIndex: 0,
+      pendingConnections: [],
     };
-    walkViewChildren(viewNode, 0, 0, walkCtx);
+    // Pass 1: collect all nodes and diagram object positions
+    walkViewChildren(viewNode, 0, 0, walkCtx, undefined, 0);
+    // Pass 2: resolve connections now that all positions are known
+    resolvePendingViewConnections(walkCtx);
   }
+
+  // Build folder hierarchy from <folder> elements in the diagrams section.
+  // Folders become pseudo-views (no elementIds) with childViewIds linking to sub-folders and views.
+  const viewIdSet = new Set(views.map(v => v.id));
+  const viewByIdMap = new Map(views.map(v => [v.id, v]));
+
+  function walkFolderTree(folderEl: Element): string[] {
+    const directChildIds: string[] = [];
+
+    for (const child of Array.from(folderEl.children)) {
+      const tag = localName(child).toLowerCase();
+
+      if (tag === 'folder') {
+        const folderId = getAttr(child, ['id', 'identifier']);
+        const folderName = getName(child) || getAttr(child, ['name']) || 'Folder';
+        if (!folderId) continue;
+
+        // Recurse into sub-folder first to collect its children
+        const subChildIds = walkFolderTree(child);
+
+        // Only create a folder entry if it has children (views or sub-folders)
+        if (subChildIds.length > 0) {
+          if (!viewIdSet.has(folderId)) {
+            views.push({
+              id: folderId,
+              name: folderName,
+              childViewIds: subChildIds,
+            });
+            viewIdSet.add(folderId);
+            viewByIdMap.set(folderId, views[views.length - 1]);
+          } else {
+            // Folder ID collides with an existing view — update its children
+            const existing = viewByIdMap.get(folderId);
+            if (existing) existing.childViewIds = subChildIds;
+          }
+          directChildIds.push(folderId);
+        }
+      } else {
+        // Check if this child is a view (already collected)
+        const childId = getAttr(child, ['id', 'identifier']);
+        if (childId && viewIdSet.has(childId)) {
+          directChildIds.push(childId);
+        }
+      }
+    }
+
+    return directChildIds;
+  }
+
+  // Find the top-level diagrams folder(s) and walk them
+  const diagramsFolders = allNodes.filter(n => {
+    const tag = localName(n).toLowerCase();
+    if (tag !== 'folder') return false;
+    const type = getAttr(n, ['type']);
+    return type === 'diagrams';
+  });
+
+  // Track which views end up as children of a folder
+  const childViewIdSet = new Set<string>();
+
+  for (const df of diagramsFolders) {
+    const topChildIds = walkFolderTree(df);
+    for (const cid of topChildIds) childViewIdSet.add(cid);
+  }
+
+  // For views that are direct children of the diagrams folder (not inside a sub-folder),
+  // they remain as root-level views. Views inside sub-folders are already linked via childViewIds.
+  // Mark views that are children of folders so they don't appear as roots.
+  // (The Sidebar's getRootViews filters by parentMap, which is built from childViewIds.)
 
   if (semanticElements.length === 0) {
     return {
@@ -527,11 +869,61 @@ function finalizeCoArchiModel(
     });
   }
 
+  // Normalize coordinates per view: shift so the top-left of content starts near (50, 50)
+  const ORIGIN_PADDING = 50;
+  const viewIdSet = new Set(views.map(v => v.id));
+  for (const viewId of viewIdSet) {
+    const nodesInView = viewNodes.filter(n => n.viewId === viewId);
+    if (nodesInView.length === 0) continue;
+
+    const minX = Math.min(...nodesInView.map(n => n.x));
+    const minY = Math.min(...nodesInView.map(n => n.y));
+    const dx = ORIGIN_PADDING - minX;
+    const dy = ORIGIN_PADDING - minY;
+
+    // Skip if already near origin
+    if (Math.abs(dx) < 1 && Math.abs(dy) < 1) continue;
+
+    for (const node of nodesInView) {
+      node.x += dx;
+      node.y += dy;
+    }
+
+    // Shift waypoints for connections in this view by the same offset
+    const connectionsInView = viewConnections.filter(c => c.viewId === viewId);
+    for (const conn of connectionsInView) {
+      conn.waypoints = conn.waypoints.map(wp => ({ x: wp.x + dx, y: wp.y + dy }));
+    }
+  }
+
+  // Remove phantom views — entries that have no diagram content (no viewNodes)
+  // and no meaningful name (name is just the raw ID). These are typically
+  // structural XML nodes that were incorrectly promoted to views.
+  const viewNodeCountById = new Map<string, number>();
+  for (const vn of viewNodes) {
+    viewNodeCountById.set(vn.viewId, (viewNodeCountById.get(vn.viewId) ?? 0) + 1);
+  }
+  const filteredViews = views.filter(v => {
+    const hasContent = (viewNodeCountById.get(v.id) ?? 0) > 0;
+    const hasRealName = v.name !== v.id && !/^id-[0-9a-f]/i.test(v.name);
+    return hasContent || hasRealName;
+  });
+  // If filtering removed all views, keep originals (safety net)
+  const finalViews = filteredViews.length > 0 ? filteredViews : views;
+
+  if (views.length !== finalViews.length) {
+    diagnostics.push({
+      severity: 'info',
+      code: 'COARCHI_PHANTOM_VIEWS_REMOVED',
+      message: `Removed ${views.length - finalViews.length} empty phantom views (no diagram content and no name).`,
+    });
+  }
+
   const model: CanonicalModelDocument = {
     version: 'openarchi-0.1',
     elements,
     relationships,
-    views,
+    views: finalViews,
     viewNodes,
     viewConnections,
     metadata: {
@@ -545,8 +937,9 @@ function finalizeCoArchiModel(
 /**
  * Parse a fragmented coArchi directory where each element/relationship/view
  * is stored as an individual XML file (e.g. model/business/*.xml, model/relations/*.xml).
+ * Optionally accepts file paths for path-aware hierarchy building.
  */
-export function parseCoArchiFragments(xmlContents: string[]): ParseResult {
+export function parseCoArchiFragments(xmlContents: string[], filePaths?: string[]): ParseResult {
   if (typeof DOMParser === 'undefined') {
     return {
       diagnostics: [{
@@ -570,35 +963,53 @@ export function parseCoArchiFragments(xmlContents: string[]): ParseResult {
   const viewNodeKeys = new Set<string>();
   const viewConnectionKeys = new Set<string>();
 
-  for (const raw of xmlContents) {
+  // Two-pass approach: first collect all elements and relationships across all
+  // files, then process views. This ensures that element/relationship IDs are
+  // fully known before views reference them via walkViewChildren.
+
+  // Collect parsed documents and deferred view candidates
+  const parsedDocs: Document[] = [];
+  const deferredViews: { doc: Document; node: Element; id: string; path?: string }[] = [];
+  let skippedRelCount = 0;
+  const skippedRelSample: { id: string; tag: string; sourceId: string; targetId: string; attrs: string }[] = [];
+
+  // Pass 1: collect elements, relationships, and identify views
+  for (let fileIdx = 0; fileIdx < xmlContents.length; fileIdx++) {
+    const raw = xmlContents[fileIdx];
     const doc = new DOMParser().parseFromString(raw, 'application/xml');
     if (doc.querySelector('parsererror')) continue;
+    parsedDocs.push(doc);
 
     const allNodes = Array.from(doc.querySelectorAll('*'));
 
-    // Extract elements and relationships
     for (const node of allNodes) {
       const id = getAttr(node, ['identifier', 'id']);
       if (!id) continue;
 
       const tag = localName(node);
       const tagLower = tag.toLowerCase();
-      // Use xsi:type or type attribute, falling back to the tag name itself
-      // (coArchi fragments use the tag name as type, e.g. <archimate:BusinessActor>)
       const rawType = getAttr(node, ['xsi:type', 'type']) || tag;
       const typeName = extractTypeName(rawType).toLowerCase();
 
-      const isRelationshipByTag = tagLower === 'relationship';
+      const isRelationshipByTag = tagLower === 'relationship' || tagLower.endsWith('relationship');
       const isRelationshipByType = typeName.endsWith('relationship');
 
       if (isRelationshipByTag || isRelationshipByType) {
         if (relationshipIds.has(id)) continue;
 
-        const sourceId = getAttr(node, ['source', 'sourceRef']);
-        const targetId = getAttr(node, ['target', 'targetRef']);
-        if (!sourceId || !targetId) continue;
+        const sourceId = getRef(node, ['source', 'sourceRef']);
+        const targetId = getRef(node, ['target', 'targetRef']);
+        if (!sourceId || !targetId) {
+          // Track skipped relationships for diagnostics
+          if (skippedRelSample.length < 5) skippedRelSample.push({
+            id, tag, sourceId: sourceId ?? '(missing)', targetId: targetId ?? '(missing)',
+            attrs: Array.from(node.attributes).map(a => `${a.name}=${a.value.slice(0, 40)}`).join(', '),
+          });
+          skippedRelCount++;
+          continue;
+        }
 
-        const mappedType = mapRelationshipType(rawType);
+        const mappedType = mapRelationshipType(rawType, tag);
         if (!mappedType) {
           diagnostics.push({
             severity: 'warning',
@@ -619,35 +1030,22 @@ export function parseCoArchiFragments(xmlContents: string[]): ParseResult {
         continue;
       }
 
-      // Check if it's a view/diagram
-      if (tagLower === 'view' || /diagrammodel/i.test(typeName) || /diagrammodel/i.test(tag)) {
-        if (viewIds.has(id)) continue;
-
-        allViews.push({
-          id,
-          name: getName(node) || id,
-          childViewIds: [],
-        });
-        viewIds.add(id);
-
-        // Recursively walk the view tree, accumulating parent offsets for relative coordinates
-        const walkCtx: ViewWalkContext = {
-          viewId: id,
-          elementIds,
-          relationshipIds,
-          viewNodeKeys,
-          viewConnectionKeys,
-          viewNodes: allViewNodes,
-          viewConnections: allViewConnections,
-          relationships: allRelationships,
-          fallbackIndex: 0,
-        };
-        walkViewChildren(node, 0, 0, walkCtx);
+      // Defer views for pass 2 — match by tag name AND xsi:type.
+      // Exclude non-view diagram objects (references, notes, groups, child objects, connections).
+      const isNonViewDiagramObj = /diagrammodel(reference|note|group)/i.test(tag)
+        || /diagrammodel(reference|note|group)/i.test(typeName)
+        || /diagramobject|diagramconnection/i.test(typeName);
+      if (!isNonViewDiagramObj &&
+        (tagLower === 'view' || /diagrammodel/i.test(tag) || /diagrammodel/i.test(typeName))) {
+        if (!viewIds.has(id)) {
+          deferredViews.push({ doc, node, id, path: filePaths?.[fileIdx] });
+          viewIds.add(id);
+        }
         continue;
       }
 
       // Regular element
-      const mappedType = mapElementType(rawType);
+      const mappedType = mapElementType(rawType, node);
       if (!mappedType) continue;
       if (elementIds.has(id)) continue;
 
@@ -661,6 +1059,75 @@ export function parseCoArchiFragments(xmlContents: string[]): ParseResult {
     }
   }
 
+  // Log skipped relationships (missing source/target) for diagnostics
+  if (skippedRelCount > 0) {
+    diagnostics.push({
+      severity: 'warning',
+      code: 'COARCHI_REL_MISSING_ENDPOINTS',
+      message: `${skippedRelCount} relationships skipped (missing source/target ref). First: ${skippedRelSample[0]?.attrs || 'n/a'}`,
+    });
+  }
+
+  // Pass 2: process views now that all elements and relationships are known
+  // Build view name lookup for view references
+  const viewNameById = new Map<string, string>();
+  for (const dv of deferredViews) {
+    viewNameById.set(dv.id, getName(dv.node) || dv.id);
+  }
+
+  for (const { node, id } of deferredViews) {
+    allViews.push({
+      id,
+      name: getName(node) || id,
+      childViewIds: [],
+    });
+
+    const walkCtx: ViewWalkContext = {
+      viewId: id,
+      elementIds,
+      relationshipIds,
+      viewNodeKeys,
+      viewConnectionKeys,
+      viewNodes: allViewNodes,
+      viewConnections: allViewConnections,
+      relationships: allRelationships,
+      elements: allElements,
+      viewNameById,
+      fallbackIndex: 0,
+      pendingConnections: [],
+    };
+    walkViewChildren(node, 0, 0, walkCtx, undefined, 0);
+    resolvePendingViewConnections(walkCtx);
+  }
+
+  // Build folder hierarchy from file paths (if available)
+  if (filePaths) {
+    const viewPathById = new Map<string, string>();
+    for (const dv of deferredViews) {
+      if (dv.path) viewPathById.set(dv.id, dv.path);
+    }
+
+    // For each view, find views whose path is a direct child directory
+    for (const parentView of allViews) {
+      const parentPath = viewPathById.get(parentView.id);
+      if (!parentPath) continue;
+      // Parent directory of this view file
+      const parentDir = parentPath.replace(/\/[^/]+$/, '');
+
+      for (const childView of allViews) {
+        if (childView.id === parentView.id) continue;
+        const childPath = viewPathById.get(childView.id);
+        if (!childPath) continue;
+        // Child's grandparent directory should match parent's directory
+        const childDir = childPath.replace(/\/[^/]+$/, '');
+        const childGrandDir = childDir.replace(/\/[^/]+$/, '');
+        if (childGrandDir === parentDir && childDir !== parentDir) {
+          parentView.childViewIds.push(childView.id);
+        }
+      }
+    }
+  }
+
   if (allElements.length === 0) {
     return {
       diagnostics: [{
@@ -669,6 +1136,26 @@ export function parseCoArchiFragments(xmlContents: string[]): ParseResult {
         message: 'No ArchiMate elements were found in the directory.',
       }],
     };
+  }
+
+  // Diagnostic: verify relationship endpoint integrity
+  const orphanedRels = allRelationships.filter(r => !elementIds.has(r.sourceId) || !elementIds.has(r.targetId));
+  if (orphanedRels.length > 0) {
+    diagnostics.push({
+      severity: 'warning',
+      code: 'COARCHI_ORPHANED_RELATIONSHIPS',
+      message: `${orphanedRels.length} of ${allRelationships.length} relationships reference elements not found in the model.`,
+    });
+  }
+
+  // Diagnostic: verify view node integrity
+  const viewNodesWithoutElement = allViewNodes.filter(vn => !elementIds.has(vn.elementId));
+  if (viewNodesWithoutElement.length > 0) {
+    diagnostics.push({
+      severity: 'warning',
+      code: 'COARCHI_VIEWNODE_MISSING_ELEMENT',
+      message: `${viewNodesWithoutElement.length} view nodes reference elements not in the model (synthetic diagram objects are expected).`,
+    });
   }
 
   return finalizeCoArchiModel(allElements, allRelationships, allViews, allViewNodes, allViewConnections, diagnostics);

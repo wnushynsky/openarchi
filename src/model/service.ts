@@ -1,5 +1,6 @@
 import type { OpenArchiModel } from '../types';
 import { AdapterRegistry } from '../io/adapter';
+import type { ModelFormatAdapter } from '../io/adapter';
 import { openArchiJsonAdapter } from '../io/adapters/openarchi-json';
 import { coArchiXmlAdapter, parseCoArchiFragments } from '../io/adapters/coarchi-xml';
 import { archiMateExchangeXmlAdapter } from '../io/adapters/archimate-exchange-xml';
@@ -27,15 +28,15 @@ export interface ModelExportResult {
   diagnostics: ModelDiagnostic[];
 }
 
-export function listModelFormats() {
+export function listModelFormats(): ModelFormatAdapter[] {
   return registry.list();
 }
 
-export function detectModelFormatByFileName(fileName: string) {
+export function detectModelFormatByFileName(fileName: string): ModelFormatAdapter | undefined {
   const lower = fileName.toLowerCase();
   if (lower.endsWith('.openarchi.json') || lower.endsWith('.json')) return registry.getById('openarchi-json');
   if (lower.endsWith('.coarchi.xml') || lower.endsWith('.coarchi')) return registry.getById('coarchi-xml');
-  if (lower.endsWith('.archimate.xml') || lower.endsWith('.archimate')) return registry.getById('archimate-exchange-xml');
+  if (lower.endsWith('.archimate.xml') || lower.endsWith('.archimate')) return registry.getById('coarchi-xml');
   return registry.detectByFileName(fileName);
 }
 
@@ -77,7 +78,7 @@ export function isFragmentedModelDirectory(files: OpenFileEntry[]): boolean {
 
   // Check for typical coArchi/GRAFICO directory structure patterns
   // The "model" folder can appear at any depth (root, or nested under project name)
-  const graficoFolders = new Set(['model', 'relations', 'views']);
+  const graficoFolders = new Set(['model', 'relations', 'views', 'diagrams']);
   const hasModelSubdir = xmlFiles.some(f => {
     const parts = f.relativePath.toLowerCase().split('/');
     // Check the first few path segments for typical GRAFICO folder names
@@ -119,6 +120,7 @@ export async function importFragmentedModel(files: OpenFileEntry[]): Promise<Mod
   // Read files in batches to avoid memory pressure
   const BATCH_SIZE = 50;
   const contents: string[] = [];
+  const paths: string[] = [];
   const errors: string[] = [];
 
   for (let i = 0; i < xmlFiles.length; i += BATCH_SIZE) {
@@ -131,6 +133,7 @@ export async function importFragmentedModel(files: OpenFileEntry[]): Promise<Mod
       const result = results[j];
       if (result.status === 'fulfilled') {
         contents.push(result.value);
+        paths.push(batch[j].relativePath);
       } else {
         errors.push(`Failed to read ${batch[j].relativePath}: ${result.reason}`);
       }
@@ -152,7 +155,7 @@ export async function importFragmentedModel(files: OpenFileEntry[]): Promise<Mod
     };
   }
 
-  const parsed = parseCoArchiFragments(contents);
+  const parsed = parseCoArchiFragments(contents, paths);
 
   if (!parsed.model || hasDiagnosticErrors(parsed.diagnostics)) {
     return { diagnostics: parsed.diagnostics };

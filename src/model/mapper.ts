@@ -13,8 +13,8 @@ import type {
   CanonicalViewNode,
 } from './canonical';
 
-const DEFAULT_ELEMENT_WIDTH = 160;
-const DEFAULT_ELEMENT_HEIGHT = 72;
+const DEFAULT_ELEMENT_WIDTH = 120;
+const DEFAULT_ELEMENT_HEIGHT = 55;
 
 function ensureViews(model: OpenArchiModel): ModelView[] {
   if (model.views.length > 0) return model.views;
@@ -121,6 +121,12 @@ export function canonicalToEditorModel(document: CanonicalModelDocument): OpenAr
       h: node?.height ?? DEFAULT_ELEMENT_HEIGHT,
       documentation: element.documentation || '',
       linkedViewId: node?.linkedViewId,
+      zIndex: node?.nestingDepth ?? 0,
+      style: node?.style ? {
+        fillColor: node.style.fillColor,
+        lineColor: node.style.lineColor,
+        fontColor: node.style.fontColor,
+      } : undefined,
     };
   });
 
@@ -141,15 +147,18 @@ export function canonicalToEditorModel(document: CanonicalModelDocument): OpenAr
       name: relationship.name,
       waypoints: connection?.waypoints || [],
       labelPos: connection?.labelPosition ?? 0.5,
+      relativeBendpoints: connection?.relativeBendpoints,
     };
   });
 
   const nodeIdsByView = new Map<string, Set<string>>();
   for (const node of document.viewNodes) {
-    if (!nodeIdsByView.has(node.viewId)) {
-      nodeIdsByView.set(node.viewId, new Set());
+    let nodeIds = nodeIdsByView.get(node.viewId);
+    if (!nodeIds) {
+      nodeIds = new Set<string>();
+      nodeIdsByView.set(node.viewId, nodeIds);
     }
-    nodeIdsByView.get(node.viewId)!.add(node.elementId);
+    nodeIds.add(node.elementId);
   }
 
   const mappedViews: ModelView[] = document.views.map(view => ({

@@ -1,18 +1,18 @@
 import { useState, useRef, useCallback, useEffect, useMemo } from 'react';
 import type {
   ModelElement, ModelRelationship, ModelView,
-  Camera, DragState, PanState, DrawingRelState, DragWPState, DragEndpointState, DragLabelState,
-  RelPickerState, CtxMenuState, GridType, LeftPanel, SelectionType, ResizeState,
+  Camera, DragState, PanState, DrawingRelState, DragWPState, DragEndpointState, DragLabelState, DragSegmentState,
+  RelPickerState, CtxMenuState, CtxMenuItem, GridType, SelectionType, ResizeState,
 } from './types';
 import type { CanonicalModelDocument } from './model/canonical';
 import {
   LAYERS, ELEMENT_TYPES, RELATIONSHIP_TYPES, FONT,
   snap, uid, GRID,
   nearestAnchor, getRelPoints, nearestTOnPath,
-  hitTestElement, hitTestAnchor, hitTestWaypoint, hitTestEndpoint, hitTestRelationship, hitTestLabel, hitTestPopout,
+  hitTestElement, hitTestAnchor, hitTestWaypoint, hitTestEndpoint, hitTestRelationship, hitTestLabel, hitTestPopout, getSegmentOrientation,
   hitTestResizeHandle, HANDLE_CURSORS,
   SAMPLE_ELEMENTS, SAMPLE_RELATIONSHIPS, SAMPLE_VIEWS,
-  snapToElements, snapResizeToElements, type SnapGuide,
+  snapToElements, type SnapGuide,
 } from './core';
 import { drawDotGrid, drawLineGrid, drawElement, drawRelationship, drawSnapGuides, getRelSegments, type RelSegments } from './canvas';
 import { RelPicker, CtxMenu, SearchPanel, ViewNav, PropertyPanel, Btn, CanvasIcon, FloatingToolbar } from './components';
@@ -29,6 +29,7 @@ import {
   type DirectoryState,
   type OpenFileEntry,
 } from './io/filesystem';
+import type { ModelDiagnostic } from './model/diagnostics';
 
 const getLayer = (type: string) => ELEMENT_TYPES[type]?.layer;
 const isNote = (type: string) => !!ELEMENT_TYPES[type]?.isNote;
@@ -39,11 +40,15 @@ interface ElementViewLayout {
   w: number;
   h: number;
   linkedViewId?: string;
+  zIndex?: number;
+  isParent?: boolean;
+  style?: import('./types').ElementStyle;
 }
 
 interface RelationshipViewLayout {
   waypoints: { x: number; y: number }[];
   labelPos: number;
+  relativeBendpoints?: import('./types').RelativeBendpoint[];
 }
 
 type ElementLayoutsByView = Record<string, Record<string, ElementViewLayout>>;
@@ -70,6 +75,8 @@ function buildLayoutsFromEditorModel(
         w: element.w,
         h: element.h,
         linkedViewId: element.linkedViewId,
+        zIndex: element.zIndex,
+        style: element.style,
       };
     }
 
@@ -78,6 +85,7 @@ function buildLayoutsFromEditorModel(
       relationshipLayouts[view.id][relationship.id] = {
         waypoints: relationship.waypoints || [],
         labelPos: relationship.labelPos ?? 0.5,
+        relativeBendpoints: relationship.relativeBendpoints,
       };
     }
   }
@@ -96,6 +104,12 @@ function buildLayoutsFromCanonicalDocument(
     relationshipLayouts[view.id] = {};
   }
 
+  // Build a map from viewNode ID to elementId for parent resolution
+  const viewNodeIdToElementId = new Map<string, string>();
+  for (const node of document.viewNodes) {
+    viewNodeIdToElementId.set(node.id, node.elementId);
+  }
+
   for (const node of document.viewNodes) {
     if (!elementLayouts[node.viewId]) elementLayouts[node.viewId] = {};
     elementLayouts[node.viewId][node.elementId] = {
@@ -104,7 +118,19 @@ function buildLayoutsFromCanonicalDocument(
       w: node.width,
       h: node.height,
       linkedViewId: node.linkedViewId,
+      zIndex: node.nestingDepth ?? 0,
+      style: node.style ? { fillColor: node.style.fillColor, lineColor: node.style.lineColor, fontColor: node.style.fontColor } : undefined,
     };
+  }
+
+  // Mark elements that are structural parents (have children nested inside them)
+  for (const node of document.viewNodes) {
+    if (node.parentNodeId) {
+      const parentElementId = viewNodeIdToElementId.get(node.parentNodeId);
+      if (parentElementId && elementLayouts[node.viewId]?.[parentElementId]) {
+        elementLayouts[node.viewId][parentElementId].isParent = true;
+      }
+    }
   }
 
   for (const connection of document.viewConnections) {
@@ -112,6 +138,7 @@ function buildLayoutsFromCanonicalDocument(
     relationshipLayouts[connection.viewId][connection.relationshipId] = {
       waypoints: connection.waypoints || [],
       labelPos: connection.labelPosition ?? 0.5,
+      relativeBendpoints: connection.relativeBendpoints,
     };
   }
 
@@ -127,6 +154,8 @@ export default function App() {
   const [elements, setElements] = useState<ModelElement[]>(SAMPLE_ELEMENTS);
   const [relationships, setRelationships] = useState<ModelRelationship[]>(SAMPLE_RELATIONSHIPS);
 
+  const [importDiag, setImportDiag] = useState<string | null>(null);
+
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [selType, setSelType] = useState<SelectionType>(null);
   const [activeLayer, setActiveLayer] = useState('business');
@@ -140,16 +169,17 @@ export default function App() {
   const [dragWP, setDragWP] = useState<DragWPState | null>(null);
   const [dragEndpoint, setDragEndpoint] = useState<DragEndpointState | null>(null);
   const [dragLabel, setDragLabel] = useState<DragLabelState | null>(null);
+  const [dragSegment, setDragSegment] = useState<DragSegmentState | null>(null);
   const [resizing, setResizing] = useState<ResizeState | null>(null);
   const [relPicker, setRelPicker] = useState<RelPickerState | null>(null);
   const [ctxMenu, setCtxMenu] = useState<CtxMenuState | null>(null);
   const [showSearch, setShowSearch] = useState(false);
   const [ioFormatId, setIoFormatId] = useState<string>('auto');
-  const [leftPanel, setLeftPanel] = useState<LeftPanel>('views');
   const [leftPanelWidth, setLeftPanelWidth] = useState(244);
   const [propSide, setPropSide] = useState<'left' | 'right'>('left');
   const [openTabIds, setOpenTabIds] = useState<string[]>(['v1']);
   const [editingElId, setEditingElId] = useState<string | null>(null);
+  const [interactionMode, setInteractionMode] = useState<'view' | 'edit'>('edit');
   const [editingName, setEditingName] = useState('');
   const [showLegend, setShowLegend] = useState(false);
   const [snapGuides, setSnapGuides] = useState<SnapGuide[]>([]);
@@ -159,6 +189,24 @@ export default function App() {
   const [activeFileEntry, setActiveFileEntry] = useState<OpenFileEntry | null>(null);
   const [activeFormatId, setActiveFormatId] = useState<string | null>(null);
   const [isDirty, setIsDirty] = useState(false);
+
+  const showTransientDiagnostic = useCallback((message: string, timeoutMs: number = 8000) => {
+    setImportDiag(message);
+    setTimeout(() => {
+      setImportDiag(current => (current === message ? null : current));
+    }, timeoutMs);
+  }, []);
+
+  const summarizeDiagnostics = useCallback((scope: string, diagnostics: ModelDiagnostic[]) => {
+    if (diagnostics.length === 0) return;
+    const errors = diagnostics.filter(diagnostic => diagnostic.severity === 'error');
+    const warnings = diagnostics.filter(diagnostic => diagnostic.severity === 'warning');
+    const first = diagnostics[0];
+    const summary = `${scope}: ${first.message}`
+      + (errors.length > 0 ? ` | errors=${errors.length}` : '')
+      + (warnings.length > 0 ? ` | warnings=${warnings.length}` : '');
+    showTransientDiagnostic(summary);
+  }, [showTransientDiagnostic]);
 
   // Undo/Redo history — snapshots are pushed explicitly at interaction boundaries
   interface HistorySnapshot { elements: ModelElement[]; relationships: ModelRelationship[]; views: ModelView[] }
@@ -250,11 +298,43 @@ export default function App() {
   );
 
   const visibleRelationships = useMemo(
-    () => relationships.filter(relationship =>
-      visibleElementIds.has(relationship.sourceId) && visibleElementIds.has(relationship.targetId),
-    ),
-    [relationships, visibleElementIds],
+    () => {
+      // Build element lookup for containment checks
+      const elMap = new Map(elements.map(e => [e.id, e]));
+
+      const visible = relationships.filter(relationship => {
+        if (!visibleElementIds.has(relationship.sourceId) || !visibleElementIds.has(relationship.targetId)) return false;
+
+        // Hide connections between parent and child when one visually contains the other.
+        // This matches Archi's behavior of hiding nested connections for composition/aggregation.
+        const src = elMap.get(relationship.sourceId);
+        const tgt = elMap.get(relationship.targetId);
+        if (src && tgt) {
+          const srcContainsTgt = tgt.x >= src.x && tgt.y >= src.y &&
+            tgt.x + tgt.w <= src.x + src.w && tgt.y + tgt.h <= src.y + src.h;
+          const tgtContainsSrc = src.x >= tgt.x && src.y >= tgt.y &&
+            src.x + src.w <= tgt.x + tgt.w && src.y + src.h <= tgt.y + tgt.h;
+          if (srcContainsTgt || tgtContainsSrc) return false;
+        }
+
+        return true;
+      });
+      return visible;
+    },
+    [relationships, visibleElementIds, elements],
   );
+
+  useEffect(() => {
+    if (relationships.length > 0 && visibleRelationships.length === 0 && visibleElementIds.size > 0) {
+      const sample = relationships.slice(0, 3);
+      const elSample = Array.from(visibleElementIds).slice(0, 3);
+      showTransientDiagnostic(
+        `${relationships.length} relationships loaded but none visible in current view (${visibleElementIds.size} elements). `
+        + `Sample endpoints: ${sample.map(relationship => `${relationship.sourceId}->${relationship.targetId}`).join(', ')}. `
+        + `Sample view element IDs: ${elSample.join(', ')}`,
+      );
+    }
+  }, [relationships, visibleRelationships, visibleElementIds, showTransientDiagnostic]);
 
   // Element lookup map for O(1) access in getRelPoints/drawRelationship
   const visibleElementMap = useMemo(
@@ -282,6 +362,8 @@ export default function App() {
         w: element.w,
         h: element.h,
         linkedViewId: element.linkedViewId,
+        zIndex: element.zIndex,
+        style: element.style,
       };
     }
 
@@ -290,6 +372,7 @@ export default function App() {
       relationshipLayout[relationship.id] = {
         waypoints: relationship.waypoints || [],
         labelPos: relationship.labelPos ?? 0.5,
+        relativeBendpoints: relationship.relativeBendpoints,
       };
     }
 
@@ -317,6 +400,8 @@ export default function App() {
         w: layout.w,
         h: layout.h,
         linkedViewId: layout.linkedViewId,
+        zIndex: layout.zIndex ?? element.zIndex ?? 0,
+        style: layout.style ?? element.style,
       };
     }));
 
@@ -327,9 +412,67 @@ export default function App() {
         ...relationship,
         waypoints: layout.waypoints,
         labelPos: layout.labelPos,
+        relativeBendpoints: layout.relativeBendpoints,
       };
     }));
   }, []);
+
+  // ==================== CAMERA ====================
+  const [cam, setCam] = useState<Camera>({ x: 0, y: 0, s: 1 });
+  const [cSize, setCSize] = useState({ w: 800, h: 600 });
+
+  // rAF-throttled camera updates — avoids re-rendering more than once per frame
+  const camPendingRef = useRef<Camera | null>(null);
+  const camRafRef = useRef(0);
+  const setCamThrottled = useCallback((next: Camera | ((prev: Camera) => Camera)) => {
+    if (typeof next === 'function') {
+      const current = camPendingRef.current ?? cam;
+      camPendingRef.current = next(current);
+    } else {
+      camPendingRef.current = next;
+    }
+    if (!camRafRef.current) {
+      camRafRef.current = requestAnimationFrame(() => {
+        camRafRef.current = 0;
+        if (camPendingRef.current) {
+          setCam(camPendingRef.current);
+          camPendingRef.current = null;
+        }
+      });
+    }
+  }, [cam]);
+
+  // Fit camera to show all elements with padding
+  const fitToContent = useCallback((els?: ModelElement[]) => {
+    const targets = els ?? elements;
+    if (targets.length === 0) return;
+
+    const minX = Math.min(...targets.map(e => e.x));
+    const minY = Math.min(...targets.map(e => e.y));
+    const maxX = Math.max(...targets.map(e => e.x + e.w));
+    const maxY = Math.max(...targets.map(e => e.y + e.h));
+
+    const contentW = maxX - minX;
+    const contentH = maxY - minY;
+    if (contentW < 1 || contentH < 1) return;
+
+    const pad = 60;
+    const canvasW = cSize.w;
+    const canvasH = cSize.h;
+
+    const scaleX = canvasW / (contentW + pad * 2);
+    const scaleY = canvasH / (contentH + pad * 2);
+    const s = Math.min(scaleX, scaleY, 1.5);
+
+    const cx = minX + contentW / 2;
+    const cy = minY + contentH / 2;
+
+    setCam({
+      s,
+      x: canvasW / 2 - cx * s,
+      y: canvasH / 2 - cy * s,
+    });
+  }, [elements, cSize]);
 
   // ==================== BACK / FORWARD NAVIGATION ====================
   const viewHistory = useRef<string[]>(['v1']);
@@ -351,7 +494,16 @@ export default function App() {
     isNavAction.current = false;
     setCurrentViewId(id);
     setOpenTabIds(prev => prev.includes(id) ? prev : [...prev, id]);
-  }, [currentViewId, saveViewLayoutSnapshot, applyViewLayout]);
+
+    // Fit camera to the new view's content using layout data
+    const layoutEls = elementLayoutsByViewRef.current[id];
+    if (layoutEls) {
+      const laidOut = elements
+        .filter(e => layoutEls[e.id])
+        .map(e => ({ ...e, ...layoutEls[e.id], w: layoutEls[e.id].w, h: layoutEls[e.id].h }));
+      if (laidOut.length > 0) fitToContent(laidOut);
+    }
+  }, [currentViewId, saveViewLayoutSnapshot, applyViewLayout, elements, fitToContent]);
 
   const canGoBack = historyIdx.current > 0;
   const canGoForward = historyIdx.current < viewHistory.current.length - 1;
@@ -386,32 +538,6 @@ export default function App() {
     });
   }, [currentViewId, saveViewLayoutSnapshot, applyViewLayout]);
 
-  const [cam, setCam] = useState<Camera>({ x: 0, y: 0, s: 1 });
-  const [cSize, setCSize] = useState({ w: 800, h: 600 });
-
-  // rAF-throttled camera updates — avoids re-rendering more than once per frame
-  const camPendingRef = useRef<Camera | null>(null);
-  const camRafRef = useRef(0);
-  const setCamThrottled = useCallback((next: Camera | ((prev: Camera) => Camera)) => {
-    // Resolve the next value
-    if (typeof next === 'function') {
-      // Need current cam — use ref
-      const current = camPendingRef.current ?? cam;
-      camPendingRef.current = next(current);
-    } else {
-      camPendingRef.current = next;
-    }
-    if (!camRafRef.current) {
-      camRafRef.current = requestAnimationFrame(() => {
-        camRafRef.current = 0;
-        if (camPendingRef.current) {
-          setCam(camPendingRef.current);
-          camPendingRef.current = null;
-        }
-      });
-    }
-  }, [cam]);
-
   // Resize observer
   useEffect(() => {
     const c = containerRef.current;
@@ -428,46 +554,68 @@ export default function App() {
     y: (sy - cam.y) / cam.s,
   }), [cam]);
 
-  // Pre-compute parent IDs using spatial index for large models (avoid O(n²))
+  // Pre-compute parent IDs — prefer structural data from import, fall back to spatial detection
   const parentIds = useMemo(() => {
     const ids = new Set<string>();
-    const n = visibleElements.length;
-    // For small sets, brute force is fine. For larger sets, use sorted-edge approach.
-    if (n < 200) {
-      for (const outer of visibleElements) {
-        for (const inner of visibleElements) {
-          if (inner.id === outer.id) continue;
-          if (inner.x >= outer.x && inner.y >= outer.y &&
-              inner.x + inner.w <= outer.x + outer.w &&
-              inner.y + inner.h <= outer.y + outer.h) {
-            ids.add(outer.id);
-            break;
+
+    // Try structural detection first (from parsed nesting hierarchy)
+    const currentLayout = elementLayoutsByViewRef.current[currentViewId] || {};
+    for (const [elementId, layout] of Object.entries(currentLayout)) {
+      if (layout.isParent) ids.add(elementId);
+    }
+
+    // If no structural data available, fall back to spatial containment detection
+    if (ids.size === 0 && visibleElements.length > 0) {
+      const n = visibleElements.length;
+      if (n < 200) {
+        for (const outer of visibleElements) {
+          for (const inner of visibleElements) {
+            if (inner.id === outer.id) continue;
+            if (inner.x >= outer.x && inner.y >= outer.y &&
+                inner.x + inner.w <= outer.x + outer.w &&
+                inner.y + inner.h <= outer.y + outer.h) {
+              ids.add(outer.id);
+              break;
+            }
           }
         }
-      }
-    } else {
-      // Sort by area descending — larger elements are more likely parents
-      const byArea = [...visibleElements].sort((a, b) => (b.w * b.h) - (a.w * a.h));
-      for (let i = 0; i < byArea.length && !ids.has(byArea[i].id); i++) {
-        const outer = byArea[i];
-        for (let j = i + 1; j < byArea.length; j++) {
-          const inner = byArea[j];
-          if (inner.x >= outer.x && inner.y >= outer.y &&
-              inner.x + inner.w <= outer.x + outer.w &&
-              inner.y + inner.h <= outer.y + outer.h) {
-            ids.add(outer.id);
-            break;
+      } else {
+        const byArea = [...visibleElements].sort((a, b) => (b.w * b.h) - (a.w * a.h));
+        for (let i = 0; i < byArea.length && !ids.has(byArea[i].id); i++) {
+          const outer = byArea[i];
+          for (let j = i + 1; j < byArea.length; j++) {
+            const inner = byArea[j];
+            if (inner.x >= outer.x && inner.y >= outer.y &&
+                inner.x + inner.w <= outer.x + outer.w &&
+                inner.y + inner.h <= outer.y + outer.h) {
+              ids.add(outer.id);
+              break;
+            }
           }
         }
       }
     }
     return ids;
-  }, [visibleElements]);
+  }, [visibleElements, currentViewId]);
 
-  const sortedElements = useMemo(
-    () => [...visibleElements].sort((a, b) => (a.zIndex ?? 0) - (b.zIndex ?? 0)),
-    [visibleElements],
-  );
+  // Archi draw order: containers behind children, composites behind non-composites.
+  // Sort by: 1) nesting depth (zIndex), 2) composites before non-composites, 3) area descending (larger behind smaller)
+  const sortedElements = useMemo(() => {
+    const isComp = (el: ModelElement) => {
+      const layer = ELEMENT_TYPES[el.type]?.layer;
+      return layer === 'composite' && el.type !== 'note';
+    };
+    return [...visibleElements].sort((a, b) => {
+      // Primary: lower zIndex draws first (parents behind children)
+      const za = a.zIndex ?? 0, zb = b.zIndex ?? 0;
+      if (za !== zb) return za - zb;
+      // Secondary: composites draw before non-composites at same depth
+      const ca = isComp(a) ? 0 : 1, cb = isComp(b) ? 0 : 1;
+      if (ca !== cb) return ca - cb;
+      // Tertiary: larger elements draw first (behind smaller ones)
+      return (b.w * b.h) - (a.w * a.h);
+    });
+  }, [visibleElements]);
 
   // Track canvas dimensions to avoid unnecessary reallocation
   const canvasDimsRef = useRef({ w: 0, h: 0 });
@@ -476,7 +624,8 @@ export default function App() {
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
-    const ctx = canvas.getContext('2d')!;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
     const dpr = window.devicePixelRatio || 1;
     const pw = cSize.w * dpr, ph = cSize.h * dpr;
     // Only resize canvas buffer when dimensions actually change (expensive operation)
@@ -511,18 +660,15 @@ export default function App() {
 
     const culledElements = sortedElements.filter(inViewport);
 
-    // 1. Composite elements (background)
+    // Elements — single pass sorted by zIndex (parents draw before children)
     for (const el of culledElements) {
-      if (getLayer(el.type) === 'composite' && !isNote(el.type)) {
-        drawElement(ctx, el, selType === 'element' && selectedId === el.id, hovElId === el.id, (selType === 'element' && selectedId === el.id) || hovElId === el.id, parentIds.has(el.id));
-      }
-    }
-
-    // 2. Non-composite elements + notes
-    for (const el of culledElements) {
-      if (getLayer(el.type) !== 'composite' || isNote(el.type)) {
-        drawElement(ctx, el, selType === 'element' && selectedId === el.id, hovElId === el.id, (selType === 'element' && selectedId === el.id) || hovElId === el.id, parentIds.has(el.id));
-      }
+      drawElement(
+        ctx,
+        el,
+        selType === 'element' && selectedId === el.id,
+        (selType === 'element' && selectedId === el.id) || hovElId === el.id,
+        parentIds.has(el.id),
+      );
     }
 
     // 3. Relationships (always on top of elements) — with crossing hops
@@ -559,7 +705,7 @@ export default function App() {
         const wps = drawingRel.waypoints;
         const startPt = wps.length > 0 ? wps[0] : null;
         const a = nearestAnchor(src, startPt?.x ?? drawingRel.mx, startPt?.y ?? drawingRel.my);
-        const col = '#3b82f6';
+        const col = '#4a5568';
         ctx.save();
         // Line
         ctx.beginPath();
@@ -595,22 +741,63 @@ export default function App() {
   }, [visibleElements, visibleElementMap, visibleRelationships, sortedElements, parentIds, selectedId, selType, cam, cSize, hovElId, hovRelId, drawingRel, gridType, snapGuides]);
 
   // ==================== MOUSE HANDLERS ====================
+  const isViewMode = interactionMode === 'view';
+
   const handleMouseDown = useCallback((e: React.MouseEvent) => {
-    if (relPicker || ctxMenu) { setRelPicker(null); setCtxMenu(null); return; }
+    if (relPicker || ctxMenu) { setRelPicker(null); setCtxMenu(null); setShowChangelog(false); return; }
     if (editingElId) return;
-    const rect = canvasRef.current!.getBoundingClientRect();
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const rect = canvas.getBoundingClientRect();
     const sx = e.clientX - rect.left, sy = e.clientY - rect.top;
     const { x: wx, y: wy } = s2w(sx, sy);
 
-    if (drawingRel && e.shiftKey) {
-      setDrawingRel(prev => prev ? { ...prev, waypoints: [...prev.waypoints, { x: snap(wx), y: snap(wy) }] } : null);
+    // View mode: only allow selection (inspect), panning, and view navigation
+    if (isViewMode) {
+      const linked = hitTestPopout(visibleElements, wx, wy);
+      if (linked) { navigateToView(linked); return; }
+
+      const el = hitTestElement(visibleElements, wx, wy, getLayer, isNote);
+      if (el) {
+        setSelectedId(el.id); setSelType('element');
+      } else {
+        const rh = hitTestRelationship(visibleRelationships, visibleElements, wx, wy);
+        if (rh) { setSelectedId(rh.rel.id); setSelType('relationship'); }
+        else { setSelectedId(null); setSelType(null); setPanning({ sx: e.clientX, sy: e.clientY, cx: cam.x, cy: cam.y }); }
+      }
       return;
+    }
+
+    // During relationship drawing: click on element = complete, click on empty = add waypoint
+    if (drawingRel) {
+      const tgtEl = hitTestElement(sortedElements, wx, wy, getLayer, isNote);
+      if (tgtEl && tgtEl.id !== drawingRel.sourceId) {
+        // Clicked on target element — complete the connection (handled in mouseUp)
+        // Let it fall through to normal handling
+      } else {
+        // Clicked on empty space or same element — add waypoint
+        setDrawingRel(prev => prev ? { ...prev, waypoints: [...prev.waypoints, { x: snap(wx), y: snap(wy) }] } : null);
+        return;
+      }
     }
 
     const linked = hitTestPopout(visibleElements, wx, wy);
     if (linked) { navigateToView(linked); return; }
 
-    const anch = hitTestAnchor(visibleElements, wx, wy, getLayer, isNote);
+    // Resize handles take priority over everything (they overlap anchor zones at corners)
+    if (selType === 'element' && selectedId) {
+      const selEl = visibleElements.find(e => e.id === selectedId);
+      if (selEl) {
+        const handle = hitTestResizeHandle(selEl, wx, wy);
+        if (handle) {
+          pushHistory();
+          setResizing({ id: selEl.id, handle, startWx: wx, startWy: wy, origX: selEl.x, origY: selEl.y, origW: selEl.w, origH: selEl.h });
+          return;
+        }
+      }
+    }
+
+    const anch = hitTestAnchor(sortedElements, wx, wy, getLayer, isNote);
     if (anch) { setDrawingRel({ sourceId: anch.elId, mx: wx, my: wy, waypoints: [] }); return; }
 
     // Endpoint dragging — only when a relationship is selected
@@ -628,58 +815,150 @@ export default function App() {
     const lbl = hitTestLabel(visibleRelationships, visibleElements, wx, wy);
     if (lbl) { pushHistory(); setDragLabel({ relId: lbl.id }); setSelectedId(lbl.id); setSelType('relationship'); return; }
 
-    // Check resize handles on currently selected element first
-    if (selType === 'element' && selectedId) {
-      const selEl = visibleElements.find(e => e.id === selectedId);
-      if (selEl) {
-        const handle = hitTestResizeHandle(selEl, wx, wy);
-        if (handle) {
-          pushHistory();
-          setResizing({ id: selEl.id, handle, startWx: wx, startWy: wy, origX: selEl.x, origY: selEl.y, origW: selEl.w, origH: selEl.h });
-          return;
-        }
-      }
-    }
-
-    const el = hitTestElement(visibleElements, wx, wy, getLayer, isNote);
+    const el = hitTestElement(sortedElements, wx, wy, getLayer, isNote);
     if (el) {
       setSelectedId(el.id); setSelType('element');
       pushHistory();
       setDragging({ id: el.id, ox: wx - el.x, oy: wy - el.y });
     } else {
       const rh = hitTestRelationship(visibleRelationships, visibleElements, wx, wy);
-      if (rh) { setSelectedId(rh.rel.id); setSelType('relationship'); }
+      if (rh) {
+        setSelectedId(rh.rel.id); setSelType('relationship');
+        // If already selected, start segment drag
+        if (selType === 'relationship' && selectedId === rh.rel.id) {
+          const orient = getSegmentOrientation(rh.rel, visibleElements, rh.segIdx, visibleElementMap);
+          if (orient) {
+            pushHistory();
+            setDragSegment({ relId: rh.rel.id, segIdx: rh.segIdx, orientation: orient, startWx: wx, startWy: wy });
+          }
+        }
+      }
       else { setSelectedId(null); setSelType(null); setPanning({ sx: e.clientX, sy: e.clientY, cx: cam.x, cy: cam.y }); }
     }
-  }, [s2w, visibleElements, visibleRelationships, cam, relPicker, ctxMenu, drawingRel, editingElId, navigateToView, selType, selectedId, pushHistory]);
+  }, [s2w, visibleElements, visibleRelationships, cam, relPicker, ctxMenu, drawingRel, editingElId, navigateToView, selType, selectedId, pushHistory, isViewMode]);
 
   const handleMouseMove = useCallback((e: React.MouseEvent) => {
-    const rect = canvasRef.current!.getBoundingClientRect();
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const rect = canvas.getBoundingClientRect();
     const sx = e.clientX - rect.left, sy = e.clientY - rect.top;
     const { x: wx, y: wy } = s2w(sx, sy);
 
     if (resizing) {
       const dx = wx - resizing.startWx, dy = wy - resizing.startWy;
       const rh = resizing.handle;
-      let nx = resizing.origX, ny = resizing.origY, nw = resizing.origW, nh = resizing.origH;
-      if (rh.includes('w')) { nx = resizing.origX + dx; nw = resizing.origW - dx; }
-      if (rh.includes('e')) { nw = resizing.origW + dx; }
-      if (rh.includes('n')) { ny = resizing.origY + dy; nh = resizing.origH - dy; }
-      if (rh.includes('s')) { nh = resizing.origH + dy; }
-      nw = Math.max(60, nw); nh = Math.max(40, nh);
-      if (nw === 60 && rh.includes('w')) nx = resizing.origX + resizing.origW - 60;
-      if (nh === 40 && rh.includes('n')) ny = resizing.origY + resizing.origH - 40;
-      // Grid-snap first, then smart-snap to elements
-      nx = snap(nx); ny = snap(ny); nw = snap(nw); nh = snap(nh);
+      const fixedLeft = resizing.origX;
+      const fixedTop = resizing.origY;
+      const fixedRight = resizing.origX + resizing.origW;
+      const fixedBottom = resizing.origY + resizing.origH;
       const others = visibleElements.filter(el => el.id !== resizing.id);
-      const result = snapResizeToElements({ x: nx, y: ny, w: nw, h: nh }, rh, others);
-      setSnapGuides(result.guides);
-      setElements(prev => prev.map(el => el.id === resizing.id ? { ...el, x: result.x, y: result.y, w: result.w, h: result.h } : el));
+      const snapThresh = 6;
+
+      let left = fixedLeft, top = fixedTop, right = fixedRight, bottom = fixedBottom;
+      const guides: SnapGuide[] = [];
+
+      // For each moving edge: try snapping to other element edges, fall back to grid
+      if (rh.includes('w')) {
+        let raw = fixedLeft + dx;
+        let snapped = false;
+        for (const o of others) {
+          for (const t of [o.x, o.x + o.w]) {
+            if (Math.abs(raw - t) < snapThresh) { raw = t; snapped = true; guides.push({ axis: 'x', value: t, type: 'edge' }); break; }
+          }
+          if (snapped) break;
+        }
+        left = snapped ? raw : snap(raw);
+      }
+      if (rh.includes('e')) {
+        let raw = fixedRight + dx;
+        let snapped = false;
+        for (const o of others) {
+          for (const t of [o.x, o.x + o.w]) {
+            if (Math.abs(raw - t) < snapThresh) { raw = t; snapped = true; guides.push({ axis: 'x', value: t, type: 'edge' }); break; }
+          }
+          if (snapped) break;
+        }
+        right = snapped ? raw : snap(raw);
+      }
+      if (rh.includes('n')) {
+        let raw = fixedTop + dy;
+        let snapped = false;
+        for (const o of others) {
+          for (const t of [o.y, o.y + o.h]) {
+            if (Math.abs(raw - t) < snapThresh) { raw = t; snapped = true; guides.push({ axis: 'y', value: t, type: 'edge' }); break; }
+          }
+          if (snapped) break;
+        }
+        top = snapped ? raw : snap(raw);
+      }
+      if (rh.includes('s')) {
+        let raw = fixedBottom + dy;
+        let snapped = false;
+        for (const o of others) {
+          for (const t of [o.y, o.y + o.h]) {
+            if (Math.abs(raw - t) < snapThresh) { raw = t; snapped = true; guides.push({ axis: 'y', value: t, type: 'edge' }); break; }
+          }
+          if (snapped) break;
+        }
+        bottom = snapped ? raw : snap(raw);
+      }
+
+      // Enforce minimum size
+      if (right - left < 60) { if (rh.includes('w')) left = right - 60; else right = left + 60; }
+      if (bottom - top < 40) { if (rh.includes('n')) top = bottom - 40; else bottom = top + 40; }
+
+      setSnapGuides(guides);
+      setElements(prev => prev.map(el => el.id === resizing.id ? { ...el, x: left, y: top, w: right - left, h: bottom - top } : el));
       return;
     }
     if (drawingRel) { setDrawingRel(p => p ? { ...p, mx: wx, my: wy } : null); return; }
     if (dragWP) {
       setRelationships(prev => prev.map(r => r.id === dragWP.relId ? { ...r, waypoints: r.waypoints.map((w, i) => i === dragWP.wpIdx ? { x: snap(wx), y: snap(wy) } : w) } : r));
+      return;
+    }
+    if (dragSegment) {
+      setRelationships(prev => prev.map(r => {
+        if (r.id !== dragSegment.relId) return r;
+        const pts = getRelPoints(r, visibleElements, visibleElementMap);
+        if (!pts) return r;
+        const allPts = [pts.start, ...pts.waypoints, pts.end];
+        const si = dragSegment.segIdx;
+        const wpCount = pts.waypoints.length;
+
+        if (wpCount === 0) {
+          // No waypoints yet — create 2 waypoints to form a 3-segment orthogonal path
+          const a = allPts[0], b = allPts[allPts.length - 1];
+          if (dragSegment.orientation === 'h') {
+            // Horizontal segment → drag vertically → create Z-route
+            const newY = snap(wy);
+            return { ...r, waypoints: [{ x: a.x, y: newY }, { x: b.x, y: newY }], relativeBendpoints: undefined };
+          } else {
+            const newX = snap(wx);
+            return { ...r, waypoints: [{ x: newX, y: a.y }, { x: newX, y: b.y }], relativeBendpoints: undefined };
+          }
+        }
+
+        // Has waypoints — move the endpoints of the dragged segment
+        const newWaypoints = [...pts.waypoints];
+        // Segment si connects allPts[si] → allPts[si+1]
+        // allPts = [start, wp0, wp1, ..., end]
+        // wp index = allPts index - 1
+
+        if (dragSegment.orientation === 'h') {
+          // Horizontal segment → move vertically
+          const newY = snap(wy);
+          // Move the waypoint endpoints of this segment
+          if (si > 0 && si - 1 < wpCount) newWaypoints[si - 1] = { ...newWaypoints[si - 1], y: newY };
+          if (si < wpCount) newWaypoints[si] = { ...newWaypoints[si], y: newY };
+        } else {
+          // Vertical segment → move horizontally
+          const newX = snap(wx);
+          if (si > 0 && si - 1 < wpCount) newWaypoints[si - 1] = { ...newWaypoints[si - 1], x: newX };
+          if (si < wpCount) newWaypoints[si] = { ...newWaypoints[si], x: newX };
+        }
+
+        return { ...r, waypoints: newWaypoints, relativeBendpoints: undefined };
+      }));
       return;
     }
     if (dragEndpoint) {
@@ -707,6 +986,7 @@ export default function App() {
         const others = visibleElements.filter(el => el.id !== dragging.id);
         const result = snapToElements({ x: proposedX, y: proposedY, w: draggedEl.w, h: draggedEl.h }, others);
         setSnapGuides(result.guides);
+
         setElements(prev => prev.map(el => el.id === dragging.id ? { ...el, x: result.x, y: result.y } : el));
       }
     } else if (panning) {
@@ -717,7 +997,7 @@ export default function App() {
         if (selElHov) {
           const handle = hitTestResizeHandle(selElHov, wx, wy);
           if (handle) {
-            canvasRef.current!.style.cursor = HANDLE_CURSORS[handle];
+            canvas.style.cursor = HANDLE_CURSORS[handle];
             setHovElId(null); setHovRelId(null);
             return;
           }
@@ -729,13 +1009,15 @@ export default function App() {
         const rh = hitTestRelationship(visibleRelationships, visibleElements, wx, wy);
         setHovRelId(rh?.rel?.id || null);
       } else setHovRelId(null);
-      canvasRef.current!.style.cursor = 'default';
+      canvas.style.cursor = 'default';
     }
-  }, [s2w, dragging, panning, visibleElements, visibleRelationships, drawingRel, dragWP, dragEndpoint, dragLabel, resizing, selType, selectedId, setCamThrottled]);
+  }, [s2w, dragging, panning, visibleElements, visibleRelationships, visibleElementMap, drawingRel, dragWP, dragEndpoint, dragLabel, dragSegment, resizing, selType, selectedId, setCamThrottled]);
 
   const handleMouseUp = useCallback((e: React.MouseEvent) => {
     if (drawingRel) {
-      const rect = canvasRef.current!.getBoundingClientRect();
+      const canvas = canvasRef.current;
+      if (!canvas) return;
+      const rect = canvas.getBoundingClientRect();
       const { x: wx, y: wy } = s2w(e.clientX - rect.left, e.clientY - rect.top);
       const tgt = hitTestElement(visibleElements, wx, wy, getLayer, isNote);
       if (tgt && tgt.id !== drawingRel.sourceId) {
@@ -744,37 +1026,78 @@ export default function App() {
       }
       setDrawingRel(null); return;
     }
-    setDragging(null); setPanning(null); setDragWP(null); setDragEndpoint(null); setDragLabel(null); setResizing(null);
+
+    // Archi behavior: when dropping an element onto another element, offer to create a relationship
+    if (dragging && !isViewMode) {
+      const draggedEl = visibleElements.find(el => el.id === dragging.id);
+      if (draggedEl) {
+        const canvas = canvasRef.current;
+        if (canvas) {
+          const rect = canvas.getBoundingClientRect();
+          const sx = e.clientX - rect.left, sy = e.clientY - rect.top;
+          // Find element under the center of the dragged element
+          const dropTarget = visibleElements.find(el => {
+            if (el.id === dragging.id) return false;
+            return draggedEl.x + draggedEl.w / 2 >= el.x && draggedEl.x + draggedEl.w / 2 <= el.x + el.w &&
+                   draggedEl.y + draggedEl.h / 2 >= el.y && draggedEl.y + draggedEl.h / 2 <= el.y + el.h;
+          });
+          // Only offer if no relationship already exists between the two
+          if (dropTarget) {
+            const alreadyConnected = relationships.some(r =>
+              (r.sourceId === dragging.id && r.targetId === dropTarget.id) ||
+              (r.sourceId === dropTarget.id && r.targetId === dragging.id)
+            );
+            if (!alreadyConnected) {
+              relPickerWaypoints.current = [];
+              setRelPicker({ sx, sy, srcId: dragging.id, tgtId: dropTarget.id });
+            }
+          }
+        }
+      }
+    }
+
+    setDragging(null); setPanning(null); setDragWP(null); setDragEndpoint(null); setDragLabel(null); setDragSegment(null); setResizing(null);
     setSnapGuides([]);
-  }, [drawingRel, s2w, visibleElements]);
+  }, [drawingRel, dragging, s2w, visibleElements, relationships, isViewMode]);
 
   const handleDblClick = useCallback((e: React.MouseEvent) => {
-    const rect = canvasRef.current!.getBoundingClientRect();
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const rect = canvas.getBoundingClientRect();
     const { x: wx, y: wy } = s2w(e.clientX - rect.left, e.clientY - rect.top);
 
     const el = hitTestElement(visibleElements, wx, wy, getLayer, isNote);
     if (el) {
+      // View navigation always allowed
       if (el.linkedViewId) {
         navigateToView(el.linkedViewId);
         return;
       }
-      setEditingElId(el.id);
-      setEditingName(el.name);
-      setSelectedId(el.id);
-      setSelType('element');
+      // Inline editing only in edit mode
+      if (!isViewMode) {
+        setEditingElId(el.id);
+        setEditingName(el.name);
+        setSelectedId(el.id);
+        setSelType('element');
+      }
       return;
     }
 
-    const rh = hitTestRelationship(visibleRelationships, visibleElements, wx, wy);
-    if (rh) {
-      const name = prompt('Relationship label:', rh.rel.name || '');
-      if (name !== null) { pushHistory(); setRelationships(prev => prev.map(r => r.id === rh.rel.id ? { ...r, name } : r)); }
+    if (!isViewMode) {
+      const rh = hitTestRelationship(visibleRelationships, visibleElements, wx, wy);
+      if (rh) {
+        const name = prompt('Relationship label:', rh.rel.name || '');
+        if (name !== null) { pushHistory(); setRelationships(prev => prev.map(r => r.id === rh.rel.id ? { ...r, name } : r)); }
+      }
     }
-  }, [s2w, visibleElements, visibleRelationships, navigateToView]);
+  }, [s2w, visibleElements, visibleRelationships, navigateToView, isViewMode, pushHistory]);
 
   const handleContextMenu = useCallback((e: React.MouseEvent) => {
     e.preventDefault();
-    const rect = canvasRef.current!.getBoundingClientRect();
+    if (isViewMode) return; // No context menu in view mode
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const rect = canvas.getBoundingClientRect();
     const sx = e.clientX - rect.left, sy = e.clientY - rect.top;
     const { x: wx, y: wy } = s2w(sx, sy);
 
@@ -792,7 +1115,7 @@ export default function App() {
         typesByLayer[layer].push([k, v]);
       }
 
-      const changeTypeChildren: typeof items = [];
+      const changeTypeChildren: CtxMenuItem[] = [];
       // Current layer first, then others
       const currentLayer = elTypeDef?.layer;
       const layerOrder = currentLayer
@@ -816,7 +1139,7 @@ export default function App() {
         }
       }
 
-      const items: { label: string; action?: () => void; children?: typeof changeTypeChildren; separator?: boolean; icon?: string; iconColor?: string }[] = [
+      const items: CtxMenuItem[] = [
         { label: 'Rename', action: () => { setEditingElId(el.id); setEditingName(el.name); } },
         { label: 'Change type', children: changeTypeChildren },
         { label: '', separator: true },
@@ -839,6 +1162,7 @@ export default function App() {
         { label: '', separator: true },
         {
           label: 'Delete',
+          color: '#e07070',
           action: () => {
             pushHistory();
             setElements(prev => prev.filter(e => e.id !== el.id));
@@ -866,7 +1190,7 @@ export default function App() {
           { label: 'Edit label', action: () => { pushHistory(); const name = prompt('Label:', rh.rel.name || ''); if (name !== null) setRelationships(prev => prev.map(r => r.id === rh.rel.id ? { ...r, name } : r)); } },
           ...(rh.rel.waypoints?.length > 0 ? [{ label: 'Remove all waypoints', action: () => { pushHistory(); setRelationships(prev => prev.map(r => r.id === rh.rel.id ? { ...r, waypoints: [] } : r)); } }] : []),
           ...((rh.rel.sourceAnchor || rh.rel.targetAnchor) ? [{ label: 'Reset endpoints to auto', action: () => { pushHistory(); setRelationships(prev => prev.map(r => r.id === rh.rel.id ? { ...r, sourceAnchor: undefined, targetAnchor: undefined } : r)); } }] : []),
-          { label: 'Delete relationship', action: () => { pushHistory(); setRelationships(prev => prev.filter(r => r.id !== rh.rel.id)); if (selectedId === rh.rel.id) { setSelectedId(null); setSelType(null); } } },
+          { label: 'Delete relationship', color: '#e07070', action: () => { pushHistory(); setRelationships(prev => prev.filter(r => r.id !== rh.rel.id)); if (selectedId === rh.rel.id) { setSelectedId(null); setSelType(null); } } },
         ],
       });
       return;
@@ -874,13 +1198,15 @@ export default function App() {
 
     const wp = hitTestWaypoint(visibleRelationships, wx, wy);
     if (wp) {
-      setCtxMenu({ x: sx, y: sy, items: [{ label: 'Remove waypoint', action: () => { pushHistory(); setRelationships(prev => prev.map(r => r.id === wp.relId ? { ...r, waypoints: r.waypoints.filter((_, i) => i !== wp.wpIdx) } : r)); } }] });
+      setCtxMenu({ x: sx, y: sy, items: [{ label: 'Remove waypoint', color: '#e07070', action: () => { pushHistory(); setRelationships(prev => prev.map(r => r.id === wp.relId ? { ...r, waypoints: r.waypoints.filter((_, i) => i !== wp.wpIdx) } : r)); } }] });
     }
-  }, [s2w, visibleElements, visibleRelationships, selectedId, pushHistory]);
+  }, [s2w, visibleElements, visibleRelationships, selectedId, pushHistory, elements, isViewMode]);
 
   const handleWheel = useCallback((e: React.WheelEvent) => {
     e.preventDefault();
-    const rect = canvasRef.current!.getBoundingClientRect();
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const rect = canvas.getBoundingClientRect();
     const sx = e.clientX - rect.left, sy = e.clientY - rect.top;
     const f = e.deltaY < 0 ? 1.08 : 0.93;
     const ns = Math.min(3, Math.max(0.2, cam.s * f));
@@ -948,19 +1274,21 @@ export default function App() {
       alert(firstError?.message || 'Export failed');
       return;
     }
-    if (result.diagnostics.length > 0) console.warn('Export diagnostics', result.diagnostics);
+    summarizeDiagnostics('Export', result.diagnostics);
 
     const blob = new Blob([result.content], { type: result.mimeType });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a'); a.href = url; a.download = result.suggestedFileName; a.click();
     URL.revokeObjectURL(url);
-  }, [elements, relationships, views, selectedFormatId]);
+  }, [elements, relationships, views, selectedFormatId, summarizeDiagnostics]);
 
   const importModel = useCallback(() => {
     const acceptedExtensions = Array.from(new Set(modelFormats.flatMap(format => format.extensions.map(extension => `.${extension}`))));
     const inp = document.createElement('input'); inp.type = 'file'; inp.accept = acceptedExtensions.join(',');
-    inp.onchange = (e: Event) => {
-      const f = (e.target as HTMLInputElement).files?.[0];
+    inp.onchange = async (e: Event) => {
+      const target = e.target;
+      if (!(target instanceof HTMLInputElement)) return;
+      const f = target.files?.[0];
       if (!f) return;
 
       const detectedFormat = detectModelFormatByFileName(f.name);
@@ -970,39 +1298,48 @@ export default function App() {
         return;
       }
 
-      const r = new FileReader();
-      r.onload = (ev) => {
-        try {
-          const content = ev.target?.result as string;
-          const result = importEditorModelFromText(content, formatId);
-          if (!result.model) {
-            const firstError = result.diagnostics.find(diagnostic => diagnostic.severity === 'error');
-            alert(firstError?.message || 'Invalid file');
-            return;
-          }
-          if (result.diagnostics.length > 0) console.warn('Import diagnostics', result.diagnostics);
+      try {
+        const content = await f.text();
+        const result = importEditorModelFromText(content, formatId);
+        if (!result.model) {
+          const firstError = result.diagnostics.find(diagnostic => diagnostic.severity === 'error');
+          alert(firstError?.message || 'Invalid file');
+          return;
+        }
+        summarizeDiagnostics('Import', result.diagnostics);
 
-          const importedLayouts = result.document
-            ? buildLayoutsFromCanonicalDocument(result.document)
-            : buildLayoutsFromEditorModel(result.model.elements, result.model.relationships, result.model.views);
-          elementLayoutsByViewRef.current = importedLayouts.elementLayouts;
-          relationshipLayoutsByViewRef.current = importedLayouts.relationshipLayouts;
+        const importedLayouts = result.document
+          ? buildLayoutsFromCanonicalDocument(result.document)
+          : buildLayoutsFromEditorModel(result.model.elements, result.model.relationships, result.model.views);
+        elementLayoutsByViewRef.current = importedLayouts.elementLayouts;
+        relationshipLayoutsByViewRef.current = importedLayouts.relationshipLayouts;
 
-          setElements(result.model.elements);
-          setRelationships(result.model.relationships);
-          setViews(result.model.views);
-          if (result.model.views.length > 0) {
-            setCurrentViewId(result.model.views[0].id);
-            setOpenTabIds([result.model.views[0].id]);
-            applyViewLayout(result.model.views[0].id);
-          }
-          setSelectedId(null); setSelType(null);
-        } catch { alert('Invalid file'); }
-      };
-      r.readAsText(f);
+        setElements(result.model.elements);
+        setRelationships(result.model.relationships);
+        setViews(result.model.views);
+        if (result.model.views.length > 0) {
+          setCurrentViewId(result.model.views[0].id);
+          setOpenTabIds([result.model.views[0].id]);
+          applyViewLayout(result.model.views[0].id);
+        }
+        setSelectedId(null); setSelType(null);
+        // Fit camera to imported content using layout-resolved positions
+        const firstViewId = result.model.views[0]?.id;
+        const layoutEls = firstViewId ? importedLayouts.elementLayouts[firstViewId] : null;
+        if (layoutEls) {
+          const laidOut = result.model.elements
+            .filter(element => layoutEls[element.id])
+            .map(element => ({ ...element, ...layoutEls[element.id], w: layoutEls[element.id].w, h: layoutEls[element.id].h }));
+          fitToContent(laidOut);
+        } else {
+          fitToContent(result.model.elements);
+        }
+      } catch {
+        alert('Invalid file');
+      }
     };
     inp.click();
-  }, [ioFormatId, modelFormats, applyViewLayout]);
+  }, [ioFormatId, modelFormats, applyViewLayout, fitToContent, summarizeDiagnostics]);
 
   // ---------------------------------------------------------------------------
   // Filesystem: Open Directory, Open File, Save
@@ -1021,7 +1358,7 @@ export default function App() {
         alert(firstError?.message || 'Invalid file');
         return;
       }
-      if (result.diagnostics.length > 0) console.warn('Import diagnostics', result.diagnostics);
+      summarizeDiagnostics('Import', result.diagnostics);
 
       const importedLayouts = result.document
         ? buildLayoutsFromCanonicalDocument(result.document)
@@ -1039,23 +1376,36 @@ export default function App() {
       }
       setSelectedId(null); setSelType(null);
 
+      // Fit camera to imported content
+      const firstViewId = result.model.views[0]?.id;
+      const layoutEls = firstViewId ? importedLayouts.elementLayouts[firstViewId] : null;
+      if (layoutEls) {
+        const laidOut = result.model.elements
+          .filter(e => layoutEls[e.id])
+          .map(e => ({ ...e, ...layoutEls[e.id], w: layoutEls[e.id].w, h: layoutEls[e.id].h }));
+        fitToContent(laidOut);
+      } else {
+        fitToContent(result.model.elements);
+      }
+
       setActiveFileEntry(entry);
       setActiveFormatId(formatId);
       setIsDirty(false);
     } catch (err) {
       alert(`Failed to open file: ${err}`);
     }
-  }, [applyViewLayout]);
+  }, [applyViewLayout, fitToContent, summarizeDiagnostics]);
 
   const loadFragmentedModel = useCallback(async (files: OpenFileEntry[]) => {
     try {
+      setImportDiag(null);
       const result = await importFragmentedModel(files);
       if (!result.model) {
         const firstError = result.diagnostics.find(d => d.severity === 'error');
         alert(firstError?.message || 'Failed to import fragmented model');
         return;
       }
-      if (result.diagnostics.length > 0) console.warn('Import diagnostics', result.diagnostics);
+      summarizeDiagnostics('Import', result.diagnostics);
 
       const importedLayouts = result.document
         ? buildLayoutsFromCanonicalDocument(result.document)
@@ -1074,10 +1424,31 @@ export default function App() {
       setSelectedId(null); setSelType(null);
       setActiveFormatId('coarchi-xml');
       setIsDirty(false);
+
+      // Show import summary as a temporary visible diagnostic
+      const m = result.model;
+      const fv = m.views[0];
+      const fvEls = fv ? new Set(fv.elementIds) : new Set<string>();
+      const relsMatch = m.relationships.filter(r => fvEls.has(r.sourceId) && fvEls.has(r.targetId)).length;
+      const summary = `Imported: ${m.elements.length} elements, ${m.relationships.length} relationships, ${m.views.length} views. `
+        + `First view "${fv?.name || '?'}": ${fv?.elementIds.length ?? 0} els, ${relsMatch} rels match.`;
+      showTransientDiagnostic(summary);
+
+      // Fit camera to imported content
+      const firstViewId = result.model.views[0]?.id;
+      const layoutEls = firstViewId ? importedLayouts.elementLayouts[firstViewId] : null;
+      if (layoutEls) {
+        const laidOut = result.model.elements
+          .filter(e => layoutEls[e.id])
+          .map(e => ({ ...e, ...layoutEls[e.id], w: layoutEls[e.id].w, h: layoutEls[e.id].h }));
+        fitToContent(laidOut);
+      } else {
+        fitToContent(result.model.elements);
+      }
     } catch (err) {
       alert(`Failed to import fragmented model: ${err}`);
     }
-  }, [applyViewLayout]);
+  }, [applyViewLayout, fitToContent, showTransientDiagnostic, summarizeDiagnostics]);
 
   const handleOpenDirectory = useCallback(async () => {
     try {
@@ -1085,7 +1456,9 @@ export default function App() {
       setDirState(state);
 
       // Detect fragmented coArchi directory (individual XML files per element)
-      if (isFragmentedModelDirectory(state.files)) {
+      const isFragmented = isFragmentedModelDirectory(state.files);
+
+      if (isFragmented) {
         await loadFragmentedModel(state.files);
         return;
       }
@@ -1093,13 +1466,15 @@ export default function App() {
       // Auto-open the first archimate/xml/json file
       if (state.files.length > 0) {
         await loadFileEntry(state.files[0]);
+      } else {
+        showTransientDiagnostic(`No supported model files found in '${state.directoryName}'.`);
       }
     } catch (err) {
       // User cancelled the picker
       if (err instanceof DOMException && err.name === 'AbortError') return;
       alert(`Failed to open directory: ${err}`);
     }
-  }, [loadFileEntry, loadFragmentedModel]);
+  }, [loadFileEntry, loadFragmentedModel, showTransientDiagnostic]);
 
   const handleSave = useCallback(async () => {
     if (!activeFileEntry || !activeFormatId) {
@@ -1142,32 +1517,40 @@ export default function App() {
   }, [elements, relationships, views, activeFileEntry]);
 
   // Keyboard
+  const isTextInputActive = useCallback((): boolean => {
+    const activeElement = document.activeElement;
+    if (!(activeElement instanceof HTMLElement)) return false;
+    return ['INPUT', 'TEXTAREA', 'SELECT'].includes(activeElement.tagName);
+  }, []);
+
   useEffect(() => {
     const h = (e: KeyboardEvent) => {
       if (e.key === 'Delete' || e.key === 'Backspace') {
-        if (['INPUT', 'TEXTAREA', 'SELECT'].includes((document.activeElement as HTMLElement)?.tagName)) return;
-        deleteSelected();
+        if (isTextInputActive()) return;
+        if (interactionMode !== 'view') deleteSelected();
       }
-      if (e.key === 'Escape') { setRelPicker(null); setCtxMenu(null); setShowSearch(false); setDrawingRel(null); cancelEditing(); }
+      if (e.key === 'Escape') { setRelPicker(null); setCtxMenu(null); setShowChangelog(false); setShowSearch(false); setDrawingRel(null); cancelEditing(); }
       if ((e.metaKey || e.ctrlKey) && e.key === 'k') { e.preventDefault(); setShowSearch(s => !s); }
       if ((e.metaKey || e.ctrlKey) && e.key === 's') { e.preventDefault(); handleSave(); }
       if ((e.metaKey || e.ctrlKey) && e.key === 'z') {
-        if (['INPUT', 'TEXTAREA', 'SELECT'].includes((document.activeElement as HTMLElement)?.tagName)) return;
+        if (isTextInputActive()) return;
         e.preventDefault();
         if (e.shiftKey) redo(); else undo();
       }
       if ((e.metaKey || e.ctrlKey) && e.key === 'y') {
-        if (['INPUT', 'TEXTAREA', 'SELECT'].includes((document.activeElement as HTMLElement)?.tagName)) return;
+        if (isTextInputActive()) return;
         e.preventDefault();
         redo();
       }
       // Back/forward: Alt+Left / Alt+Right
       if (e.altKey && e.key === 'ArrowLeft') { e.preventDefault(); goBack(); }
       if (e.altKey && e.key === 'ArrowRight') { e.preventDefault(); goForward(); }
+      // Fit to content: Ctrl+Shift+1
+      if ((e.metaKey || e.ctrlKey) && e.shiftKey && e.key === '1') { e.preventDefault(); fitToContent(); }
     };
     window.addEventListener('keydown', h);
     return () => window.removeEventListener('keydown', h);
-  }, [deleteSelected, cancelEditing, goBack, goForward, handleSave, undo, redo]);
+  }, [deleteSelected, cancelEditing, goBack, goForward, handleSave, undo, redo, fitToContent, interactionMode, isTextInputActive]);
 
   useEffect(() => {
     if (!selectedId) return;
@@ -1214,16 +1597,11 @@ export default function App() {
 
   const relPickerWaypoints = useRef<{ x: number; y: number }[]>([]);
 
-  // Left panel cycling (views + changelog only — palette moved to toolbar)
-  const cycleLeftPanel = useCallback(() => {
-    setLeftPanel(p => p === 'views' ? 'changelog' : 'views');
-  }, []);
-
-  const leftPanelLabel = leftPanel === 'views' ? 'Changelog' : 'Views';
+  const [showChangelog, setShowChangelog] = useState(false);
 
   // ==================== RENDER ====================
   return (
-    <div style={{ width: '100%', height: '100vh', display: 'flex', flexDirection: 'column', fontFamily: FONT, background: 'var(--bg, #f5f6f8)', color: 'var(--text-primary, #1a1a1a)' }}>
+    <div style={{ width: '100%', height: '100vh', display: 'flex', flexDirection: 'column', fontFamily: FONT, background: 'var(--bg, #f3f4f6)', color: 'var(--text-primary, #1a1a1a)' }}>
       {/* Full-screen canvas area with floating UI */}
       <div style={{ flex: 1, position: 'relative', overflow: 'hidden' }}>
 
@@ -1231,18 +1609,19 @@ export default function App() {
         <div style={{
           position: 'absolute', top: 10, left: 10, zIndex: 10,
           display: 'flex', alignItems: 'center', gap: 8,
-          background: 'rgba(255,255,255,0.88)',
-          backdropFilter: 'blur(16px) saturate(1.6)',
-          WebkitBackdropFilter: 'blur(16px) saturate(1.6)',
-          border: '1px solid rgba(255,255,255,0.5)',
-          borderRadius: 10,
-          boxShadow: '0 2px 12px rgba(0,0,0,0.06)',
-          padding: '6px 12px',
+          maxWidth: 280,
+          background: 'var(--glass, rgba(255,255,255,0.82))',
+          backdropFilter: 'var(--glass-blur, blur(20px) saturate(1.8))',
+          WebkitBackdropFilter: 'var(--glass-blur, blur(20px) saturate(1.8))',
+          border: '1px solid var(--glass-border, rgba(255,255,255,0.55))',
+          borderRadius: 'var(--radius-md, 10px)',
+          boxShadow: 'var(--shadow-md, 0 2px 12px rgba(0,0,0,0.06))',
+          padding: '5px 10px',
         }}>
-          <div style={{ width: 22, height: 22, background: '#2a2a2a', borderRadius: 5, display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 9, fontWeight: 600, color: '#fff', letterSpacing: '-0.3px' }}>OA</div>
-          <span style={{ fontWeight: 600, fontSize: 13, color: '#2a2a2a', letterSpacing: '-0.01em' }}>OpenArchi</span>
+          <div style={{ width: 20, height: 20, flexShrink: 0, background: 'var(--text-primary, #1a1a1a)', borderRadius: 5, display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 8, fontWeight: 600, color: '#fff', letterSpacing: '-0.3px' }}>OA</div>
+          <span style={{ fontWeight: 600, fontSize: 13, flexShrink: 0, color: 'var(--text-primary, #1a1a1a)', letterSpacing: '-0.01em' }}>OpenArchi</span>
           {activeFileEntry && (
-            <span style={{ fontSize: 11, color: '#999' }}>
+            <span style={{ fontSize: 11, color: 'var(--text-muted, #8a8a90)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
               {dirState ? `${dirState.directoryName}/` : ''}{activeFileEntry.relativePath}{isDirty ? ' *' : ''}
             </span>
           )}
@@ -1251,38 +1630,78 @@ export default function App() {
         {/* ====== Top-right: Actions cluster ====== */}
         <div style={{
           position: 'absolute', top: 10, right: propSide === 'right' ? 270 : 10, zIndex: 10,
-          display: 'flex', alignItems: 'center', gap: 4,
-          background: 'rgba(255,255,255,0.88)',
-          backdropFilter: 'blur(16px) saturate(1.6)',
-          WebkitBackdropFilter: 'blur(16px) saturate(1.6)',
-          border: '1px solid rgba(255,255,255,0.5)',
-          borderRadius: 10,
-          boxShadow: '0 2px 12px rgba(0,0,0,0.06)',
-          padding: '4px 6px',
+          display: 'flex', alignItems: 'center', gap: 2,
+          background: 'var(--glass, rgba(255,255,255,0.82))',
+          backdropFilter: 'var(--glass-blur, blur(20px) saturate(1.8))',
+          WebkitBackdropFilter: 'var(--glass-blur, blur(20px) saturate(1.8))',
+          border: '1px solid var(--glass-border, rgba(255,255,255,0.55))',
+          borderRadius: 'var(--radius-md, 10px)',
+          boxShadow: 'var(--shadow-md, 0 2px 12px rgba(0,0,0,0.06))',
+          padding: '3px 5px',
         }}>
           <Btn onClick={goBack} disabled={!canGoBack}>{'\u25C0'}</Btn>
           <Btn onClick={goForward} disabled={!canGoForward}>{'\u25B6'}</Btn>
-          <div style={{ width: 1, height: 18, background: 'rgba(0,0,0,0.07)', margin: '0 2px' }} />
+          <div style={{ width: 1, height: 16, background: 'var(--border, rgba(0,0,0,0.06))', margin: '0 2px' }} />
           <Btn onClick={undo} disabled={historyIndexRef.current <= 0}>Undo</Btn>
           <Btn onClick={redo} disabled={historyIndexRef.current >= historyRef.current.length - 1}>Redo</Btn>
-          <div style={{ width: 1, height: 18, background: 'rgba(0,0,0,0.07)', margin: '0 2px' }} />
-          <Btn onClick={cycleLeftPanel}>{leftPanelLabel}</Btn>
+          <div style={{ width: 1, height: 16, background: 'var(--border, rgba(0,0,0,0.06))', margin: '0 2px' }} />
+          <div style={{ position: 'relative' }}>
+            <Btn onClick={() => setShowChangelog(v => !v)}>History</Btn>
+            {showChangelog && (
+              <div
+                onMouseDown={e => e.stopPropagation()}
+                style={{
+                  position: 'absolute', top: '100%', right: 0, marginTop: 6,
+                  width: 340, maxHeight: 400,
+                  background: 'var(--glass-strong, rgba(255,255,255,0.95))',
+                  backdropFilter: 'var(--glass-blur, blur(20px) saturate(1.8))',
+                  WebkitBackdropFilter: 'var(--glass-blur, blur(20px) saturate(1.8))' as string,
+                  border: '1px solid var(--glass-border, rgba(255,255,255,0.55))',
+                  borderRadius: 'var(--radius-md, 10px)',
+                  boxShadow: 'var(--shadow-xl, 0 8px 40px rgba(0,0,0,0.12))',
+                  fontFamily: FONT, overflow: 'hidden',
+                  display: 'flex', flexDirection: 'column',
+                  zIndex: 200,
+                }}>
+                <div style={{ padding: '10px 14px 6px', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                  <span style={{ fontSize: 11, fontWeight: 600, color: 'var(--text-primary, #1a1a1a)', textTransform: 'uppercase', letterSpacing: '0.5px' }}>View History</span>
+                  <button onClick={() => setShowChangelog(false)} style={{
+                    background: 'none', border: 'none', cursor: 'pointer', fontSize: 14,
+                    color: 'var(--text-faint, #b0b0b8)', padding: '0 2px', lineHeight: 1,
+                  }}>{'\u00D7'}</button>
+                </div>
+                <div style={{ padding: '4px 14px 6px', fontSize: 10, color: 'var(--text-muted, #8a8a90)' }}>
+                  {activeView?.name || 'Unknown view'}
+                </div>
+                <div style={{ flex: 1, overflow: 'auto', padding: '6px 14px 14px' }}>
+                  <div style={{ color: 'var(--text-faint, #b0b0b8)', fontSize: 12, lineHeight: 1.7 }}>
+                    <p style={{ margin: '0 0 8px', fontWeight: 400 }}>
+                      Git history for elements, relationships and properties in this view will appear here.
+                    </p>
+                    <p style={{ margin: 0, fontSize: 11, fontStyle: 'italic' }}>
+                      Coming soon — requires a git-backed model (coArchi directory).
+                    </p>
+                  </div>
+                </div>
+              </div>
+            )}
+          </div>
         </div>
 
         {/* ====== Tab bar island ====== */}
         <div style={{
           position: 'absolute', top: 10,
-          left: activeFileEntry ? 320 : 200,
+          left: 300,
           right: propSide === 'right' ? 520 : 260,
           zIndex: 10,
           height: 32,
-          background: 'rgba(255,255,255,0.88)',
-          backdropFilter: 'blur(16px) saturate(1.6)',
-          WebkitBackdropFilter: 'blur(16px) saturate(1.6)',
-          border: '1px solid rgba(255,255,255,0.5)',
-          borderRadius: 10,
-          boxShadow: '0 2px 12px rgba(0,0,0,0.06)',
-          display: 'flex', alignItems: 'center', padding: '0 4px', gap: 1, overflow: 'auto',
+          background: 'var(--glass, rgba(255,255,255,0.82))',
+          backdropFilter: 'var(--glass-blur, blur(20px) saturate(1.8))',
+          WebkitBackdropFilter: 'var(--glass-blur, blur(20px) saturate(1.8))',
+          border: '1px solid var(--glass-border, rgba(255,255,255,0.55))',
+          borderRadius: 'var(--radius-md, 10px)',
+          boxShadow: 'var(--shadow-md, 0 2px 12px rgba(0,0,0,0.06))',
+          display: 'flex', alignItems: 'stretch', padding: '3px 4px', gap: 1, overflow: 'auto',
         }}>
           {openTabIds.map(tid => {
             const v = views.find(vv => vv.id === tid);
@@ -1292,22 +1711,30 @@ export default function App() {
                 key={tid}
                 onClick={() => navigateToView(tid)}
                 style={{
-                  display: 'flex', alignItems: 'center', gap: 5, padding: '4px 10px', fontSize: 12, fontFamily: 'inherit',
+                  display: 'flex', alignItems: 'center', gap: 5, padding: '0 10px', fontSize: 12, fontFamily: 'inherit',
                   cursor: 'pointer', userSelect: 'none', whiteSpace: 'nowrap',
-                  background: isActive ? 'var(--accent-bg, #eef2ff)' : 'transparent',
-                  color: isActive ? 'var(--accent-text, #1d4ed8)' : '#999',
+                  background: isActive ? 'var(--surface-selected, rgba(74,85,104,0.07))' : 'transparent',
+                  color: isActive ? 'var(--accent-text, #374151)' : 'var(--text-muted, #8a8a90)',
                   fontWeight: isActive ? 500 : 400,
-                  borderRadius: 5,
+                  borderRadius: 6,
                   border: 'none',
+                  position: 'relative',
+                  transition: 'background var(--transition-fast, 0.12s ease), color var(--transition-fast, 0.12s ease)',
                 }}
+                onMouseEnter={e => { if (!isActive) e.currentTarget.style.background = 'var(--surface-hover, rgba(0,0,0,0.035))'; }}
+                onMouseLeave={e => { if (!isActive) e.currentTarget.style.background = 'transparent'; }}
               >
                 <span>{v?.name || tid}</span>
                 {openTabIds.length > 1 && (
                   <span
                     onClick={e => { e.stopPropagation(); closeTab(tid); }}
-                    style={{ fontSize: 13, color: '#ccc', lineHeight: 1, padding: '0 2px', borderRadius: 3, cursor: 'pointer' }}
-                    onMouseEnter={e => { e.currentTarget.style.color = '#666'; e.currentTarget.style.background = 'rgba(0,0,0,0.06)'; }}
-                    onMouseLeave={e => { e.currentTarget.style.color = '#ccc'; e.currentTarget.style.background = 'transparent'; }}
+                    style={{
+                      fontSize: 12, color: 'var(--text-faint, #b0b0b8)', lineHeight: 1,
+                      padding: '1px 2px', borderRadius: 3, cursor: 'pointer',
+                      transition: 'color var(--transition-fast, 0.12s ease), background var(--transition-fast, 0.12s ease)',
+                    }}
+                    onMouseEnter={e => { e.currentTarget.style.color = 'var(--text-secondary, #555)'; e.currentTarget.style.background = 'var(--surface-active, rgba(0,0,0,0.06))'; }}
+                    onMouseLeave={e => { e.currentTarget.style.color = 'var(--text-faint, #b0b0b8)'; e.currentTarget.style.background = 'transparent'; }}
                   >
                     {'\u00D7'}
                   </span>
@@ -1320,11 +1747,12 @@ export default function App() {
         {/* ====== Left panel island (views + properties) ====== */}
         <div style={{
           position: 'absolute', left: 10, top: 52, bottom: 10, width: leftPanelWidth, zIndex: 10,
-          background: 'rgba(255,255,255,0.92)',
-          backdropFilter: 'blur(20px) saturate(1.6)',
-          WebkitBackdropFilter: 'blur(20px) saturate(1.6)',
-          borderRadius: 14, border: '1px solid rgba(255,255,255,0.5)',
-          boxShadow: '0 4px 24px rgba(0,0,0,0.08)',
+          background: 'var(--glass-strong, rgba(255,255,255,0.92))',
+          backdropFilter: 'var(--glass-blur, blur(20px) saturate(1.8))',
+          WebkitBackdropFilter: 'var(--glass-blur, blur(20px) saturate(1.8))',
+          borderRadius: 'var(--radius-lg, 14px)',
+          border: '1px solid var(--glass-border, rgba(255,255,255,0.55))',
+          boxShadow: 'var(--shadow-lg, 0 4px 24px rgba(0,0,0,0.08))',
           display: 'flex', flexDirection: 'column', overflow: 'hidden',
         }}>
           {/* Resize handle */}
@@ -1349,19 +1777,7 @@ export default function App() {
               window.addEventListener('mouseup', onUp);
             }}
           />
-          {leftPanel === 'views' ? (
-            <ViewNav views={views} currentViewId={currentViewId} onNavigate={navigateToView} />
-          ) : (
-            <div style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
-              <div style={{ padding: '14px 14px 7px', fontSize: 11, fontWeight: 500, color: '#a0a0a0', textTransform: 'uppercase', letterSpacing: '0.5px' }}>Changelog</div>
-              <div style={{ padding: '10px 14px', color: '#aaa', fontSize: 13, lineHeight: 1.7 }}>
-                <p style={{ margin: '0 0 10px', color: '#777', fontWeight: 400 }}>Change history will appear here.</p>
-                <p style={{ margin: 0, fontSize: 12 }}>
-                  Track element additions, modifications, relationship changes, and view updates over time.
-                </p>
-              </div>
-            </div>
-          )}
+          <ViewNav views={views} currentViewId={currentViewId} onNavigate={navigateToView} />
           {/* Property panel on left side */}
           {propSide === 'left' && (
             <PropertyPanel
@@ -1386,7 +1802,7 @@ export default function App() {
             onMouseUp={handleMouseUp}
             onDoubleClick={handleDblClick}
             onContextMenu={handleContextMenu}
-            onMouseLeave={() => { setDragging(null); setPanning(null); setDragWP(null); setDragEndpoint(null); setDragLabel(null); setResizing(null); setHovElId(null); setHovRelId(null); setSnapGuides([]); }}
+            onMouseLeave={() => { setDragging(null); setPanning(null); setDragWP(null); setDragEndpoint(null); setDragLabel(null); setDragSegment(null); setResizing(null); setHovElId(null); setHovRelId(null); setSnapGuides([]); }}
             onWheel={handleWheel}
           />
 
@@ -1421,7 +1837,7 @@ export default function App() {
                     fontFamily: 'inherit',
                     fontWeight: 400,
                     textAlign: 'left',
-                    border: '2px solid #2563eb',
+                    border: '2px solid #4a5568',
                     borderRadius: 4,
                     outline: 'none',
                     background: '#fffffa',
@@ -1446,7 +1862,7 @@ export default function App() {
                     fontFamily: 'inherit',
                     fontWeight: 600,
                     textAlign: 'center',
-                    border: '2px solid #2563eb',
+                    border: '2px solid #4a5568',
                     borderRadius: 6,
                     outline: 'none',
                     background: '#fff',
@@ -1494,15 +1910,16 @@ export default function App() {
           {drawingRel && (
             <div style={{
               position: 'absolute', bottom: 120, left: '50%', transform: 'translateX(-50%)',
-              fontSize: 12, color: '#666', background: 'rgba(255,255,255,0.92)',
-              backdropFilter: 'blur(12px)',
-              WebkitBackdropFilter: 'blur(12px)',
-              padding: '6px 14px', borderRadius: 8,
-              border: '1px solid rgba(255,255,255,0.5)',
-              boxShadow: '0 2px 12px rgba(0,0,0,0.08)',
+              fontSize: 12, color: 'var(--text-secondary, #555)',
+              background: 'var(--glass, rgba(255,255,255,0.82))',
+              backdropFilter: 'var(--glass-blur, blur(20px) saturate(1.8))',
+              WebkitBackdropFilter: 'var(--glass-blur, blur(20px) saturate(1.8))',
+              padding: '5px 12px', borderRadius: 'var(--radius-sm, 6px)',
+              border: '1px solid var(--glass-border, rgba(255,255,255,0.55))',
+              boxShadow: 'var(--shadow-md, 0 2px 12px rgba(0,0,0,0.06))',
               whiteSpace: 'nowrap',
             }}>
-              Hold <strong>Shift + Click</strong> to add a waypoint bend
+              <strong>Click</strong> to add waypoint, click <strong>target element</strong> to complete
             </div>
           )}
         </div>
@@ -1533,6 +1950,8 @@ export default function App() {
           gridType={gridType}
           onToggleGrid={() => setGridType(g => g === 'dot' ? 'line' : 'dot')}
           onSearch={() => setShowSearch(s => !s)}
+          interactionMode={interactionMode}
+          onToggleMode={() => setInteractionMode(m => m === 'view' ? 'edit' : 'view')}
         />
 
         {/* ====== Legend toggle + panel (bottom-right) ====== */}
@@ -1540,15 +1959,20 @@ export default function App() {
           onClick={() => setShowLegend(l => !l)}
           style={{
             position: 'absolute', bottom: 14, right: propSide === 'right' ? 274 : 12, zIndex: 50,
-            width: 32, height: 32, borderRadius: 8, border: '1px solid rgba(0,0,0,0.06)',
-            background: showLegend ? 'rgba(37,99,235,0.1)' : 'rgba(245,246,248,0.8)',
-            backdropFilter: 'blur(12px)', WebkitBackdropFilter: 'blur(12px)',
-            boxShadow: '0 2px 8px rgba(0,0,0,0.06)',
+            width: 30, height: 30, borderRadius: 'var(--radius-sm, 6px)',
+            border: '1px solid var(--glass-border, rgba(255,255,255,0.55))',
+            background: showLegend ? 'var(--surface-selected, rgba(74,85,104,0.07))' : 'var(--glass, rgba(255,255,255,0.82))',
+            backdropFilter: 'var(--glass-blur, blur(20px) saturate(1.8))',
+            WebkitBackdropFilter: 'var(--glass-blur, blur(20px) saturate(1.8))',
+            boxShadow: 'var(--shadow-sm, 0 1px 3px rgba(0,0,0,0.03))',
             cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center',
-            color: showLegend ? '#1d4ed8' : '#8a8a90', fontSize: 11, fontWeight: 600, fontFamily: FONT,
-            padding: 0,
+            color: showLegend ? 'var(--accent-text, #374151)' : 'var(--text-muted, #8a8a90)',
+            fontSize: 11, fontWeight: 600, fontFamily: FONT, padding: 0,
+            transition: 'background var(--transition-fast, 0.12s ease), color var(--transition-fast, 0.12s ease)',
           }}
           title={showLegend ? 'Hide Legend' : 'Show Legend'}
+          onMouseEnter={e => { if (!showLegend) e.currentTarget.style.background = 'var(--surface-hover, rgba(0,0,0,0.035))'; }}
+          onMouseLeave={e => { if (!showLegend) e.currentTarget.style.background = 'var(--glass, rgba(255,255,255,0.82))'; }}
         >
           <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><rect x="2" y="2" width="12" height="12" rx="1.5" stroke="currentColor" strokeWidth="1.2" /><line x1="5" y1="6" x2="7.5" y2="6" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" /><line x1="9" y1="6" x2="11" y2="6" stroke="currentColor" strokeWidth="0.8" strokeLinecap="round" opacity="0.4" /><line x1="5" y1="8.5" x2="7.5" y2="8.5" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" /><line x1="9" y1="8.5" x2="11" y2="8.5" stroke="currentColor" strokeWidth="0.8" strokeLinecap="round" opacity="0.4" /><line x1="5" y1="11" x2="7.5" y2="11" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" /><line x1="9" y1="11" x2="11" y2="11" stroke="currentColor" strokeWidth="0.8" strokeLinecap="round" opacity="0.4" /></svg>
         </button>
@@ -1604,25 +2028,26 @@ export default function App() {
 
           return (
             <div style={{
-              position: 'absolute', bottom: 110, right: propSide === 'right' ? 274 : 12, zIndex: 50,
-              background: 'rgba(255,255,255,0.94)',
-              backdropFilter: 'blur(20px) saturate(1.6)',
-              WebkitBackdropFilter: 'blur(20px) saturate(1.6)',
-              border: '1px solid rgba(255,255,255,0.5)',
-              borderRadius: 12,
-              boxShadow: '0 4px 24px rgba(0,0,0,0.1)', padding: '12px 16px',
-              width: 300, fontSize: 12, fontFamily: FONT, maxHeight: 440, overflow: 'auto',
+              position: 'absolute', bottom: 54, right: propSide === 'right' ? 274 : 12, zIndex: 50,
+              background: 'var(--glass-strong, rgba(255,255,255,0.92))',
+              backdropFilter: 'var(--glass-blur, blur(20px) saturate(1.8))',
+              WebkitBackdropFilter: 'var(--glass-blur, blur(20px) saturate(1.8))',
+              border: '1px solid var(--glass-border, rgba(255,255,255,0.55))',
+              borderRadius: 'var(--radius-md, 10px)',
+              boxShadow: 'var(--shadow-lg, 0 4px 24px rgba(0,0,0,0.08))',
+              padding: '10px 14px',
+              width: 280, fontSize: 12, fontFamily: FONT, maxHeight: 400, overflow: 'auto',
             }}>
               {activeElTypes.length > 0 && (
                 <>
-                  <div style={{ fontSize: 10, fontWeight: 600, color: '#a0a0a0', textTransform: 'uppercase', marginBottom: 8, letterSpacing: '0.5px' }}>Elements</div>
-                  <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '4px 12px' }}>
+                  <div style={{ fontSize: 10, fontWeight: 500, color: 'var(--text-faint, #b0b0b8)', textTransform: 'uppercase', marginBottom: 6, letterSpacing: '0.5px' }}>Elements</div>
+                  <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '3px 10px' }}>
                     {activeElTypes.map(([k, def]) => {
                       const L = LAYERS[def.layer];
                       return (
-                        <div key={k} style={{ display: 'flex', alignItems: 'center', gap: 7, padding: '2px 0' }}>
-                          <CanvasIcon type={k} size={16} color={L?.accent || '#888'} />
-                          <span style={{ color: '#444', fontSize: 12 }}>{def.label}</span>
+                        <div key={k} style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '1px 0' }}>
+                          <CanvasIcon type={k} size={16} color={L?.stroke || '#666'} />
+                          <span style={{ color: 'var(--text-secondary, #555)', fontSize: 11.5 }}>{def.label}</span>
                         </div>
                       );
                     })}
@@ -1630,62 +2055,71 @@ export default function App() {
                 </>
               )}
               {activeElTypes.length > 0 && activeRelTypes.length > 0 && (
-                <div style={{ height: 1, background: 'rgba(0,0,0,0.06)', margin: '10px 0' }} />
+                <div style={{ height: 1, background: 'var(--border, rgba(0,0,0,0.06))', margin: '8px 0' }} />
               )}
               {activeRelTypes.length > 0 && (
                 <>
-                  <div style={{ fontSize: 10, fontWeight: 600, color: '#a0a0a0', textTransform: 'uppercase', marginBottom: 8, letterSpacing: '0.5px' }}>Relationships</div>
+                  <div style={{ fontSize: 10, fontWeight: 500, color: 'var(--text-faint, #b0b0b8)', textTransform: 'uppercase', marginBottom: 6, letterSpacing: '0.5px' }}>Relationships</div>
                   {activeRelTypes.map(([, rd]) => (
-                    <div key={rd.label} style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 2 }}>
+                    <div key={rd.label} style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 2 }}>
                       {renderRelSvg(rd)}
                       <div style={{ display: 'flex', flexDirection: 'column' }}>
-                        <span style={{ color: '#444', fontSize: 12, fontWeight: 500 }}>{rd.label}</span>
-                        <span style={{ color: '#aaa', fontSize: 10 }}>{rd.desc}</span>
+                        <span style={{ color: 'var(--text-secondary, #555)', fontSize: 11.5, fontWeight: 500 }}>{rd.label}</span>
+                        <span style={{ color: 'var(--text-faint, #b0b0b8)', fontSize: 10 }}>{rd.desc}</span>
                       </div>
                     </div>
                   ))}
                 </>
               )}
               {activeElTypes.length === 0 && activeRelTypes.length === 0 && (
-                <div style={{ color: '#bbb', fontSize: 12, padding: '4px 0' }}>No elements or relationships yet.</div>
+                <div style={{ color: 'var(--text-faint, #b0b0b8)', fontSize: 12, padding: '4px 0' }}>No elements or relationships yet.</div>
               )}
             </div>
           );
         })()}
 
-        {/* ====== Zoom indicator (bottom-left) ====== */}
+        {/* ====== Zoom + stats (bottom-left) ====== */}
         <div style={{
           position: 'absolute', bottom: 12, left: leftPanelWidth + 24, zIndex: 10,
-          fontSize: 11, color: '#aaa',
-          background: 'rgba(255,255,255,0.85)',
-          backdropFilter: 'blur(12px)',
-          WebkitBackdropFilter: 'blur(12px)',
-          padding: '3px 8px', borderRadius: 6,
-          border: '1px solid rgba(255,255,255,0.5)',
-          boxShadow: '0 1px 4px rgba(0,0,0,0.04)',
-          fontWeight: 500,
+          display: 'flex', alignItems: 'center', gap: 8,
+          fontSize: 11, fontWeight: 400,
+          background: 'var(--glass, rgba(255,255,255,0.82))',
+          backdropFilter: 'var(--glass-blur, blur(20px) saturate(1.8))',
+          WebkitBackdropFilter: 'var(--glass-blur, blur(20px) saturate(1.8))',
+          padding: '3px 10px', borderRadius: 'var(--radius-sm, 6px)',
+          border: '1px solid var(--glass-border, rgba(255,255,255,0.55))',
+          boxShadow: 'var(--shadow-sm, 0 1px 3px rgba(0,0,0,0.03))',
         }}>
-          {Math.round(cam.s * 100)}%
+          <span style={{ color: 'var(--text-muted, #8a8a90)', fontWeight: 500 }}>{Math.round(cam.s * 100)}%</span>
+          <span style={{ width: 1, height: 12, background: 'var(--border, rgba(0,0,0,0.06))' }} />
+          <span style={{ color: 'var(--text-faint, #b0b0b8)' }}>{visibleElements.length} el {'\u00B7'} {visibleRelationships.length} rel</span>
         </div>
 
-        {/* ====== Stats (bottom-left, next to zoom) ====== */}
-        <div style={{
-          position: 'absolute', bottom: 12, left: leftPanelWidth + 80, zIndex: 10,
-          fontSize: 11, color: '#bbb',
-          fontWeight: 400,
-        }}>
-          {visibleElements.length} el {'\u00B7'} {visibleRelationships.length} rel
-        </div>
+        {importDiag && (
+          <div
+            onClick={() => setImportDiag(null)}
+            style={{
+              position: 'absolute', bottom: 60, left: '50%', transform: 'translateX(-50%)',
+              maxWidth: '80vw', padding: '8px 14px', zIndex: 100,
+              background: 'rgba(220,160,0,0.95)', color: '#000', borderRadius: 8,
+              fontSize: 11, fontFamily: 'monospace', cursor: 'pointer', whiteSpace: 'pre-wrap',
+              boxShadow: '0 2px 8px rgba(0,0,0,0.2)',
+            }}
+          >
+            {importDiag} <span style={{ opacity: 0.5 }}>(click to dismiss)</span>
+          </div>
+        )}
 
         {/* ====== Property panel on right side ====== */}
         {propSide === 'right' && (
           <div style={{
             position: 'absolute', right: 10, top: 52, bottom: 10, width: 252, zIndex: 10,
-            background: 'rgba(255,255,255,0.92)',
-            backdropFilter: 'blur(20px) saturate(1.6)',
-            WebkitBackdropFilter: 'blur(20px) saturate(1.6)',
-            borderRadius: 14, border: '1px solid rgba(255,255,255,0.5)',
-            boxShadow: '0 4px 24px rgba(0,0,0,0.08)',
+            background: 'var(--glass-strong, rgba(255,255,255,0.92))',
+            backdropFilter: 'var(--glass-blur, blur(20px) saturate(1.8))',
+            WebkitBackdropFilter: 'var(--glass-blur, blur(20px) saturate(1.8))',
+            borderRadius: 'var(--radius-lg, 14px)',
+            border: '1px solid var(--glass-border, rgba(255,255,255,0.55))',
+            boxShadow: 'var(--shadow-lg, 0 4px 24px rgba(0,0,0,0.08))',
             display: 'flex', flexDirection: 'column', overflow: 'hidden',
           }}>
             <PropertyPanel

@@ -17,6 +17,7 @@ const SearchIcon = () => <I><circle cx="8" cy="8" r="4.5" stroke="currentColor" 
 const MenuIcon = () => <I><line x1="3.5" y1="5.5" x2="14.5" y2="5.5" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" /><line x1="3.5" y1="9" x2="14.5" y2="9" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" /><line x1="3.5" y1="12.5" x2="14.5" y2="12.5" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" /></I>;
 const DeleteIcon = () => <I><path d="M5.5 4.5V3.5a1.5 1.5 0 011.5-1.5h4a1.5 1.5 0 011.5 1.5v1" stroke="currentColor" strokeWidth="1.3" /><path d="M3 4.5h12" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" /><path d="M4.5 4.5l.7 10a1 1 0 001 .9h5.6a1 1 0 001-.9l.7-10" stroke="currentColor" strokeWidth="1.3" /></I>;
 const ViewIcon = () => <I><path d="M2 9s3-5.5 7-5.5S16 9 16 9s-3 5.5-7 5.5S2 9 2 9z" stroke="currentColor" strokeWidth="1.3" strokeLinejoin="round" /><circle cx="9" cy="9" r="2.5" stroke="currentColor" strokeWidth="1.3" /></I>;
+const AgentIcon = () => <I><rect x="4" y="5" width="10" height="8" rx="2" stroke="currentColor" strokeWidth="1.2" fill="none" /><circle cx="7" cy="9" r="1" fill="currentColor" /><circle cx="11" cy="9" r="1" fill="currentColor" /><path d="M6 3.5L7 5M12 3.5L11 5" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" /><path d="M7 14v1.5M11 14v1.5" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" /></I>;
 const EditIcon = () => <I><path d="M11.5 2.5l4 4-9.5 9.5H2v-4z" stroke="currentColor" strokeWidth="1.3" strokeLinejoin="round" /><path d="M9.5 4.5l4 4" stroke="currentColor" strokeWidth="1.3" /></I>;
 
 const LAYER_ORDER = ['strategy', 'business', 'application', 'technology', 'motivation', 'implementation', 'composite'] as const;
@@ -329,9 +330,16 @@ export function FloatingToolbar(props: FloatingToolbarProps) {
         {div}
 
         {/* Delete */}
-        <button onClick={() => { if (!isViewMode) { onDeleteSelected(); close(); } }} title="Delete" disabled={!hasSelection || isViewMode} style={tb(false, !hasSelection || isViewMode)}
+        <button onClick={() => { if (!isViewMode) { onDeleteSelected(); close(); } }} title="Delete" disabled={!hasSelection || isViewMode}
+          style={{ ...tb(false, !hasSelection || isViewMode), color: hasSelection && !isViewMode ? '#e07070' : undefined }}
           onMouseEnter={e => { if (hasSelection && !isViewMode) hover(e); }} onMouseLeave={e => { if (hasSelection && !isViewMode) unhover(e); }}>
           <DeleteIcon />
+        </button>
+
+        {/* AI Agent */}
+        <button onClick={() => { close(); alert('Coming soon — connect your AI agent (Claude, Codex, etc.) to chat about your architecture.'); }} title="Connect AI Agent" style={tb()}
+          onMouseEnter={e => hover(e)} onMouseLeave={e => unhover(e)}>
+          <AgentIcon />
         </button>
 
         {/* File menu */}

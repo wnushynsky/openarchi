@@ -5,4 +5,5 @@ dist/
 .DS_Store
 .idea/
 *.tsbuildinfo
-.claude
+/.claude/
+/.claude/settings.local.json

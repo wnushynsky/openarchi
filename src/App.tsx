@@ -2,7 +2,7 @@ import { useState, useRef, useCallback, useEffect, useMemo } from 'react';
 import type {
   ModelElement, ModelRelationship, ModelView,
   Camera, DragState, PanState, DrawingRelState, DragWPState, DragEndpointState, DragLabelState, DragSegmentState,
-  RelPickerState, CtxMenuState, CtxMenuItem, GridType, LeftPanel, SelectionType, ResizeState,
+  RelPickerState, CtxMenuState, CtxMenuItem, GridType, SelectionType, ResizeState,
 } from './types';
 import type { CanonicalModelDocument } from './model/canonical';
 import {
@@ -175,7 +175,6 @@ export default function App() {
   const [ctxMenu, setCtxMenu] = useState<CtxMenuState | null>(null);
   const [showSearch, setShowSearch] = useState(false);
   const [ioFormatId, setIoFormatId] = useState<string>('auto');
-  const [leftPanel, setLeftPanel] = useState<LeftPanel>('views');
   const [leftPanelWidth, setLeftPanelWidth] = useState(244);
   const [propSide, setPropSide] = useState<'left' | 'right'>('left');
   const [openTabIds, setOpenTabIds] = useState<string[]>(['v1']);
@@ -745,7 +744,7 @@ export default function App() {
   const isViewMode = interactionMode === 'view';
 
   const handleMouseDown = useCallback((e: React.MouseEvent) => {
-    if (relPicker || ctxMenu) { setRelPicker(null); setCtxMenu(null); return; }
+    if (relPicker || ctxMenu) { setRelPicker(null); setCtxMenu(null); setShowChangelog(false); return; }
     if (editingElId) return;
     const canvas = canvasRef.current;
     if (!canvas) return;
@@ -769,9 +768,17 @@ export default function App() {
       return;
     }
 
-    if (drawingRel && e.shiftKey) {
-      setDrawingRel(prev => prev ? { ...prev, waypoints: [...prev.waypoints, { x: snap(wx), y: snap(wy) }] } : null);
-      return;
+    // During relationship drawing: click on element = complete, click on empty = add waypoint
+    if (drawingRel) {
+      const tgtEl = hitTestElement(sortedElements, wx, wy, getLayer, isNote);
+      if (tgtEl && tgtEl.id !== drawingRel.sourceId) {
+        // Clicked on target element — complete the connection (handled in mouseUp)
+        // Let it fall through to normal handling
+      } else {
+        // Clicked on empty space or same element — add waypoint
+        setDrawingRel(prev => prev ? { ...prev, waypoints: [...prev.waypoints, { x: snap(wx), y: snap(wy) }] } : null);
+        return;
+      }
     }
 
     const linked = hitTestPopout(visibleElements, wx, wy);
@@ -1019,9 +1026,39 @@ export default function App() {
       }
       setDrawingRel(null); return;
     }
+
+    // Archi behavior: when dropping an element onto another element, offer to create a relationship
+    if (dragging && !isViewMode) {
+      const draggedEl = visibleElements.find(el => el.id === dragging.id);
+      if (draggedEl) {
+        const canvas = canvasRef.current;
+        if (canvas) {
+          const rect = canvas.getBoundingClientRect();
+          const sx = e.clientX - rect.left, sy = e.clientY - rect.top;
+          // Find element under the center of the dragged element
+          const dropTarget = visibleElements.find(el => {
+            if (el.id === dragging.id) return false;
+            return draggedEl.x + draggedEl.w / 2 >= el.x && draggedEl.x + draggedEl.w / 2 <= el.x + el.w &&
+                   draggedEl.y + draggedEl.h / 2 >= el.y && draggedEl.y + draggedEl.h / 2 <= el.y + el.h;
+          });
+          // Only offer if no relationship already exists between the two
+          if (dropTarget) {
+            const alreadyConnected = relationships.some(r =>
+              (r.sourceId === dragging.id && r.targetId === dropTarget.id) ||
+              (r.sourceId === dropTarget.id && r.targetId === dragging.id)
+            );
+            if (!alreadyConnected) {
+              relPickerWaypoints.current = [];
+              setRelPicker({ sx, sy, srcId: dragging.id, tgtId: dropTarget.id });
+            }
+          }
+        }
+      }
+    }
+
     setDragging(null); setPanning(null); setDragWP(null); setDragEndpoint(null); setDragLabel(null); setDragSegment(null); setResizing(null);
     setSnapGuides([]);
-  }, [drawingRel, s2w, visibleElements]);
+  }, [drawingRel, dragging, s2w, visibleElements, relationships, isViewMode]);
 
   const handleDblClick = useCallback((e: React.MouseEvent) => {
     const canvas = canvasRef.current;
@@ -1125,6 +1162,7 @@ export default function App() {
         { label: '', separator: true },
         {
           label: 'Delete',
+          color: '#e07070',
           action: () => {
             pushHistory();
             setElements(prev => prev.filter(e => e.id !== el.id));
@@ -1152,7 +1190,7 @@ export default function App() {
           { label: 'Edit label', action: () => { pushHistory(); const name = prompt('Label:', rh.rel.name || ''); if (name !== null) setRelationships(prev => prev.map(r => r.id === rh.rel.id ? { ...r, name } : r)); } },
           ...(rh.rel.waypoints?.length > 0 ? [{ label: 'Remove all waypoints', action: () => { pushHistory(); setRelationships(prev => prev.map(r => r.id === rh.rel.id ? { ...r, waypoints: [] } : r)); } }] : []),
           ...((rh.rel.sourceAnchor || rh.rel.targetAnchor) ? [{ label: 'Reset endpoints to auto', action: () => { pushHistory(); setRelationships(prev => prev.map(r => r.id === rh.rel.id ? { ...r, sourceAnchor: undefined, targetAnchor: undefined } : r)); } }] : []),
-          { label: 'Delete relationship', action: () => { pushHistory(); setRelationships(prev => prev.filter(r => r.id !== rh.rel.id)); if (selectedId === rh.rel.id) { setSelectedId(null); setSelType(null); } } },
+          { label: 'Delete relationship', color: '#e07070', action: () => { pushHistory(); setRelationships(prev => prev.filter(r => r.id !== rh.rel.id)); if (selectedId === rh.rel.id) { setSelectedId(null); setSelType(null); } } },
         ],
       });
       return;
@@ -1160,7 +1198,7 @@ export default function App() {
 
     const wp = hitTestWaypoint(visibleRelationships, wx, wy);
     if (wp) {
-      setCtxMenu({ x: sx, y: sy, items: [{ label: 'Remove waypoint', action: () => { pushHistory(); setRelationships(prev => prev.map(r => r.id === wp.relId ? { ...r, waypoints: r.waypoints.filter((_, i) => i !== wp.wpIdx) } : r)); } }] });
+      setCtxMenu({ x: sx, y: sy, items: [{ label: 'Remove waypoint', color: '#e07070', action: () => { pushHistory(); setRelationships(prev => prev.map(r => r.id === wp.relId ? { ...r, waypoints: r.waypoints.filter((_, i) => i !== wp.wpIdx) } : r)); } }] });
     }
   }, [s2w, visibleElements, visibleRelationships, selectedId, pushHistory, elements, isViewMode]);
 
@@ -1491,7 +1529,7 @@ export default function App() {
         if (isTextInputActive()) return;
         if (interactionMode !== 'view') deleteSelected();
       }
-      if (e.key === 'Escape') { setRelPicker(null); setCtxMenu(null); setShowSearch(false); setDrawingRel(null); cancelEditing(); }
+      if (e.key === 'Escape') { setRelPicker(null); setCtxMenu(null); setShowChangelog(false); setShowSearch(false); setDrawingRel(null); cancelEditing(); }
       if ((e.metaKey || e.ctrlKey) && e.key === 'k') { e.preventDefault(); setShowSearch(s => !s); }
       if ((e.metaKey || e.ctrlKey) && e.key === 's') { e.preventDefault(); handleSave(); }
       if ((e.metaKey || e.ctrlKey) && e.key === 'z') {
@@ -1559,12 +1597,7 @@ export default function App() {
 
   const relPickerWaypoints = useRef<{ x: number; y: number }[]>([]);
 
-  // Left panel cycling (views + changelog only — palette moved to toolbar)
-  const cycleLeftPanel = useCallback(() => {
-    setLeftPanel(p => p === 'views' ? 'changelog' : 'views');
-  }, []);
-
-  const leftPanelLabel = leftPanel === 'views' ? 'Changelog' : 'Views';
+  const [showChangelog, setShowChangelog] = useState(false);
 
   // ==================== RENDER ====================
   return (
@@ -1576,6 +1609,7 @@ export default function App() {
         <div style={{
           position: 'absolute', top: 10, left: 10, zIndex: 10,
           display: 'flex', alignItems: 'center', gap: 8,
+          maxWidth: 280,
           background: 'var(--glass, rgba(255,255,255,0.82))',
           backdropFilter: 'var(--glass-blur, blur(20px) saturate(1.8))',
           WebkitBackdropFilter: 'var(--glass-blur, blur(20px) saturate(1.8))',
@@ -1584,10 +1618,10 @@ export default function App() {
           boxShadow: 'var(--shadow-md, 0 2px 12px rgba(0,0,0,0.06))',
           padding: '5px 10px',
         }}>
-          <div style={{ width: 20, height: 20, background: 'var(--text-primary, #1a1a1a)', borderRadius: 5, display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 8, fontWeight: 600, color: '#fff', letterSpacing: '-0.3px' }}>OA</div>
-          <span style={{ fontWeight: 600, fontSize: 13, color: 'var(--text-primary, #1a1a1a)', letterSpacing: '-0.01em' }}>OpenArchi</span>
+          <div style={{ width: 20, height: 20, flexShrink: 0, background: 'var(--text-primary, #1a1a1a)', borderRadius: 5, display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 8, fontWeight: 600, color: '#fff', letterSpacing: '-0.3px' }}>OA</div>
+          <span style={{ fontWeight: 600, fontSize: 13, flexShrink: 0, color: 'var(--text-primary, #1a1a1a)', letterSpacing: '-0.01em' }}>OpenArchi</span>
           {activeFileEntry && (
-            <span style={{ fontSize: 11, color: 'var(--text-muted, #8a8a90)' }}>
+            <span style={{ fontSize: 11, color: 'var(--text-muted, #8a8a90)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
               {dirState ? `${dirState.directoryName}/` : ''}{activeFileEntry.relativePath}{isDirty ? ' *' : ''}
             </span>
           )}
@@ -1611,13 +1645,53 @@ export default function App() {
           <Btn onClick={undo} disabled={historyIndexRef.current <= 0}>Undo</Btn>
           <Btn onClick={redo} disabled={historyIndexRef.current >= historyRef.current.length - 1}>Redo</Btn>
           <div style={{ width: 1, height: 16, background: 'var(--border, rgba(0,0,0,0.06))', margin: '0 2px' }} />
-          <Btn onClick={cycleLeftPanel}>{leftPanelLabel}</Btn>
+          <div style={{ position: 'relative' }}>
+            <Btn onClick={() => setShowChangelog(v => !v)}>History</Btn>
+            {showChangelog && (
+              <div
+                onMouseDown={e => e.stopPropagation()}
+                style={{
+                  position: 'absolute', top: '100%', right: 0, marginTop: 6,
+                  width: 340, maxHeight: 400,
+                  background: 'var(--glass-strong, rgba(255,255,255,0.95))',
+                  backdropFilter: 'var(--glass-blur, blur(20px) saturate(1.8))',
+                  WebkitBackdropFilter: 'var(--glass-blur, blur(20px) saturate(1.8))' as string,
+                  border: '1px solid var(--glass-border, rgba(255,255,255,0.55))',
+                  borderRadius: 'var(--radius-md, 10px)',
+                  boxShadow: 'var(--shadow-xl, 0 8px 40px rgba(0,0,0,0.12))',
+                  fontFamily: FONT, overflow: 'hidden',
+                  display: 'flex', flexDirection: 'column',
+                  zIndex: 200,
+                }}>
+                <div style={{ padding: '10px 14px 6px', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                  <span style={{ fontSize: 11, fontWeight: 600, color: 'var(--text-primary, #1a1a1a)', textTransform: 'uppercase', letterSpacing: '0.5px' }}>View History</span>
+                  <button onClick={() => setShowChangelog(false)} style={{
+                    background: 'none', border: 'none', cursor: 'pointer', fontSize: 14,
+                    color: 'var(--text-faint, #b0b0b8)', padding: '0 2px', lineHeight: 1,
+                  }}>{'\u00D7'}</button>
+                </div>
+                <div style={{ padding: '4px 14px 6px', fontSize: 10, color: 'var(--text-muted, #8a8a90)' }}>
+                  {activeView?.name || 'Unknown view'}
+                </div>
+                <div style={{ flex: 1, overflow: 'auto', padding: '6px 14px 14px' }}>
+                  <div style={{ color: 'var(--text-faint, #b0b0b8)', fontSize: 12, lineHeight: 1.7 }}>
+                    <p style={{ margin: '0 0 8px', fontWeight: 400 }}>
+                      Git history for elements, relationships and properties in this view will appear here.
+                    </p>
+                    <p style={{ margin: 0, fontSize: 11, fontStyle: 'italic' }}>
+                      Coming soon — requires a git-backed model (coArchi directory).
+                    </p>
+                  </div>
+                </div>
+              </div>
+            )}
+          </div>
         </div>
 
         {/* ====== Tab bar island ====== */}
         <div style={{
           position: 'absolute', top: 10,
-          left: activeFileEntry ? 320 : 200,
+          left: 300,
           right: propSide === 'right' ? 520 : 260,
           zIndex: 10,
           height: 32,
@@ -1703,19 +1777,7 @@ export default function App() {
               window.addEventListener('mouseup', onUp);
             }}
           />
-          {leftPanel === 'views' ? (
-            <ViewNav views={views} currentViewId={currentViewId} onNavigate={navigateToView} />
-          ) : (
-            <div style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
-              <div style={{ padding: '10px 12px 6px', fontSize: 10, fontWeight: 500, color: 'var(--text-faint, #b0b0b8)', textTransform: 'uppercase', letterSpacing: '0.5px' }}>Changelog</div>
-              <div style={{ padding: '8px 12px', color: 'var(--text-faint, #b0b0b8)', fontSize: 12, lineHeight: 1.7 }}>
-                <p style={{ margin: '0 0 8px', color: 'var(--text-muted, #8a8a90)', fontWeight: 400 }}>Change history will appear here.</p>
-                <p style={{ margin: 0, fontSize: 11 }}>
-                  Track element additions, modifications, relationship changes, and view updates over time.
-                </p>
-              </div>
-            </div>
-          )}
+          <ViewNav views={views} currentViewId={currentViewId} onNavigate={navigateToView} />
           {/* Property panel on left side */}
           {propSide === 'left' && (
             <PropertyPanel
@@ -1857,7 +1919,7 @@ export default function App() {
               boxShadow: 'var(--shadow-md, 0 2px 12px rgba(0,0,0,0.06))',
               whiteSpace: 'nowrap',
             }}>
-              Hold <strong>Shift + Click</strong> to add a waypoint bend
+              <strong>Click</strong> to add waypoint, click <strong>target element</strong> to complete
             </div>
           )}
         </div>

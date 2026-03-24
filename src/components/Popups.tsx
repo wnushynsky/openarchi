@@ -1,7 +1,49 @@
 import { useState } from 'react';
-import type { ModelElement, ModelView, CtxMenuItem } from '../types';
+import type { ModelElement, ModelView, CtxMenuItem, RelationshipTypeDef } from '../types';
 import { RELATIONSHIP_TYPES, ELEMENT_TYPES, LAYERS, FONT } from '../core';
 import { CanvasIcon } from './CanvasIcon';
+
+/** Mini SVG preview of a relationship line + arrowhead, matching the actual rendered style */
+function RelArrowPreview({ def }: { def: RelationshipTypeDef }) {
+  const w = 36, h = 14, mx = w - 4, my = h / 2;
+  const col = '#666';
+  const dash = def.dash ? (def.dashPattern ? def.dashPattern.join(',') : '6,3') : undefined;
+
+  let srcDeco: React.ReactNode = null;
+  let tgtDeco: React.ReactNode = null;
+  let lineStart = 4;
+  let lineEnd = mx;
+
+  // Source decorations
+  if (def.head === 'diamond_filled' || def.head === 'diamond') {
+    const dw = 4, dh = 3;
+    srcDeco = <polygon points={`4,${my} ${4+dw},${my-dh} ${4+dw*2},${my} ${4+dw},${my+dh}`} fill={def.head === 'diamond_filled' ? col : '#fff'} stroke={col} strokeWidth="1" />;
+    lineStart = 4 + dw * 2;
+  } else if (def.head === 'filled_dot') {
+    srcDeco = <circle cx="7" cy={my} r="2.5" fill={col} />;
+    lineStart = 10;
+  }
+
+  // Target decorations
+  if (def.head === 'filled_arrow') {
+    tgtDeco = <polygon points={`${mx},${my} ${mx-7},${my-4} ${mx-7},${my+4}`} fill={col} stroke="none" />;
+    lineEnd = mx - 7;
+  } else if (def.head === 'open_arrow') {
+    tgtDeco = <polyline points={`${mx-7},${my-4} ${mx},${my} ${mx-7},${my+4}`} fill="none" stroke={col} strokeWidth="1.2" />;
+    lineEnd = mx - 2;
+  } else if (def.head === 'hollow_arrow') {
+    tgtDeco = <polygon points={`${mx},${my} ${mx-7},${my-4} ${mx-7},${my+4}`} fill="#fff" stroke={col} strokeWidth="1" />;
+    lineEnd = mx - 7;
+  }
+
+  return (
+    <svg width={w} height={h} viewBox={`0 0 ${w} ${h}`} style={{ flexShrink: 0 }}>
+      <line x1={lineStart} y1={my} x2={lineEnd} y2={my} stroke={col} strokeWidth="1.2" strokeDasharray={dash} />
+      {srcDeco}
+      {tgtDeco}
+    </svg>
+  );
+}
 
 // Shared glass surface
 const glassPanel: React.CSSProperties = {
@@ -65,7 +107,7 @@ export function RelPicker({ x, y, onSelect, onCancel }: RelPickerProps) {
           onMouseEnter={itemHover}
           onMouseLeave={itemUnhover}
         >
-          <span style={{ width: 22, color: 'var(--text-faint, #b0b0b8)', fontSize: 12, textAlign: 'center', flexShrink: 0 }}>{v.dash ? '\u2504\u25B8' : '\u2500\u25B8'}</span>
+          <RelArrowPreview def={v} />
           <span style={{ fontWeight: 500 }}>{v.label}</span>
           <span style={{ marginLeft: 'auto', fontSize: 11, color: 'var(--text-faint, #b0b0b8)' }}>{v.desc}</span>
         </button>
@@ -119,7 +161,7 @@ function CtxMenuItemRow({ item, onClose }: { item: CtxMenuItem; onClose: () => v
           display: 'flex', alignItems: 'center', gap: 8, width: '100%', padding: '5px 12px',
           border: 'none', background: 'transparent',
           cursor: item.action || hasChildren ? 'pointer' : 'default',
-          fontSize: 13, color: 'var(--text-secondary, #555)', fontFamily: 'inherit',
+          fontSize: 13, color: item.color || 'var(--text-secondary, #555)', fontFamily: 'inherit',
           textAlign: 'left', fontWeight: 400, borderRadius: 4,
           transition: 'background var(--transition-fast, 0.12s ease)',
         }}

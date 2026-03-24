@@ -165,6 +165,7 @@ export interface CtxMenuItem {
   action?: () => void;
   icon?: string;
   iconColor?: string;
+  color?: string;
   children?: CtxMenuItem[];
   separator?: boolean;
 }

@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/openarchi-logo-trans.png" width="128" />
+</p>
+
 **OpenArchi - An open-source ArchiMate modeling tool built for human & AI collaboration**
 
 OpenArchi is a modern, alternative to Archi. It provides an interactive canvas for visual architecture modeling, backed by the ArchiMate language by The Open Group along with a more agentic friendly layer in Markdown, making them readable and editable by humans and AI agents.

@@ -29,6 +29,8 @@ export interface DirectoryState {
   directoryName: string;
   /** All ArchiMate-compatible files found (recursively) */
   files: OpenFileEntry[];
+  /** Root directory handle (only available with File System Access API) */
+  directoryHandle?: FileSystemDirectoryHandle;
 }
 
 type FileWithRelativePath = File & {
@@ -59,7 +61,7 @@ export async function openDirectoryNative(): Promise<DirectoryState> {
   const files: OpenFileEntry[] = [];
   await scanDirectoryNative(directoryHandle, '', files);
   files.sort((a, b) => a.relativePath.localeCompare(b.relativePath));
-  return { directoryName: directoryHandle.name, files };
+  return { directoryName: directoryHandle.name, files, directoryHandle };
 }
 
 async function scanDirectoryNative(
@@ -187,4 +189,40 @@ export async function createFileInDirectory(
   const fileHandle = await directoryHandle.getFileHandle(fileName, { create: true });
   await writeFileHandle(fileHandle, content);
   return fileHandle;
+}
+
+// ---------------------------------------------------------------------------
+// Re-scan an existing directory handle (for restore after page refresh)
+// ---------------------------------------------------------------------------
+
+/**
+ * Re-scan a previously obtained directory handle.
+ * Used to rebuild the file list after restoring from IndexedDB.
+ */
+export async function rescanDirectory(
+  directoryHandle: FileSystemDirectoryHandle,
+): Promise<DirectoryState> {
+  const files: OpenFileEntry[] = [];
+  await scanDirectoryNative(directoryHandle, '', files);
+  files.sort((a, b) => a.relativePath.localeCompare(b.relativePath));
+  return { directoryName: directoryHandle.name, files, directoryHandle };
+}
+
+/**
+ * Write a file at the given relative path within a directory handle.
+ * Creates intermediate directories as needed.
+ */
+export async function writeFileAtPath(
+  rootHandle: FileSystemDirectoryHandle,
+  relativePath: string,
+  content: string,
+): Promise<void> {
+  const parts = relativePath.split('/');
+  const fileName = parts.pop()!;
+  let dirHandle = rootHandle;
+  for (const part of parts) {
+    dirHandle = await dirHandle.getDirectoryHandle(part, { create: true });
+  }
+  const fileHandle = await dirHandle.getFileHandle(fileName, { create: true });
+  await writeFileHandle(fileHandle, content);
 }

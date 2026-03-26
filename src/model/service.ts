@@ -1,10 +1,12 @@
 import type { OpenArchiModel } from '../types';
 import { AdapterRegistry } from '../io/adapter';
-import type { ModelFormatAdapter } from '../io/adapter';
+import type { ModelFormatAdapter, FragmentedSerializeResult } from '../io/adapter';
 import { openArchiJsonAdapter } from '../io/adapters/openarchi-json';
-import { coArchiXmlAdapter, parseCoArchiFragments } from '../io/adapters/coarchi-xml';
+import { coArchiXmlAdapter, parseCoArchiFragmentsStreaming, serializeCoArchiFragmented } from '../io/adapters/coarchi-xml';
+import type { ProgressCallback } from '../io/adapters/coarchi-xml';
 import { archiMateExchangeXmlAdapter } from '../io/adapters/archimate-exchange-xml';
-import { canonicalToEditorModel, editorToCanonicalModel } from './mapper';
+import { canonicalToEditorModel, canonicalToEditorModelWithLayouts, editorToCanonicalModel } from './mapper';
+import type { ElementLayoutsByView, RelationshipLayoutsByView } from './mapper';
 import { hasDiagnosticErrors, type ModelDiagnostic } from './diagnostics';
 import type { CanonicalModelDocument } from './canonical';
 import type { OpenFileEntry } from '../io/filesystem';
@@ -19,6 +21,9 @@ export interface ModelImportResult {
   model?: OpenArchiModel;
   document?: CanonicalModelDocument;
   diagnostics: ModelDiagnostic[];
+  /** Pre-computed layouts (avoids redundant pass over viewNodes after import) */
+  elementLayouts?: ElementLayoutsByView;
+  relationshipLayouts?: RelationshipLayoutsByView;
 }
 
 export interface ModelExportResult {
@@ -100,11 +105,32 @@ export function isFragmentedModelDirectory(files: OpenFileEntry[]): boolean {
 }
 
 /**
- * Import a fragmented coArchi model by reading all XML files in the directory
- * and merging them into a single model. Reads files in batches to avoid
- * overwhelming browser memory on large models.
+ * Async generator that reads XML files one at a time via their OpenFileEntry.
+ * Only one file's raw text is in memory at a time — the previous is released
+ * before the next is read.
  */
-export async function importFragmentedModel(files: OpenFileEntry[]): Promise<ModelImportResult> {
+async function* yieldFileContents(
+  xmlFiles: OpenFileEntry[],
+): AsyncGenerator<{ content: string; path: string }> {
+  for (const file of xmlFiles) {
+    try {
+      const content = await file.readText();
+      yield { content, path: file.relativePath };
+    } catch {
+      // Skipped — errors handled via diagnostics in the parser
+    }
+  }
+}
+
+/**
+ * Import a fragmented coArchi model using streaming parsing.
+ * Files are read and parsed one at a time to avoid holding all raw XML
+ * strings + DOM trees in memory simultaneously — critical for 500MB+ models.
+ */
+export async function importFragmentedModel(
+  files: OpenFileEntry[],
+  onProgress?: ProgressCallback,
+): Promise<ModelImportResult> {
   const xmlFiles = files.filter(f => f.relativePath.toLowerCase().endsWith('.xml'));
 
   if (xmlFiles.length === 0) {
@@ -117,60 +143,25 @@ export async function importFragmentedModel(files: OpenFileEntry[]): Promise<Mod
     };
   }
 
-  // Read files in batches to avoid memory pressure
-  const BATCH_SIZE = 50;
-  const contents: string[] = [];
-  const paths: string[] = [];
-  const errors: string[] = [];
-
-  for (let i = 0; i < xmlFiles.length; i += BATCH_SIZE) {
-    const batch = xmlFiles.slice(i, i + BATCH_SIZE);
-    const results = await Promise.allSettled(
-      batch.map(f => f.readText()),
-    );
-
-    for (let j = 0; j < results.length; j++) {
-      const result = results[j];
-      if (result.status === 'fulfilled') {
-        contents.push(result.value);
-        paths.push(batch[j].relativePath);
-      } else {
-        errors.push(`Failed to read ${batch[j].relativePath}: ${result.reason}`);
-      }
-    }
-
-    // Yield to the event loop between batches to avoid blocking the UI
-    if (i + BATCH_SIZE < xmlFiles.length) {
-      await new Promise(r => setTimeout(r, 0));
-    }
-  }
-
-  if (contents.length === 0) {
-    return {
-      diagnostics: [{
-        severity: 'error',
-        code: 'ALL_READS_FAILED',
-        message: 'Could not read any XML files from the directory.',
-      }],
-    };
-  }
-
-  const parsed = parseCoArchiFragments(contents, paths);
+  const parsed = await parseCoArchiFragmentsStreaming(
+    yieldFileContents(xmlFiles),
+    xmlFiles.length,
+    onProgress,
+  );
 
   if (!parsed.model || hasDiagnosticErrors(parsed.diagnostics)) {
     return { diagnostics: parsed.diagnostics };
   }
 
-  // Add read errors as warnings
-  const diagnostics = [...parsed.diagnostics];
-  for (const err of errors) {
-    diagnostics.push({ severity: 'warning', code: 'FILE_READ_FAILED', message: err });
-  }
+  // Use combined conversion to build model + layouts in a single pass
+  const { model, elementLayouts, relationshipLayouts } = canonicalToEditorModelWithLayouts(parsed.model);
 
   return {
-    model: canonicalToEditorModel(parsed.model),
+    model,
     document: parsed.model,
-    diagnostics,
+    diagnostics: parsed.diagnostics,
+    elementLayouts,
+    relationshipLayouts,
   };
 }
 
@@ -193,4 +184,13 @@ export function exportEditorModelToText(model: OpenArchiModel, formatId: string)
 
   const canonical = editorToCanonicalModel(model);
   return adapter.serialize(canonical);
+}
+
+/**
+ * Export an editor model as fragmented coArchi/GRAFICO files.
+ * Returns the list of { relativePath, content } pairs to write to disk.
+ */
+export function exportFragmentedEditorModel(model: OpenArchiModel): FragmentedSerializeResult {
+  const canonical = editorToCanonicalModel(model);
+  return serializeCoArchiFragmented(canonical);
 }

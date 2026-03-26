@@ -119,7 +119,27 @@ function FileMenu({ onOpenDir, onImport, onExport, onSave, canSave, isDirty, dir
       <Row label="Open Directory" onClick={() => { onOpenDir(); onClose(); }} />
       <Row label="Import" onClick={() => { onImport(); onClose(); }} />
       <Row label="Export" onClick={() => { onExport(); onClose(); }} />
-      {canSave && <Row label={isDirty ? 'Save *' : 'Save'} shortcut={'\u2318S'} onClick={() => { onSave(); onClose(); }} />}
+      {canSave && (
+        <button onClick={() => { onSave(); onClose(); }}
+          style={{
+            display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+            width: '100%', padding: '6px 12px', border: 'none', background: 'transparent',
+            cursor: 'pointer', fontFamily: 'inherit', fontSize: 13,
+            color: isDirty ? 'var(--accent-text, #1d4ed8)' : 'var(--text-secondary, #555)',
+            fontWeight: isDirty ? 600 : 400,
+            borderRadius: 4, margin: '0 2px', boxSizing: 'border-box',
+            transition: 'background var(--transition-fast, 0.12s ease)',
+          }}
+          onMouseEnter={e => { e.currentTarget.style.background = 'var(--surface-hover, rgba(0,0,0,0.035))'; }}
+          onMouseLeave={e => { e.currentTarget.style.background = 'transparent'; }}
+        >
+          <span style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+            {isDirty && <span style={{ width: 6, height: 6, borderRadius: '50%', background: 'var(--accent, #2563eb)', flexShrink: 0 }} />}
+            {isDirty ? 'Save (unsaved changes)' : 'Save'}
+          </span>
+          <span style={{ fontSize: 11, color: 'var(--text-faint, #b0b0b8)', fontWeight: 500, fontFamily: 'inherit' }}>{'\u2318S'}</span>
+        </button>
+      )}
       {dirState && dirFiles.length > 1 && (<>
         <div style={{ height: 1, background: 'var(--border, rgba(0,0,0,0.06))', margin: '3px 8px' }} />
         <div style={{ padding: '4px 12px', fontSize: 10, fontWeight: 500, color: 'var(--text-faint, #b0b0b8)', textTransform: 'uppercase', letterSpacing: '0.4px' }}>Files</div>

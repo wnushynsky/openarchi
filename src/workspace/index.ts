@@ -1,0 +1,6 @@
+export { useWorkspace } from './useWorkspace';
+export type { UseWorkspaceReturn } from './useWorkspace';
+export { WorkspaceManager } from './manager';
+export type { WorkspaceState, WorkspaceMetadata } from './types';
+export { INITIAL_WORKSPACE_STATE } from './types';
+export { detectGitBranch } from './git';

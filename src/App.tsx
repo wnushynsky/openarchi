@@ -19,16 +19,16 @@ import { RelPicker, CtxMenu, SearchPanel, ViewNav, PropertyPanel, Btn, CanvasIco
 import {
   detectModelFormatByFileName,
   exportEditorModelToText,
+  exportFragmentedEditorModel,
   importEditorModelFromText,
   importFragmentedModel,
   isFragmentedModelDirectory,
   listModelFormats,
 } from './model/service';
 import {
-  openDirectory,
-  type DirectoryState,
   type OpenFileEntry,
 } from './io/filesystem';
+import { useWorkspace } from './workspace';
 import type { ModelDiagnostic } from './model/diagnostics';
 
 const getLayer = (type: string) => ELEMENT_TYPES[type]?.layer;
@@ -155,6 +155,7 @@ export default function App() {
   const [relationships, setRelationships] = useState<ModelRelationship[]>(SAMPLE_RELATIONSHIPS);
 
   const [importDiag, setImportDiag] = useState<string | null>(null);
+  const [loadProgress, setLoadProgress] = useState<{ phase: string; pct: number } | null>(null);
 
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [selType, setSelType] = useState<SelectionType>(null);
@@ -184,11 +185,15 @@ export default function App() {
   const [showLegend, setShowLegend] = useState(false);
   const [snapGuides, setSnapGuides] = useState<SnapGuide[]>([]);
 
-  // Filesystem state
-  const [dirState, setDirState] = useState<DirectoryState | null>(null);
-  const [activeFileEntry, setActiveFileEntry] = useState<OpenFileEntry | null>(null);
-  const [activeFormatId, setActiveFormatId] = useState<string | null>(null);
-  const [isDirty, setIsDirty] = useState(false);
+  // Workspace (directory, file, dirty, git branch – persisted to IndexedDB)
+  const {
+    workspace, openDirectory: wsOpenDirectory, setActiveFile: wsSetActiveFile,
+    markDirty, markClean, saveFile: wsSaveFile, saveFragmented: wsSaveFragmented,
+    getFile: wsGetFile, getActiveFile,
+    closeWorkspace,
+    restorePending, restoreDirectoryName, requestPermissionAndRestore,
+  } = useWorkspace();
+  const { isDirty, gitBranch, directoryName: wsDirName, files: wsFiles, activeFilePath: wsActiveFilePath, format: wsFormat, isFragmented: wsIsFragmented } = workspace;
 
   const showTransientDiagnostic = useCallback((message: string, timeoutMs: number = 8000) => {
     setImportDiag(message);
@@ -1388,18 +1393,20 @@ export default function App() {
         fitToContent(result.model.elements);
       }
 
-      setActiveFileEntry(entry);
-      setActiveFormatId(formatId);
-      setIsDirty(false);
+      wsSetActiveFile(entry.relativePath, formatId);
     } catch (err) {
       alert(`Failed to open file: ${err}`);
     }
-  }, [applyViewLayout, fitToContent, summarizeDiagnostics]);
+  }, [applyViewLayout, fitToContent, summarizeDiagnostics, wsSetActiveFile]);
 
   const loadFragmentedModel = useCallback(async (files: OpenFileEntry[]) => {
     try {
       setImportDiag(null);
-      const result = await importFragmentedModel(files);
+      setLoadProgress({ phase: 'Starting', pct: 0 });
+      const result = await importFragmentedModel(files, (phase, current, total) => {
+        setLoadProgress({ phase, pct: total > 0 ? Math.round((current / total) * 100) : 0 });
+      });
+      setLoadProgress(null);
       if (!result.model) {
         const firstError = result.diagnostics.find(d => d.severity === 'error');
         alert(firstError?.message || 'Failed to import fragmented model');
@@ -1407,9 +1414,12 @@ export default function App() {
       }
       summarizeDiagnostics('Import', result.diagnostics);
 
-      const importedLayouts = result.document
-        ? buildLayoutsFromCanonicalDocument(result.document)
-        : buildLayoutsFromEditorModel(result.model.elements, result.model.relationships, result.model.views);
+      // Use pre-computed layouts from the combined mapper when available (avoids redundant pass)
+      const importedLayouts = result.elementLayouts && result.relationshipLayouts
+        ? { elementLayouts: result.elementLayouts, relationshipLayouts: result.relationshipLayouts }
+        : result.document
+          ? buildLayoutsFromCanonicalDocument(result.document)
+          : buildLayoutsFromEditorModel(result.model.elements, result.model.relationships, result.model.views);
       elementLayoutsByViewRef.current = importedLayouts.elementLayouts;
       relationshipLayoutsByViewRef.current = importedLayouts.relationshipLayouts;
 
@@ -1422,8 +1432,6 @@ export default function App() {
         applyViewLayout(result.model.views[0].id);
       }
       setSelectedId(null); setSelType(null);
-      setActiveFormatId('coarchi-xml');
-      setIsDirty(false);
 
       // Show import summary as a temporary visible diagnostic
       const m = result.model;
@@ -1446,19 +1454,17 @@ export default function App() {
         fitToContent(result.model.elements);
       }
     } catch (err) {
+      setLoadProgress(null);
       alert(`Failed to import fragmented model: ${err}`);
     }
   }, [applyViewLayout, fitToContent, showTransientDiagnostic, summarizeDiagnostics]);
 
   const handleOpenDirectory = useCallback(async () => {
     try {
-      const state = await openDirectory();
-      setDirState(state);
+      const state = await wsOpenDirectory();
 
       // Detect fragmented coArchi directory (individual XML files per element)
-      const isFragmented = isFragmentedModelDirectory(state.files);
-
-      if (isFragmented) {
+      if (state.files.length > 0 && isFragmentedModelDirectory(state.files)) {
         await loadFragmentedModel(state.files);
         return;
       }
@@ -1474,15 +1480,35 @@ export default function App() {
       if (err instanceof DOMException && err.name === 'AbortError') return;
       alert(`Failed to open directory: ${err}`);
     }
-  }, [loadFileEntry, loadFragmentedModel, showTransientDiagnostic]);
+  }, [wsOpenDirectory, loadFileEntry, loadFragmentedModel, showTransientDiagnostic]);
 
   const handleSave = useCallback(async () => {
-    if (!activeFileEntry || !activeFormatId) {
+    // Fragmented save (coArchi directory)
+    if (wsIsFragmented && workspace.directoryHandle) {
+      try {
+        const result = exportFragmentedEditorModel({ version: 'openarchi-0.1', elements, relationships, views });
+        const hasError = result.diagnostics.some(d => d.severity === 'error');
+        if (hasError) {
+          const firstError = result.diagnostics.find(d => d.severity === 'error');
+          alert(firstError?.message || 'Save failed');
+          return;
+        }
+        await wsSaveFragmented(result.files);
+        showTransientDiagnostic(`Saved ${result.files.length} files to ${wsDirName}/`);
+      } catch (err) {
+        alert(`Save failed: ${err}`);
+      }
+      return;
+    }
+
+    // Single-file save
+    const activeFileEntry = getActiveFile();
+    if (!activeFileEntry || !wsFormat) {
       // Fallback to download export
       exportModel();
       return;
     }
-    const result = exportEditorModelToText({ version: 'openarchi-0.1', elements, relationships, views }, activeFormatId);
+    const result = exportEditorModelToText({ version: 'openarchi-0.1', elements, relationships, views }, wsFormat);
     const hasError = result.diagnostics.some(d => d.severity === 'error');
     if (hasError) {
       const firstError = result.diagnostics.find(d => d.severity === 'error');
@@ -1491,8 +1517,7 @@ export default function App() {
     }
     if (activeFileEntry.writeText) {
       try {
-        await activeFileEntry.writeText(result.content);
-        setIsDirty(false);
+        await wsSaveFile(activeFileEntry, result.content);
       } catch (err) {
         alert(`Save failed: ${err}`);
       }
@@ -1505,16 +1530,16 @@ export default function App() {
       a.download = activeFileEntry.name;
       a.click();
       URL.revokeObjectURL(url);
-      setIsDirty(false);
+      markClean();
     }
-  }, [activeFileEntry, activeFormatId, elements, relationships, views, exportModel]);
+  }, [wsIsFragmented, workspace.directoryHandle, getActiveFile, wsFormat, wsDirName, elements, relationships, views, exportModel, wsSaveFile, wsSaveFragmented, markClean, showTransientDiagnostic]);
 
   // Mark dirty on model changes (skip initial render)
   const isInitialRender = useRef(true);
   useEffect(() => {
     if (isInitialRender.current) { isInitialRender.current = false; return; }
-    if (activeFileEntry) setIsDirty(true);
-  }, [elements, relationships, views, activeFileEntry]);
+    if (wsActiveFilePath || wsIsFragmented) markDirty();
+  }, [elements, relationships, views, wsActiveFilePath, wsIsFragmented, markDirty]);
 
   // Keyboard
   const isTextInputActive = useCallback((): boolean => {
@@ -1620,12 +1645,101 @@ export default function App() {
         }}>
           <div style={{ width: 20, height: 20, flexShrink: 0, background: 'var(--text-primary, #1a1a1a)', borderRadius: 5, display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 8, fontWeight: 600, color: '#fff', letterSpacing: '-0.3px' }}>OA</div>
           <span style={{ fontWeight: 600, fontSize: 13, flexShrink: 0, color: 'var(--text-primary, #1a1a1a)', letterSpacing: '-0.01em' }}>OpenArchi</span>
-          {activeFileEntry && (
-            <span style={{ fontSize: 11, color: 'var(--text-muted, #8a8a90)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-              {dirState ? `${dirState.directoryName}/` : ''}{activeFileEntry.relativePath}{isDirty ? ' *' : ''}
+          {(wsActiveFilePath || wsDirName) && (
+            <span style={{ fontSize: 11, color: 'var(--text-muted, #8a8a90)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', display: 'flex', alignItems: 'center', gap: 4 }}>
+              {wsDirName ? `${wsDirName}/` : ''}{wsActiveFilePath || ''}
+              {isDirty && <span style={{ width: 6, height: 6, borderRadius: '50%', background: 'var(--accent, #2563eb)', flexShrink: 0 }} title="Unsaved changes" />}
+            </span>
+          )}
+          {gitBranch && (
+            <span style={{
+              fontSize: 10, color: 'var(--text-muted, #8a8a90)',
+              background: 'var(--surface-hover, rgba(0,0,0,0.035))',
+              padding: '1px 6px', borderRadius: 8, flexShrink: 0, whiteSpace: 'nowrap',
+            }}>
+              {'\u2387'} {gitBranch}
             </span>
           )}
         </div>
+
+        {/* ====== Reconnect banner (shows after page refresh when permission needed) ====== */}
+        {restorePending && restoreDirectoryName && (
+          <div style={{
+            position: 'absolute', top: 50, left: '50%', transform: 'translateX(-50%)', zIndex: 20,
+            display: 'flex', alignItems: 'center', gap: 10,
+            background: 'var(--glass-strong, rgba(255,255,255,0.95))',
+            backdropFilter: 'var(--glass-blur, blur(20px) saturate(1.8))',
+            WebkitBackdropFilter: 'var(--glass-blur, blur(20px) saturate(1.8))',
+            border: '1px solid var(--glass-border, rgba(255,255,255,0.55))',
+            borderRadius: 'var(--radius-md, 10px)',
+            boxShadow: 'var(--shadow-md, 0 2px 12px rgba(0,0,0,0.06))',
+            padding: '8px 14px', fontSize: 13, fontFamily: FONT,
+          }}>
+            <span style={{ color: 'var(--text-secondary, #555)' }}>
+              Reconnect to <strong>{restoreDirectoryName}</strong>?
+            </span>
+            <button
+              onClick={async () => {
+                const state = await requestPermissionAndRestore();
+                if (state && state.activeFilePath) {
+                  const entry = wsGetFile(state.activeFilePath);
+                  if (entry) await loadFileEntry(entry);
+                } else if (state && state.isFragmented && state.files.length > 0) {
+                  await loadFragmentedModel(state.files);
+                }
+              }}
+              style={{
+                padding: '4px 12px', border: 'none', borderRadius: 6,
+                background: 'var(--accent, #2563eb)', color: '#fff',
+                fontFamily: 'inherit', fontSize: 12, fontWeight: 500, cursor: 'pointer',
+              }}
+            >Reconnect</button>
+            <button
+              onClick={closeWorkspace}
+              style={{
+                padding: '4px 8px', border: 'none', borderRadius: 6,
+                background: 'transparent', color: 'var(--text-muted, #8a8a90)',
+                fontFamily: 'inherit', fontSize: 12, cursor: 'pointer',
+              }}
+            >Dismiss</button>
+          </div>
+        )}
+
+        {/* ====== Loading progress overlay ====== */}
+        {loadProgress && (
+          <div style={{
+            position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, zIndex: 50,
+            display: 'flex', alignItems: 'center', justifyContent: 'center',
+            background: 'rgba(243,244,246,0.85)',
+            backdropFilter: 'blur(8px)',
+            fontFamily: FONT,
+          }}>
+            <div style={{
+              background: 'var(--glass-strong, rgba(255,255,255,0.95))',
+              border: '1px solid var(--glass-border, rgba(255,255,255,0.55))',
+              borderRadius: 'var(--radius-md, 10px)',
+              boxShadow: 'var(--shadow-md, 0 2px 12px rgba(0,0,0,0.06))',
+              padding: '24px 32px', textAlign: 'center', minWidth: 280,
+            }}>
+              <div style={{ fontSize: 14, fontWeight: 600, color: 'var(--text-primary, #1a1a1a)', marginBottom: 8 }}>
+                Loading model...
+              </div>
+              <div style={{ fontSize: 12, color: 'var(--text-muted, #8a8a90)', marginBottom: 12 }}>
+                {loadProgress.phase} ({loadProgress.pct}%)
+              </div>
+              <div style={{
+                height: 4, borderRadius: 2, background: 'var(--border, rgba(0,0,0,0.06))', overflow: 'hidden',
+              }}>
+                <div style={{
+                  height: '100%', borderRadius: 2,
+                  background: 'var(--accent, #2563eb)',
+                  width: `${loadProgress.pct}%`,
+                  transition: 'width 0.2s ease',
+                }} />
+              </div>
+            </div>
+          </div>
+        )}
 
         {/* ====== Top-right: Actions cluster ====== */}
         <div style={{
@@ -1935,13 +2049,13 @@ export default function App() {
           onImport={importModel}
           onExport={exportModel}
           onSave={handleSave}
-          canSave={!!activeFileEntry}
+          canSave={!!wsActiveFilePath || wsIsFragmented}
           isDirty={isDirty}
-          dirState={!!dirState}
-          dirFiles={dirState?.files || []}
-          activeFilePath={activeFileEntry?.relativePath || ''}
+          dirState={!!wsDirName}
+          dirFiles={wsFiles}
+          activeFilePath={wsActiveFilePath || ''}
           onSelectFile={path => {
-            const entry = dirState?.files.find(f => f.relativePath === path);
+            const entry = wsGetFile(path);
             if (entry) loadFileEntry(entry);
           }}
           ioFormatId={ioFormatId}

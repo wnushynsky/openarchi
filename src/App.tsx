@@ -182,6 +182,8 @@ export default function App() {
   const [editingElId, setEditingElId] = useState<string | null>(null);
   const [interactionMode, setInteractionMode] = useState<'view' | 'edit'>('edit');
   const [editingName, setEditingName] = useState('');
+  const [editingTabId, setEditingTabId] = useState<string | null>(null);
+  const [editingTabName, setEditingTabName] = useState('');
   const [showLegend, setShowLegend] = useState(false);
   const [snapGuides, setSnapGuides] = useState<SnapGuide[]>([]);
 
@@ -604,19 +606,21 @@ export default function App() {
   }, [visibleElements, currentViewId]);
 
   // Archi draw order: containers behind children, composites behind non-composites.
-  // Sort by: 1) nesting depth (zIndex), 2) composites before non-composites, 3) area descending (larger behind smaller)
+  // Sort by: 1) nesting depth (zIndex), 2) composites → regular → viewRefs, 3) area descending
   const sortedElements = useMemo(() => {
-    const isComp = (el: ModelElement) => {
+    const sortKey = (el: ModelElement): number => {
+      if (el.type === 'viewReference') return 2; // on top of siblings
       const layer = ELEMENT_TYPES[el.type]?.layer;
-      return layer === 'composite' && el.type !== 'note';
+      if (layer === 'composite' && el.type !== 'note') return 0; // behind everything
+      return 1; // regular elements
     };
     return [...visibleElements].sort((a, b) => {
       // Primary: lower zIndex draws first (parents behind children)
       const za = a.zIndex ?? 0, zb = b.zIndex ?? 0;
       if (za !== zb) return za - zb;
-      // Secondary: composites draw before non-composites at same depth
-      const ca = isComp(a) ? 0 : 1, cb = isComp(b) ? 0 : 1;
-      if (ca !== cb) return ca - cb;
+      // Secondary: composites first, then regular, then view references (on top)
+      const ka = sortKey(a), kb = sortKey(b);
+      if (ka !== kb) return ka - kb;
       // Tertiary: larger elements draw first (behind smaller ones)
       return (b.w * b.h) - (a.w * a.h);
     });
@@ -1255,6 +1259,38 @@ export default function App() {
     setSelectedId(el.id); setSelType('element');
   }, [s2w, cSize, currentViewId, pushHistory]);
 
+  const addView = useCallback((name?: string, parentViewId?: string) => {
+    pushHistory();
+    const newView: ModelView = {
+      id: uid(),
+      name: name || 'New View',
+      elementIds: [],
+      childViewIds: [],
+    };
+    setViews(prev => {
+      const updated = [...prev, newView];
+      if (parentViewId) {
+        return updated.map(v =>
+          v.id === parentViewId
+            ? { ...v, childViewIds: [...(v.childViewIds || []), newView.id] }
+            : v,
+        );
+      }
+      return updated;
+    });
+    // Navigate to the new view
+    saveViewLayoutSnapshot(currentViewId);
+    setCurrentViewId(newView.id);
+    setOpenTabIds(prev => [...prev, newView.id]);
+    setSelectedId(null); setSelType(null);
+  }, [pushHistory, currentViewId, saveViewLayoutSnapshot]);
+
+  const renameView = useCallback((viewId: string, newName: string) => {
+    if (!newName.trim()) return;
+    pushHistory();
+    setViews(prev => prev.map(v => v.id === viewId ? { ...v, name: newName.trim() } : v));
+  }, [pushHistory]);
+
   const deleteSelected = useCallback(() => {
     if (!selectedId) return;
     pushHistory();
@@ -1823,7 +1859,8 @@ export default function App() {
             return (
               <div
                 key={tid}
-                onClick={() => navigateToView(tid)}
+                onClick={() => { if (editingTabId !== tid) navigateToView(tid); }}
+                onDoubleClick={() => { setEditingTabId(tid); setEditingTabName(v?.name || ''); }}
                 style={{
                   display: 'flex', alignItems: 'center', gap: 5, padding: '0 10px', fontSize: 12, fontFamily: 'inherit',
                   cursor: 'pointer', userSelect: 'none', whiteSpace: 'nowrap',
@@ -1838,7 +1875,28 @@ export default function App() {
                 onMouseEnter={e => { if (!isActive) e.currentTarget.style.background = 'var(--surface-hover, rgba(0,0,0,0.035))'; }}
                 onMouseLeave={e => { if (!isActive) e.currentTarget.style.background = 'transparent'; }}
               >
-                <span>{v?.name || tid}</span>
+                {editingTabId === tid ? (
+                  <input
+                    autoFocus
+                    value={editingTabName}
+                    onChange={e => setEditingTabName(e.target.value)}
+                    onBlur={() => { renameView(tid, editingTabName); setEditingTabId(null); }}
+                    onKeyDown={e => {
+                      if (e.key === 'Enter') { renameView(tid, editingTabName); setEditingTabId(null); }
+                      if (e.key === 'Escape') setEditingTabId(null);
+                    }}
+                    onClick={e => e.stopPropagation()}
+                    style={{
+                      fontSize: 12, fontFamily: 'inherit', fontWeight: 500,
+                      border: 'none', outline: 'none', background: 'transparent',
+                      color: 'var(--accent-text, #374151)',
+                      width: Math.max(40, editingTabName.length * 7 + 10),
+                      padding: 0,
+                    }}
+                  />
+                ) : (
+                  <span>{v?.name || tid}</span>
+                )}
                 {openTabIds.length > 1 && (
                   <span
                     onClick={e => { e.stopPropagation(); closeTab(tid); }}
@@ -1856,6 +1914,23 @@ export default function App() {
               </div>
             );
           })}
+          {/* New view tab button */}
+          <div
+            onClick={() => addView()}
+            title="New View"
+            style={{
+              display: 'flex', alignItems: 'center', justifyContent: 'center',
+              padding: '0 8px', cursor: 'pointer', userSelect: 'none',
+              color: 'var(--text-faint, #b0b0b8)', borderRadius: 6, flexShrink: 0,
+              transition: 'background 0.12s ease, color 0.12s ease',
+            }}
+            onMouseEnter={e => { e.currentTarget.style.background = 'var(--surface-hover, rgba(0,0,0,0.035))'; e.currentTarget.style.color = 'var(--text-secondary, #555)'; }}
+            onMouseLeave={e => { e.currentTarget.style.background = 'transparent'; e.currentTarget.style.color = 'var(--text-faint, #b0b0b8)'; }}
+          >
+            <svg width="12" height="12" viewBox="0 0 12 12" fill="none">
+              <path d="M6 2v8M2 6h8" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" />
+            </svg>
+          </div>
         </div>
 
         {/* ====== Left panel island (views + properties) ====== */}
@@ -1891,7 +1966,7 @@ export default function App() {
               window.addEventListener('mouseup', onUp);
             }}
           />
-          <ViewNav views={views} currentViewId={currentViewId} onNavigate={navigateToView} />
+          <ViewNav views={views} currentViewId={currentViewId} onNavigate={navigateToView} onAddView={(parentId) => addView(undefined, parentId)} />
           {/* Property panel on left side */}
           {propSide === 'left' && (
             <PropertyPanel
@@ -1902,6 +1977,8 @@ export default function App() {
               onUpdateRelationship={updRel}
               side="left"
               onToggleSide={() => setPropSide('right')}
+              currentView={views.find(v => v.id === currentViewId) ?? null}
+              onRenameView={renameView}
             />
           )}
         </div>
@@ -1918,6 +1995,34 @@ export default function App() {
             onContextMenu={handleContextMenu}
             onMouseLeave={() => { setDragging(null); setPanning(null); setDragWP(null); setDragEndpoint(null); setDragLabel(null); setDragSegment(null); setResizing(null); setHovElId(null); setHovRelId(null); setSnapGuides([]); }}
             onWheel={handleWheel}
+            onDragOver={e => { if (e.dataTransfer.types.includes('application/openarchi-view')) { e.preventDefault(); e.dataTransfer.dropEffect = 'copy'; } }}
+            onDrop={e => {
+              const data = e.dataTransfer.getData('application/openarchi-view');
+              if (!data) return;
+              e.preventDefault();
+              try {
+                const { viewId, viewName } = JSON.parse(data);
+                const rect = canvasRef.current?.getBoundingClientRect();
+                if (!rect) return;
+                const { x: wx, y: wy } = s2w(e.clientX - rect.left, e.clientY - rect.top);
+                pushHistory();
+                const el: ModelElement = {
+                  id: uid(), type: 'viewReference',
+                  name: viewName || 'View',
+                  x: snap(wx - 80, GRID), y: snap(wy - 36, GRID),
+                  w: 160, h: 72,
+                  documentation: '',
+                  linkedViewId: viewId,
+                };
+                setElements(prev => [...prev, el]);
+                setViews(prev => prev.map(v =>
+                  v.id === currentViewId
+                    ? { ...v, elementIds: [...new Set([...(v.elementIds || []), el.id])] }
+                    : v,
+                ));
+                setSelectedId(el.id); setSelType('element');
+              } catch { /* invalid drag data */ }
+            }}
           />
 
           {/* Inline element name editor */}
@@ -2244,6 +2349,8 @@ export default function App() {
               onUpdateRelationship={updRel}
               side="right"
               onToggleSide={() => setPropSide('left')}
+              currentView={views.find(v => v.id === currentViewId) ?? null}
+              onRenameView={renameView}
             />
           </div>
         )}

@@ -4,10 +4,10 @@ import { GRID, FONT, getAnchors, getRelPoints, pointOnPath, getResizeHandles, ty
 
 const VIEW_REFERENCE_STYLE: LayerDef = {
   label: 'View',
-  fill: '#E4E6EA',
-  stroke: '#8A9098',
-  accent: '#687078',
-  text: '#3A4048',
+  fill: '#EAF0FF',
+  stroke: '#93a3c0',
+  accent: '#5874a0',
+  text: '#2a3a58',
 };
 
 // ============================================================
@@ -199,7 +199,7 @@ export function drawElement(ctx: CanvasRenderingContext2D, el: ModelElement, isS
     ctx.strokeStyle = L.stroke; ctx.lineWidth = 0.6; ctx.stroke();
 
     ctx.fillStyle = el.style?.fontColor || L.text;
-    ctx.font = `400 11px ${FONT}`;
+    ctx.font = `400 10px ${FONT}`;
     ctx.textAlign = 'left'; ctx.textBaseline = 'top';
     const pad = 8, mw = w - pad * 2;
     const words = (el.name || 'Note').split(' ');
@@ -210,7 +210,7 @@ export function drawElement(ctx: CanvasRenderingContext2D, el: ModelElement, isS
       if (ctx.measureText(t).width > mw && cur) { lines.push(cur); cur = word; } else cur = t;
     }
     if (cur) lines.push(cur);
-    lines.forEach((ln, i) => ctx.fillText(ln, x + pad, y + pad + i * 19));
+    lines.forEach((ln, i) => ctx.fillText(ln, x + pad, y + pad + i * 16));
   } else if (isJunction) {
     // Junction: small filled circle (AND=black, OR=white with border)
     ctx.shadowColor = 'transparent';
@@ -234,8 +234,8 @@ export function drawElement(ctx: CanvasRenderingContext2D, el: ModelElement, isS
     ctx.strokeStyle = isSel ? '#4a5568' : (el.style?.lineColor || '#b0b0b8');
     ctx.stroke(); ctx.setLineDash([]);
 
-    ctx.font = `400 11px ${FONT}`;
-    ctx.fillStyle = '#606060'; ctx.textAlign = 'left'; ctx.textBaseline = 'top';
+    ctx.font = `400 10px ${FONT}`;
+    ctx.fillStyle = '#3a3a42'; ctx.textAlign = 'left'; ctx.textBaseline = 'top';
     ctx.fillText(el.name || 'Group', x + 8, y + 8);
 
     // Icon (top-right corner)
@@ -246,41 +246,24 @@ export function drawElement(ctx: CanvasRenderingContext2D, el: ModelElement, isS
       drawIcon(ctx, cIconKey, x + w - 14, y + 13, 16, '#606068');
       ctx.restore();
     }
-  } else {
-    ctx.fillStyle = el.style?.fillColor || L.fill; ctx.fill();
+  } else if (isViewReference) {
+    // ── Embedded view icon ──
+    // Glass-like background with dashed accent border
+    ctx.fillStyle = el.style?.fillColor || 'rgba(240, 244, 255, 0.92)'; ctx.fill();
     ctx.shadowColor = 'transparent';
-    ctx.lineWidth = isSel ? 2.2 : 1.2;
-    ctx.strokeStyle = isSel ? '#4a5568' : (el.style?.lineColor || L.stroke);
-    ctx.stroke();
+    ctx.setLineDash([4, 3]); ctx.lineWidth = isSel ? 2.2 : 1.4;
+    ctx.strokeStyle = isSel ? '#2563eb' : (el.style?.lineColor || '#93a3c0');
+    ctx.stroke(); ctx.setLineDash([]);
 
-    if (isViewReference) {
-      // View reference: draw a small "navigate" arrow icon (top-right)
-      ctx.save();
-      const ix = x + w - 16, iy = y + 15, s = 8;
-      ctx.beginPath();
-      // Folder tab shape
-      ctx.moveTo(ix - s, iy - s * 0.5);
-      ctx.lineTo(ix - s, iy - s);
-      ctx.lineTo(ix - s * 0.2, iy - s);
-      ctx.lineTo(ix + s * 0.1, iy - s * 0.5);
-      ctx.lineTo(ix + s, iy - s * 0.5);
-      ctx.lineTo(ix + s, iy + s);
-      ctx.lineTo(ix - s, iy + s);
-      ctx.closePath();
-      ctx.strokeStyle = L.accent; ctx.lineWidth = 1.4;
-      ctx.lineJoin = 'round'; ctx.lineCap = 'round';
-      ctx.stroke();
-      ctx.restore();
-    } else {
-      const iconKey = ICON_MAP[el.type] || 'generic';
-      drawIcon(ctx, iconKey, x + w - 14, y + 13, 16, L.stroke);
-    }
+    // Icon — standard drawIcon (top-right, 16px, consistent with all other elements)
+    const iconKey = ICON_MAP[el.type] || 'view';
+    drawIcon(ctx, iconKey, x + w - 14, y + 13, 16, isSel ? '#2563eb' : '#7088a8');
 
-    // Label — move to top-left when children overlap this element
-    ctx.fillStyle = el.style?.fontColor || L.text;
-    ctx.font = `400 11px ${FONT}`;
+    // View name label — centered, word-wrapped
+    ctx.fillStyle = el.style?.fontColor || '#2a3a58';
+    ctx.font = `400 10px ${FONT}`;
     const mw = w - 24;
-    const displayName = isViewReference ? `View: ${el.name || 'Untitled'}` : (el.name || '');
+    const displayName = el.name || 'View';
     const words = displayName.split(' ');
     const lines: string[] = [];
     let cur = '';
@@ -289,7 +272,44 @@ export function drawElement(ctx: CanvasRenderingContext2D, el: ModelElement, isS
       if (ctx.measureText(t).width > mw && cur) { lines.push(cur); cur = word; } else cur = t;
     }
     if (cur) lines.push(cur);
-    const lh = 14;
+    const lh = 13;
+    const maxLines = Math.max(1, Math.floor((h - 8) / lh));
+    const renderLines = lines.slice(0, maxLines);
+    if (lines.length > maxLines) {
+      let lastLine = renderLines[maxLines - 1] || '';
+      while (lastLine.length > 0 && ctx.measureText(lastLine + '…').width > mw) {
+        lastLine = lastLine.slice(0, -1);
+      }
+      renderLines[maxLines - 1] = lastLine + '…';
+    }
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    const totalH = renderLines.length * lh;
+    const textTop = y + (h - totalH) / 2 + lh / 2;
+    renderLines.forEach((ln, i) => ctx.fillText(ln, x + w / 2, textTop + i * lh));
+  } else {
+    ctx.fillStyle = el.style?.fillColor || L.fill; ctx.fill();
+    ctx.shadowColor = 'transparent';
+    ctx.lineWidth = isSel ? 2.2 : 1.2;
+    ctx.strokeStyle = isSel ? '#4a5568' : (el.style?.lineColor || L.stroke);
+    ctx.stroke();
+
+    const iconKey = ICON_MAP[el.type] || 'generic';
+    drawIcon(ctx, iconKey, x + w - 14, y + 13, 16, L.stroke);
+
+    // Label — move to top-left when children overlap this element
+    ctx.fillStyle = el.style?.fontColor || L.text;
+    ctx.font = `400 10px ${FONT}`;
+    const mw = w - 24;
+    const displayName = el.name || '';
+    const words = displayName.split(' ');
+    const lines: string[] = [];
+    let cur = '';
+    for (const word of words) {
+      const t = cur ? cur + ' ' + word : word;
+      if (ctx.measureText(t).width > mw && cur) { lines.push(cur); cur = word; } else cur = t;
+    }
+    if (cur) lines.push(cur);
+    const lh = 13;
     const availableHeight = Math.max(lh, h - (hasChildren ? 18 : 8));
     const maxLines = Math.max(1, Math.floor(availableHeight / lh));
     const renderLines = lines.slice(0, maxLines);
@@ -315,19 +335,20 @@ export function drawElement(ctx: CanvasRenderingContext2D, el: ModelElement, isS
     }
   }
 
-  // Pop-out icon (larger, more visible)
+  // Pop-out icon (larger, more visible) — colored to match element layer
   if (el.linkedViewId && !isJunction) {
     const px = x + w - 16, py = y + h - 16;
+    const popL = getLayerStyle(el.type);
     ctx.save();
     rrect(ctx, px - 8, py - 8, 16, 16, 3);
-    ctx.fillStyle = '#e8ecf0'; ctx.fill();
-    ctx.strokeStyle = '#9aa5b4'; ctx.lineWidth = 1; ctx.stroke();
+    ctx.fillStyle = popL.fill; ctx.fill();
+    ctx.strokeStyle = popL.stroke; ctx.lineWidth = 1; ctx.stroke();
     ctx.beginPath();
     ctx.moveTo(px - 3, py + 4); ctx.lineTo(px + 4, py - 3);
-    ctx.strokeStyle = '#556'; ctx.lineWidth = 1.6; ctx.stroke();
+    ctx.strokeStyle = popL.accent; ctx.lineWidth = 1.6; ctx.stroke();
     ctx.beginPath();
     ctx.moveTo(px + 0, py - 3); ctx.lineTo(px + 4, py - 3); ctx.lineTo(px + 4, py + 1);
-    ctx.strokeStyle = '#556'; ctx.lineWidth = 1.6; ctx.stroke();
+    ctx.strokeStyle = popL.accent; ctx.lineWidth = 1.6; ctx.stroke();
     ctx.restore();
   }
 
@@ -525,16 +546,16 @@ export function drawRelationship(ctx: CanvasRenderingContext2D, rel: ModelRelati
   const angle = Math.atan2(end.y - last.y, end.x - last.x);
 
   if (rd.head === 'filled_arrow') {
-    // Solid filled triangle — triggering, flow (Archi: PolygonDecoration default scale)
-    const aL = 10, aW = 7;
+    // Solid filled triangle — triggering, flow
+    const aL = 9, aW = 9;
     const spread = Math.atan2(aW / 2, aL);
     ctx.beginPath(); ctx.moveTo(end.x, end.y);
     ctx.lineTo(end.x - aL * Math.cos(angle - spread), end.y - aL * Math.sin(angle - spread));
     ctx.lineTo(end.x - aL * Math.cos(angle + spread), end.y - aL * Math.sin(angle + spread));
     ctx.closePath(); ctx.fillStyle = col; ctx.fill();
   } else if (rd.head === 'open_arrow') {
-    // Open chevron — serving, access, influence (Archi: PolylineDecoration — not filled)
-    const aL = 10, aW = 7;
+    // Open chevron — serving, access, influence
+    const aL = 9, aW = 9;
     const spread = Math.atan2(aW / 2, aL);
     ctx.beginPath();
     ctx.moveTo(end.x - aL * Math.cos(angle - spread), end.y - aL * Math.sin(angle - spread));
@@ -542,8 +563,8 @@ export function drawRelationship(ctx: CanvasRenderingContext2D, rel: ModelRelati
     ctx.lineTo(end.x - aL * Math.cos(angle + spread), end.y - aL * Math.sin(angle + spread));
     ctx.strokeStyle = col; ctx.lineWidth = isSel ? 1.8 : 1.2; ctx.stroke();
   } else if (rd.head === 'hollow_arrow') {
-    // Hollow triangle — realization, specialization (Archi: scale 10,7)
-    const aL = 10, aW = 7;
+    // Hollow triangle — realization, specialization
+    const aL = 9, aW = 9;
     const spread = Math.atan2(aW / 2, aL);
     ctx.beginPath(); ctx.moveTo(end.x, end.y);
     ctx.lineTo(end.x - aL * Math.cos(angle - spread), end.y - aL * Math.sin(angle - spread));
@@ -621,7 +642,7 @@ export function drawRelationship(ctx: CanvasRenderingContext2D, rel: ModelRelati
     rrect(ctx, labelX - measured / 2 - padX, labelY - 5 - padY, measured + padX * 2, 10 + padY * 2, 2);
     ctx.fillStyle = 'rgba(255,255,255,0.88)'; ctx.fill();
     if (isSel) { ctx.strokeStyle = 'rgba(74,85,104,0.25)'; ctx.lineWidth = 0.8; ctx.stroke(); }
-    ctx.fillStyle = isSel ? '#4a5568' : '#999';
+    ctx.fillStyle = isSel ? '#3a4558' : '#4a5060';
     ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
     ctx.fillText(rel.name, labelX, labelY);
   }

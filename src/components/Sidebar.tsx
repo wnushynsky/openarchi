@@ -27,6 +27,7 @@ interface ViewNavProps {
   views: ModelView[];
   currentViewId: string;
   onNavigate: (id: string) => void;
+  onAddView?: (parentViewId?: string) => void;
 }
 
 function buildParentMap(views: ModelView[]): Map<string, string> {
@@ -105,6 +106,11 @@ function TreeNode({ view, depth, currentViewId, onNavigate, expanded, onToggle, 
   return (
     <>
       <div
+        draggable
+        onDragStart={e => {
+          e.dataTransfer.setData('application/openarchi-view', JSON.stringify({ viewId: view.id, viewName: view.name }));
+          e.dataTransfer.effectAllowed = 'copy';
+        }}
         style={{
           display: 'flex', alignItems: 'center', gap: 1,
           padding: `2px 8px 2px ${8 + depth * 14}px`,
@@ -165,7 +171,7 @@ function TreeNode({ view, depth, currentViewId, onNavigate, expanded, onToggle, 
   );
 }
 
-export function ViewNav({ views, currentViewId, onNavigate }: ViewNavProps) {
+export function ViewNav({ views, currentViewId, onNavigate, onAddView }: ViewNavProps) {
   const [searchQuery, setSearchQuery] = useState('');
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const searchRef = useRef<HTMLInputElement>(null);
@@ -242,7 +248,28 @@ export function ViewNav({ views, currentViewId, onNavigate }: ViewNavProps) {
       {/* Header */}
       <div style={{ padding: '10px 12px 6px', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
         <span style={{ fontSize: 10, fontWeight: 500, color: 'var(--text-faint, #b0b0b8)', textTransform: 'uppercase', letterSpacing: '0.5px' }}>Views</span>
-        <span style={{ fontSize: 10, color: 'var(--text-faint, #b0b0b8)', fontWeight: 400, opacity: 0.7 }}>{views.length}</span>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+          <span style={{ fontSize: 10, color: 'var(--text-faint, #b0b0b8)', fontWeight: 400, opacity: 0.7 }}>{views.length}</span>
+          {onAddView && (
+            <button
+              onClick={() => onAddView()}
+              title="New View"
+              style={{
+                width: 18, height: 18, padding: 0, border: 'none', borderRadius: 4,
+                background: 'transparent', cursor: 'pointer', display: 'flex',
+                alignItems: 'center', justifyContent: 'center',
+                color: 'var(--text-faint, #b0b0b8)',
+                transition: 'background 0.12s ease, color 0.12s ease',
+              }}
+              onMouseEnter={e => { e.currentTarget.style.background = 'var(--surface-hover, rgba(0,0,0,0.05))'; e.currentTarget.style.color = 'var(--text-secondary, #555)'; }}
+              onMouseLeave={e => { e.currentTarget.style.background = 'transparent'; e.currentTarget.style.color = 'var(--text-faint, #b0b0b8)'; }}
+            >
+              <svg width="12" height="12" viewBox="0 0 12 12" fill="none">
+                <path d="M6 2v8M2 6h8" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" />
+              </svg>
+            </button>
+          )}
+        </div>
       </div>
 
       {/* Search */}
@@ -345,9 +372,11 @@ interface PropertyPanelProps {
   onUpdateRelationship: (key: string, value: unknown) => void;
   side: 'left' | 'right';
   onToggleSide: () => void;
+  currentView?: ModelView | null;
+  onRenameView?: (viewId: string, name: string) => void;
 }
 
-export function PropertyPanel({ selEl, selRel, elements, onUpdateElement, onUpdateRelationship, side, onToggleSide }: PropertyPanelProps) {
+export function PropertyPanel({ selEl, selRel, elements, onUpdateElement, onUpdateRelationship, side, onToggleSide, currentView, onRenameView }: PropertyPanelProps) {
   const isRight = side === 'right';
   return (
     <div style={{
@@ -424,6 +453,20 @@ export function PropertyPanel({ selEl, selRel, elements, onUpdateElement, onUpda
           <PF label="Target"><span style={{ fontSize: 12, color: 'var(--text-secondary, #555)', fontWeight: 400 }}>{elements.find(e => e.id === selRel.targetId)?.name || '\u2014'}</span></PF>
           <PF label="Waypoints"><span style={{ fontSize: 11, color: 'var(--text-faint, #b0b0b8)', fontWeight: 400 }}>{selRel.waypoints?.length || 0} points</span></PF>
           <PF label="Label position"><input type="range" min="0" max="100" value={Math.round((selRel.labelPos ?? 0.5) * 100)} onChange={e => onUpdateRelationship('labelPos', +e.target.value / 100)} style={{ width: '100%', accentColor: 'var(--accent, #2563eb)' }} /></PF>
+        </div>
+      ) : currentView && onRenameView ? (
+        <div style={{ padding: '4px 12px 10px', display: 'flex', flexDirection: 'column', gap: 10, overflow: 'auto' }}>
+          <PF label="View Name">
+            <input value={currentView.name} onChange={e => onRenameView(currentView.id, e.target.value)} style={iS} />
+          </PF>
+          <PF label="Elements">
+            <span style={{ fontSize: 12, color: 'var(--text-secondary, #555)', fontWeight: 400 }}>{currentView.elementIds?.length ?? 0}</span>
+          </PF>
+          {(currentView.childViewIds?.length ?? 0) > 0 && (
+            <PF label="Child Views">
+              <span style={{ fontSize: 12, color: 'var(--text-secondary, #555)', fontWeight: 400 }}>{currentView.childViewIds.length}</span>
+            </PF>
+          )}
         </div>
       ) : (
         <div style={{ padding: '12px', color: 'var(--text-faint, #b0b0b8)', fontSize: 12, lineHeight: 1.8, fontWeight: 400 }}>Select an element or relationship.</div>

@@ -227,6 +227,8 @@ export const ICON_PATHS: Record<string, string[]> = {
   material: ['M12 3l10 18H2z'],
   // Junction: filled circle
   junction: ['M12 6a6 6 0 100 12 6 6 0 000-12z'],
+  // View reference: layered/stacked diagrams with arrow
+  view: ['M3 3h14v14H3z', 'M7 7h14v14H7z', 'M10 14l2-2 2 2', 'M12 12v5'],
   // Generic: simple rectangle
   generic: ['M4 4h16v16H4z'],
 };
@@ -298,4 +300,5 @@ export const ICON_MAP: Record<string, string> = {
   // Composite/special
   andJunction: 'junction', orJunction: 'junction',
   note: 'note', grouping: 'grouping', location: 'location',
+  viewReference: 'view',
 };

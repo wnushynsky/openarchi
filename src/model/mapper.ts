@@ -5,6 +5,8 @@ import type {
   OpenArchiModel,
   ElementStyle,
   RelativeBendpoint,
+  DiagramNodeRecord,
+  DiagramConnectionRecord,
 } from '../types';
 import type {
   CanonicalElement,
@@ -37,6 +39,30 @@ export type RelationshipLayoutsByView = Record<string, Record<string, Relationsh
 
 const DEFAULT_ELEMENT_WIDTH = 120;
 const DEFAULT_ELEMENT_HEIGHT = 55;
+
+function buildSemanticRelationships(
+  document: CanonicalModelDocument,
+  fallbackConnections?: Map<string, CanonicalViewConnection>,
+): ModelRelationship[] {
+  const hasExplicitDiagramConnections = document.viewConnections.length > 0;
+
+  return document.relationships.map(relationship => {
+    const fallbackConnection = hasExplicitDiagramConnections
+      ? undefined
+      : fallbackConnections?.get(relationship.id);
+
+    return {
+      id: relationship.id,
+      type: relationship.type,
+      sourceId: relationship.sourceId,
+      targetId: relationship.targetId,
+      name: relationship.name,
+      waypoints: fallbackConnection?.waypoints || [],
+      labelPos: fallbackConnection?.labelPosition ?? 0.5,
+      relativeBendpoints: fallbackConnection?.relativeBendpoints,
+    };
+  });
+}
 
 function ensureViews(model: OpenArchiModel): ModelView[] {
   if (model.views.length > 0) return model.views;
@@ -76,39 +102,74 @@ export function editorToCanonicalModel(model: OpenArchiModel): CanonicalModelDoc
 
   const elementById = new Map(model.elements.map(element => [element.id, element]));
 
-  const viewNodes: CanonicalViewNode[] = [];
-  for (const view of views) {
-    const memberIds = new Set(view.elementIds || []);
-    for (const elementId of memberIds) {
-      const element = elementById.get(elementId);
-      if (!element) continue;
-      viewNodes.push({
-        id: `${view.id}::${element.id}`,
-        viewId: view.id,
-        elementId: element.id,
-        x: element.x,
-        y: element.y,
-        width: element.w,
-        height: element.h,
-        linkedViewId: element.linkedViewId,
-      });
-    }
-  }
+  const viewNodes: CanonicalViewNode[] = Array.isArray(model.diagramNodes) && model.diagramNodes.length > 0
+    ? model.diagramNodes.map(node => ({
+      id: node.id,
+      viewId: node.viewId,
+      elementId: node.elementId,
+      x: node.x,
+      y: node.y,
+      width: node.w,
+      height: node.h,
+      linkedViewId: node.linkedViewId,
+      style: node.style ? {
+        fillColor: node.style.fillColor,
+        lineColor: node.style.lineColor,
+        fontColor: node.style.fontColor,
+      } : undefined,
+      parentNodeId: node.parentNodeId,
+      nestingDepth: node.nestingDepth ?? node.zIndex,
+    }))
+    : (() => {
+      const synthesizedNodes: CanonicalViewNode[] = [];
+      for (const view of views) {
+        const memberIds = new Set(view.elementIds || []);
+        for (const elementId of memberIds) {
+          const element = elementById.get(elementId);
+          if (!element) continue;
+          synthesizedNodes.push({
+            id: `${view.id}::${element.id}`,
+            viewId: view.id,
+            elementId: element.id,
+            x: element.x,
+            y: element.y,
+            width: element.w,
+            height: element.h,
+            linkedViewId: element.linkedViewId,
+          });
+        }
+      }
+      return synthesizedNodes;
+    })();
 
-  const viewConnections: CanonicalViewConnection[] = [];
-  for (const view of views) {
-    const memberIds = new Set(view.elementIds || []);
-    for (const relationship of model.relationships) {
-      if (!memberIds.has(relationship.sourceId) || !memberIds.has(relationship.targetId)) continue;
-      viewConnections.push({
-        id: `${view.id}::${relationship.id}`,
-        viewId: view.id,
-        relationshipId: relationship.id,
-        waypoints: relationship.waypoints || [],
-        labelPosition: relationship.labelPos ?? 0.5,
-      });
-    }
-  }
+  const viewConnections: CanonicalViewConnection[] = Array.isArray(model.diagramConnections) && model.diagramConnections.length > 0
+    ? model.diagramConnections.map(connection => ({
+      id: connection.id,
+      viewId: connection.viewId,
+      relationshipId: connection.relationshipId,
+      sourceNodeId: connection.sourceNodeId,
+      targetNodeId: connection.targetNodeId,
+      waypoints: connection.waypoints || [],
+      labelPosition: connection.labelPos ?? 0.5,
+      relativeBendpoints: connection.relativeBendpoints,
+    }))
+    : (() => {
+      const synthesizedConnections: CanonicalViewConnection[] = [];
+      for (const view of views) {
+        const memberIds = new Set(view.elementIds || []);
+        for (const relationship of model.relationships) {
+          if (!memberIds.has(relationship.sourceId) || !memberIds.has(relationship.targetId)) continue;
+          synthesizedConnections.push({
+            id: `${view.id}::${relationship.id}`,
+            viewId: view.id,
+            relationshipId: relationship.id,
+            waypoints: relationship.waypoints || [],
+            labelPosition: relationship.labelPos ?? 0.5,
+          });
+        }
+      }
+      return synthesizedConnections;
+    })();
 
   return {
     version: model.version,
@@ -159,19 +220,7 @@ export function canonicalToEditorModel(document: CanonicalModelDocument): OpenAr
     }
   }
 
-  const relationships: ModelRelationship[] = document.relationships.map(relationship => {
-    const connection = firstConnectionByRelationship.get(relationship.id);
-    return {
-      id: relationship.id,
-      type: relationship.type,
-      sourceId: relationship.sourceId,
-      targetId: relationship.targetId,
-      name: relationship.name,
-      waypoints: connection?.waypoints || [],
-      labelPos: connection?.labelPosition ?? 0.5,
-      relativeBendpoints: connection?.relativeBendpoints,
-    };
-  });
+  const relationships = buildSemanticRelationships(document, firstConnectionByRelationship);
 
   const nodeIdsByView = new Map<string, Set<string>>();
   for (const node of document.viewNodes) {
@@ -204,6 +253,34 @@ export function canonicalToEditorModel(document: CanonicalModelDocument): OpenAr
     elements,
     relationships,
     views,
+    diagramNodes: document.viewNodes.map<DiagramNodeRecord>(node => ({
+      id: node.id,
+      viewId: node.viewId,
+      elementId: node.elementId,
+      x: node.x,
+      y: node.y,
+      w: node.width,
+      h: node.height,
+      linkedViewId: node.linkedViewId,
+      zIndex: node.nestingDepth,
+      style: node.style ? {
+        fillColor: node.style.fillColor,
+        lineColor: node.style.lineColor,
+        fontColor: node.style.fontColor,
+      } : undefined,
+      parentNodeId: node.parentNodeId,
+      nestingDepth: node.nestingDepth,
+    })),
+    diagramConnections: document.viewConnections.map<DiagramConnectionRecord>(connection => ({
+      id: connection.id,
+      viewId: connection.viewId,
+      relationshipId: connection.relationshipId,
+      sourceNodeId: connection.sourceNodeId,
+      targetNodeId: connection.targetNodeId,
+      waypoints: connection.waypoints || [],
+      labelPos: connection.labelPosition ?? 0.5,
+      relativeBendpoints: connection.relativeBendpoints,
+    })),
   };
 }
 
@@ -305,19 +382,7 @@ export function canonicalToEditorModelWithLayouts(document: CanonicalModelDocume
     };
   }
 
-  const relationships: ModelRelationship[] = document.relationships.map(relationship => {
-    const connection = firstConnectionByRelationship.get(relationship.id);
-    return {
-      id: relationship.id,
-      type: relationship.type,
-      sourceId: relationship.sourceId,
-      targetId: relationship.targetId,
-      name: relationship.name,
-      waypoints: connection?.waypoints || [],
-      labelPos: connection?.labelPosition ?? 0.5,
-      relativeBendpoints: connection?.relativeBendpoints,
-    };
-  });
+  const relationships = buildSemanticRelationships(document, firstConnectionByRelationship);
 
   // --- Views ---
   const mappedViews: ModelView[] = document.views.map(view => ({
@@ -342,6 +407,34 @@ export function canonicalToEditorModelWithLayouts(document: CanonicalModelDocume
       elements,
       relationships,
       views,
+      diagramNodes: document.viewNodes.map<DiagramNodeRecord>(node => ({
+        id: node.id,
+        viewId: node.viewId,
+        elementId: node.elementId,
+        x: node.x,
+        y: node.y,
+        w: node.width,
+        h: node.height,
+        linkedViewId: node.linkedViewId,
+        zIndex: node.nestingDepth,
+        style: node.style ? {
+          fillColor: node.style.fillColor,
+          lineColor: node.style.lineColor,
+          fontColor: node.style.fontColor,
+        } : undefined,
+        parentNodeId: node.parentNodeId,
+        nestingDepth: node.nestingDepth,
+      })),
+      diagramConnections: document.viewConnections.map<DiagramConnectionRecord>(connection => ({
+        id: connection.id,
+        viewId: connection.viewId,
+        relationshipId: connection.relationshipId,
+        sourceNodeId: connection.sourceNodeId,
+        targetNodeId: connection.targetNodeId,
+        waypoints: connection.waypoints || [],
+        labelPos: connection.labelPosition ?? 0.5,
+        relativeBendpoints: connection.relativeBendpoints,
+      })),
     },
     elementLayouts,
     relationshipLayouts,

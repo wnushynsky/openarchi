@@ -92,11 +92,39 @@ export interface ModelView {
   childViewIds: string[];
 }
 
+export interface DiagramNodeRecord {
+  id: string;
+  viewId: string;
+  elementId: string;
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  linkedViewId?: string;
+  zIndex?: number;
+  style?: ElementStyle;
+  parentNodeId?: string;
+  nestingDepth?: number;
+}
+
+export interface DiagramConnectionRecord {
+  id: string;
+  viewId: string;
+  relationshipId: string;
+  sourceNodeId?: string;
+  targetNodeId?: string;
+  waypoints: Waypoint[];
+  labelPos: number;
+  relativeBendpoints?: RelativeBendpoint[];
+}
+
 export interface OpenArchiModel {
   version: string;
   elements: ModelElement[];
   relationships: ModelRelationship[];
   views: ModelView[];
+  diagramNodes?: DiagramNodeRecord[];
+  diagramConnections?: DiagramConnectionRecord[];
 }
 
 // ============================================================
@@ -124,6 +152,7 @@ export interface PanState {
 
 export interface DrawingRelState {
   sourceId: string;
+  sourceNodeId?: string;
   mx: number;
   my: number;
   waypoints: Point[];
@@ -158,6 +187,8 @@ export interface RelPickerState {
   sy: number;
   srcId: string;
   tgtId: string;
+  sourceNodeId?: string;
+  targetNodeId?: string;
 }
 
 export interface CtxMenuItem {

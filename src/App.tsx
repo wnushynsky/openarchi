@@ -3,6 +3,7 @@ import type {
   ModelElement, ModelRelationship, ModelView,
   Camera, DragState, PanState, DrawingRelState, DragWPState, DragEndpointState, DragLabelState, DragSegmentState,
   RelPickerState, CtxMenuState, CtxMenuItem, GridType, SelectionType, ResizeState,
+  OpenArchiModel,
 } from './types';
 import type { CanonicalModelDocument } from './model/canonical';
 import {
@@ -53,6 +54,42 @@ interface RelationshipViewLayout {
 
 type ElementLayoutsByView = Record<string, Record<string, ElementViewLayout>>;
 type RelationshipLayoutsByView = Record<string, Record<string, RelationshipViewLayout>>;
+
+interface DiagramNodeState {
+  id: string;
+  viewId: string;
+  elementId: string;
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  linkedViewId?: string;
+  zIndex?: number;
+  style?: import('./types').ElementStyle;
+  parentNodeId?: string;
+  nestingDepth?: number;
+}
+
+interface DiagramConnectionState {
+  id: string;
+  viewId: string;
+  relationshipId: string;
+  sourceNodeId?: string;
+  targetNodeId?: string;
+  waypoints: { x: number; y: number }[];
+  labelPos: number;
+  relativeBendpoints?: import('./types').RelativeBendpoint[];
+}
+
+type DiagramNodesByView = Record<string, DiagramNodeState[]>;
+type DiagramConnectionsByView = Record<string, DiagramConnectionState[]>;
+
+type DiagramElementInstance = ModelElement & { elementId: string };
+type DiagramRelationshipInstance = ModelRelationship & {
+  relationshipId: string;
+  sourceNodeId: string;
+  targetNodeId: string;
+};
 
 function buildLayoutsFromEditorModel(
   elements: ModelElement[],
@@ -145,6 +182,123 @@ function buildLayoutsFromCanonicalDocument(
   return { elementLayouts, relationshipLayouts };
 }
 
+function buildDiagramStateFromEditorModel(
+  elements: ModelElement[],
+  relationships: ModelRelationship[],
+  views: ModelView[],
+): { diagramNodesByView: DiagramNodesByView; diagramConnectionsByView: DiagramConnectionsByView } {
+  const diagramNodesByView: DiagramNodesByView = {};
+  const diagramConnectionsByView: DiagramConnectionsByView = {};
+  const elementById = new Map(elements.map(element => [element.id, element]));
+
+  for (const view of views) {
+    const memberIds = new Set(view.elementIds || []);
+    const nodes: DiagramNodeState[] = [];
+    for (const elementId of memberIds) {
+      const element = elementById.get(elementId);
+      if (!element) continue;
+      nodes.push({
+          id: `${view.id}::${element.id}`,
+          viewId: view.id,
+          elementId: element.id,
+          x: element.x,
+          y: element.y,
+          w: element.w,
+          h: element.h,
+          linkedViewId: element.linkedViewId,
+          zIndex: element.zIndex,
+          style: element.style,
+      });
+    }
+    diagramNodesByView[view.id] = nodes;
+
+    diagramConnectionsByView[view.id] = relationships
+      .filter(relationship => memberIds.has(relationship.sourceId) && memberIds.has(relationship.targetId))
+      .map(relationship => ({
+        id: `${view.id}::${relationship.id}`,
+        viewId: view.id,
+        relationshipId: relationship.id,
+        sourceNodeId: `${view.id}::${relationship.sourceId}`,
+        targetNodeId: `${view.id}::${relationship.targetId}`,
+        waypoints: relationship.waypoints || [],
+        labelPos: relationship.labelPos ?? 0.5,
+        relativeBendpoints: relationship.relativeBendpoints,
+      }));
+  }
+
+  return { diagramNodesByView, diagramConnectionsByView };
+}
+
+function buildDiagramStateFromCanonicalDocument(
+  document: CanonicalModelDocument,
+): { diagramNodesByView: DiagramNodesByView; diagramConnectionsByView: DiagramConnectionsByView } {
+  const diagramNodesByView: DiagramNodesByView = {};
+  const diagramConnectionsByView: DiagramConnectionsByView = {};
+
+  for (const view of document.views) {
+    diagramNodesByView[view.id] = [];
+    diagramConnectionsByView[view.id] = [];
+  }
+
+  for (const node of document.viewNodes) {
+    if (!diagramNodesByView[node.viewId]) diagramNodesByView[node.viewId] = [];
+    diagramNodesByView[node.viewId].push({
+      id: node.id,
+      viewId: node.viewId,
+      elementId: node.elementId,
+      x: node.x,
+      y: node.y,
+      w: node.width,
+      h: node.height,
+      linkedViewId: node.linkedViewId,
+      zIndex: node.nestingDepth ?? 0,
+      style: node.style ? {
+        fillColor: node.style.fillColor,
+        lineColor: node.style.lineColor,
+        fontColor: node.style.fontColor,
+      } : undefined,
+      parentNodeId: node.parentNodeId,
+      nestingDepth: node.nestingDepth,
+    });
+  }
+
+  for (const connection of document.viewConnections) {
+    if (!diagramConnectionsByView[connection.viewId]) diagramConnectionsByView[connection.viewId] = [];
+    diagramConnectionsByView[connection.viewId].push({
+      id: connection.id,
+      viewId: connection.viewId,
+      relationshipId: connection.relationshipId,
+      sourceNodeId: connection.sourceNodeId,
+      targetNodeId: connection.targetNodeId,
+      waypoints: connection.waypoints || [],
+      labelPos: connection.labelPosition ?? 0.5,
+      relativeBendpoints: connection.relativeBendpoints,
+    });
+  }
+
+  return { diagramNodesByView, diagramConnectionsByView };
+}
+
+function cloneDiagramNodesByView(source: DiagramNodesByView): DiagramNodesByView {
+  const cloned: DiagramNodesByView = {};
+  for (const [viewId, nodes] of Object.entries(source)) {
+    cloned[viewId] = nodes.map(node => ({ ...node }));
+  }
+  return cloned;
+}
+
+function cloneDiagramConnectionsByView(source: DiagramConnectionsByView): DiagramConnectionsByView {
+  const cloned: DiagramConnectionsByView = {};
+  for (const [viewId, connections] of Object.entries(source)) {
+    cloned[viewId] = connections.map(connection => ({
+      ...connection,
+      waypoints: connection.waypoints.map(waypoint => ({ ...waypoint })),
+      relativeBendpoints: connection.relativeBendpoints?.map(bendpoint => ({ ...bendpoint })),
+    }));
+  }
+  return cloned;
+}
+
 export default function App() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
@@ -158,6 +312,8 @@ export default function App() {
   const [loadProgress, setLoadProgress] = useState<{ phase: string; pct: number } | null>(null);
 
   const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
+  const [selectedConnectionId, setSelectedConnectionId] = useState<string | null>(null);
   const [selType, setSelType] = useState<SelectionType>(null);
   const [activeLayer, setActiveLayer] = useState('business');
   const [gridType, setGridType] = useState<GridType>('dot');
@@ -186,6 +342,8 @@ export default function App() {
   const [editingTabName, setEditingTabName] = useState('');
   const [showLegend, setShowLegend] = useState(false);
   const [snapGuides, setSnapGuides] = useState<SnapGuide[]>([]);
+  const [diagramStateVersion, setDiagramStateVersion] = useState(0);
+  const saveViewLayoutSnapshotRef = useRef<(viewId: string) => void>(() => {});
 
   // Workspace (directory, file, dirty, git branch – persisted to IndexedDB)
   const {
@@ -195,7 +353,15 @@ export default function App() {
     closeWorkspace,
     restorePending, restoreDirectoryName, requestPermissionAndRestore,
   } = useWorkspace();
-  const { isDirty, gitBranch, directoryName: wsDirName, files: wsFiles, activeFilePath: wsActiveFilePath, format: wsFormat, isFragmented: wsIsFragmented } = workspace;
+  const {
+    isDirty,
+    gitBranch,
+    directoryName: wsDirName,
+    files: wsFiles,
+    activeFilePath: wsActiveFilePath,
+    format: wsFormat,
+    kind: wsKind,
+  } = workspace;
 
   const showTransientDiagnostic = useCallback((message: string, timeoutMs: number = 8000) => {
     setImportDiag(message);
@@ -216,11 +382,19 @@ export default function App() {
   }, [showTransientDiagnostic]);
 
   // Undo/Redo history — snapshots are pushed explicitly at interaction boundaries
-  interface HistorySnapshot { elements: ModelElement[]; relationships: ModelRelationship[]; views: ModelView[] }
+  interface HistorySnapshot {
+    elements: ModelElement[];
+    relationships: ModelRelationship[];
+    views: ModelView[];
+    diagramNodesByView: DiagramNodesByView;
+    diagramConnectionsByView: DiagramConnectionsByView;
+  }
   const historyRef = useRef<HistorySnapshot[]>([{
     elements: SAMPLE_ELEMENTS.map(e => ({ ...e })),
     relationships: SAMPLE_RELATIONSHIPS.map(r => ({ ...r, waypoints: [...r.waypoints] })),
     views: SAMPLE_VIEWS.map(v => ({ ...v, elementIds: [...v.elementIds], childViewIds: [...v.childViewIds] })),
+    diagramNodesByView: cloneDiagramNodesByView(buildDiagramStateFromEditorModel(SAMPLE_ELEMENTS, SAMPLE_RELATIONSHIPS, SAMPLE_VIEWS).diagramNodesByView),
+    diagramConnectionsByView: cloneDiagramConnectionsByView(buildDiagramStateFromEditorModel(SAMPLE_ELEMENTS, SAMPLE_RELATIONSHIPS, SAMPLE_VIEWS).diagramConnectionsByView),
   }]);
   const historyIndexRef = useRef(0);
 
@@ -234,10 +408,13 @@ export default function App() {
 
   /** Call BEFORE a mutation to save the current state as an undo point */
   const pushHistory = useCallback(() => {
+    saveViewLayoutSnapshotRef.current(currentViewId);
     const snapshot: HistorySnapshot = {
       elements: elementsRef.current.map(e => ({ ...e })),
       relationships: relationshipsRef.current.map(r => ({ ...r, waypoints: [...r.waypoints] })),
       views: viewsRef.current.map(v => ({ ...v, elementIds: [...v.elementIds], childViewIds: [...v.childViewIds] })),
+      diagramNodesByView: cloneDiagramNodesByView(diagramNodesByViewRef.current),
+      diagramConnectionsByView: cloneDiagramConnectionsByView(diagramConnectionsByViewRef.current),
     };
     // Trim forward history
     historyRef.current = historyRef.current.slice(0, historyIndexRef.current + 1);
@@ -248,28 +425,33 @@ export default function App() {
       historyRef.current = historyRef.current.slice(-80);
       historyIndexRef.current = historyRef.current.length - 1;
     }
-  }, []);
+  }, [currentViewId]);
 
   const applySnapshot = useCallback((snap: HistorySnapshot) => {
     setElements(snap.elements.map(e => ({ ...e })));
     setRelationships(snap.relationships.map(r => ({ ...r, waypoints: [...r.waypoints] })));
     setViews(snap.views.map(v => ({ ...v, elementIds: [...v.elementIds], childViewIds: [...v.childViewIds] })));
+    diagramNodesByViewRef.current = cloneDiagramNodesByView(snap.diagramNodesByView);
+    diagramConnectionsByViewRef.current = cloneDiagramConnectionsByView(snap.diagramConnectionsByView);
   }, []);
 
   const undo = useCallback(() => {
     if (historyIndexRef.current <= 0) return;
     // Save current state as the "redo" point if we're at the tip
     if (historyIndexRef.current === historyRef.current.length - 1) {
+      saveViewLayoutSnapshotRef.current(currentViewId);
       const current: HistorySnapshot = {
         elements: elementsRef.current.map(e => ({ ...e })),
         relationships: relationshipsRef.current.map(r => ({ ...r, waypoints: [...r.waypoints] })),
         views: viewsRef.current.map(v => ({ ...v, elementIds: [...v.elementIds], childViewIds: [...v.childViewIds] })),
+        diagramNodesByView: cloneDiagramNodesByView(diagramNodesByViewRef.current),
+        diagramConnectionsByView: cloneDiagramConnectionsByView(diagramConnectionsByViewRef.current),
       };
       historyRef.current.push(current);
     }
     historyIndexRef.current -= 1;
     applySnapshot(historyRef.current[historyIndexRef.current]);
-  }, [applySnapshot]);
+  }, [applySnapshot, currentViewId]);
 
   const redo = useCallback(() => {
     if (historyIndexRef.current >= historyRef.current.length - 1) return;
@@ -281,8 +463,15 @@ export default function App() {
     () => buildLayoutsFromEditorModel(SAMPLE_ELEMENTS, SAMPLE_RELATIONSHIPS, SAMPLE_VIEWS),
     [],
   );
+  const initialDiagramState = useMemo(
+    () => buildDiagramStateFromEditorModel(SAMPLE_ELEMENTS, SAMPLE_RELATIONSHIPS, SAMPLE_VIEWS),
+    [],
+  );
   const elementLayoutsByViewRef = useRef<ElementLayoutsByView>(initialLayouts.elementLayouts);
   const relationshipLayoutsByViewRef = useRef<RelationshipLayoutsByView>(initialLayouts.relationshipLayouts);
+  const diagramNodesByViewRef = useRef<DiagramNodesByView>(initialDiagramState.diagramNodesByView);
+  const diagramConnectionsByViewRef = useRef<DiagramConnectionsByView>(initialDiagramState.diagramConnectionsByView);
+  const fragmentedSourceDocumentRef = useRef<CanonicalModelDocument | null>(null);
 
   const modelFormats = useMemo(() => listModelFormats(), []);
 
@@ -304,7 +493,34 @@ export default function App() {
     [elements, visibleElementIds],
   );
 
-  const visibleRelationships = useMemo(
+  const visibleDiagramElements = useMemo<DiagramElementInstance[]>(() => {
+    const nodes = diagramNodesByViewRef.current[currentViewId] || [];
+    if (nodes.length === 0) {
+      return visibleElements.map(element => ({ ...element, elementId: element.id }));
+    }
+
+    const elementById = new Map(elements.map(element => [element.id, element]));
+    const diagramElements: DiagramElementInstance[] = [];
+    for (const node of nodes) {
+      const element = elementById.get(node.elementId);
+      if (!element) continue;
+      diagramElements.push({
+          ...element,
+          id: node.id,
+          elementId: node.elementId,
+          x: node.x,
+          y: node.y,
+          w: node.w,
+          h: node.h,
+          linkedViewId: node.linkedViewId ?? element.linkedViewId,
+          zIndex: node.zIndex ?? node.nestingDepth ?? element.zIndex,
+          style: node.style ?? element.style,
+        });
+    }
+    return diagramElements;
+  }, [currentViewId, elements, visibleElements, diagramStateVersion]);
+
+  const visibleSemanticRelationships = useMemo(
     () => {
       // Build element lookup for containment checks
       const elMap = new Map(elements.map(e => [e.id, e]));
@@ -332,7 +548,7 @@ export default function App() {
   );
 
   useEffect(() => {
-    if (relationships.length > 0 && visibleRelationships.length === 0 && visibleElementIds.size > 0) {
+    if (relationships.length > 0 && visibleSemanticRelationships.length === 0 && visibleElementIds.size > 0) {
       const sample = relationships.slice(0, 3);
       const elSample = Array.from(visibleElementIds).slice(0, 3);
       showTransientDiagnostic(
@@ -341,61 +557,220 @@ export default function App() {
         + `Sample view element IDs: ${elSample.join(', ')}`,
       );
     }
-  }, [relationships, visibleRelationships, visibleElementIds, showTransientDiagnostic]);
+  }, [relationships, visibleSemanticRelationships, visibleElementIds, showTransientDiagnostic]);
 
-  // Element lookup map for O(1) access in getRelPoints/drawRelationship
   const visibleElementMap = useMemo(
-    () => new Map(visibleElements.map(e => [e.id, e])),
-    [visibleElements],
+    () => new Map(visibleDiagramElements.map(element => [element.id, element])),
+    [visibleDiagramElements],
   );
+
+  const visibleNodeIdsByElementId = useMemo(() => {
+    const map = new Map<string, string[]>();
+    for (const element of visibleDiagramElements) {
+      const ids = map.get(element.elementId) || [];
+      ids.push(element.id);
+      map.set(element.elementId, ids);
+    }
+    return map;
+  }, [visibleDiagramElements]);
+
+  const visibleRelationships = useMemo<DiagramRelationshipInstance[]>(() => {
+    const semanticRelationshipsById = new Map(relationships.map(relationship => [relationship.id, relationship]));
+    const connections = diagramConnectionsByViewRef.current[currentViewId] || [];
+    const nextRelationships: DiagramRelationshipInstance[] = [];
+
+    for (const connection of connections) {
+      const semanticRelationship = semanticRelationshipsById.get(connection.relationshipId);
+      if (!semanticRelationship) continue;
+      const sourceNodeId = connection.sourceNodeId || visibleNodeIdsByElementId.get(semanticRelationship.sourceId)?.[0];
+      const targetNodeId = connection.targetNodeId || visibleNodeIdsByElementId.get(semanticRelationship.targetId)?.[0];
+      if (!sourceNodeId || !targetNodeId) continue;
+
+      const sourceElement = visibleElementMap.get(sourceNodeId);
+      const targetElement = visibleElementMap.get(targetNodeId);
+      if (!sourceElement || !targetElement) continue;
+
+      const srcContainsTgt = targetElement.x >= sourceElement.x && targetElement.y >= sourceElement.y &&
+        targetElement.x + targetElement.w <= sourceElement.x + sourceElement.w &&
+        targetElement.y + targetElement.h <= sourceElement.y + sourceElement.h;
+      const tgtContainsSrc = sourceElement.x >= targetElement.x && sourceElement.y >= targetElement.y &&
+        sourceElement.x + sourceElement.w <= targetElement.x + targetElement.w &&
+        sourceElement.y + sourceElement.h <= targetElement.y + targetElement.h;
+      if (srcContainsTgt || tgtContainsSrc) continue;
+
+      nextRelationships.push({
+        ...semanticRelationship,
+        id: connection.id,
+        relationshipId: semanticRelationship.id,
+        sourceId: sourceNodeId,
+        targetId: targetNodeId,
+        sourceNodeId,
+        targetNodeId,
+        waypoints: connection.waypoints || [],
+        labelPos: connection.labelPos ?? 0.5,
+        relativeBendpoints: connection.relativeBendpoints,
+      });
+    }
+
+    if (nextRelationships.length > 0 || connections.length > 0) return nextRelationships;
+
+    return visibleSemanticRelationships.flatMap(relationship => {
+      const sourceNodeId = visibleNodeIdsByElementId.get(relationship.sourceId)?.[0];
+      const targetNodeId = visibleNodeIdsByElementId.get(relationship.targetId)?.[0];
+      if (!sourceNodeId || !targetNodeId) return [];
+      return [{
+        ...relationship,
+        id: `${currentViewId}::${relationship.id}`,
+        relationshipId: relationship.id,
+        sourceId: sourceNodeId,
+        targetId: targetNodeId,
+        sourceNodeId,
+        targetNodeId,
+      }];
+    });
+  }, [currentViewId, relationships, visibleSemanticRelationships, visibleElementMap, visibleNodeIdsByElementId, diagramStateVersion]);
 
   const saveViewLayoutSnapshot = useCallback((viewId: string) => {
     const view = views.find(candidate => candidate.id === viewId);
     if (!view) return;
 
     const memberIds = new Set(view.elementIds || []);
-    const elementLayout: Record<string, ElementViewLayout> = {
-      ...(elementLayoutsByViewRef.current[viewId] || {}),
-    };
-    const relationshipLayout: Record<string, RelationshipViewLayout> = {
-      ...(relationshipLayoutsByViewRef.current[viewId] || {}),
-    };
+    const elementById = new Map(elements.map(element => [element.id, element]));
+    const relationshipById = new Map(relationships.map(relationship => [relationship.id, relationship]));
+    const existingNodes = diagramNodesByViewRef.current[viewId] || [];
+    const nextNodes: DiagramNodeState[] = [];
+    const representedElementIds = new Set<string>();
+
+    for (const node of existingNodes) {
+      if (!memberIds.has(node.elementId)) continue;
+      const element = elementById.get(node.elementId);
+      if (!element) continue;
+      nextNodes.push({
+        ...node,
+        linkedViewId: node.linkedViewId ?? element.linkedViewId,
+        zIndex: node.zIndex ?? element.zIndex,
+        nestingDepth: node.nestingDepth ?? node.zIndex ?? element.zIndex ?? 0,
+        style: node.style ?? element.style,
+      });
+      representedElementIds.add(node.elementId);
+    }
 
     for (const element of elements) {
-      if (!memberIds.has(element.id)) continue;
-      elementLayout[element.id] = {
+      if (!memberIds.has(element.id) || representedElementIds.has(element.id)) continue;
+      nextNodes.push({
+        id: `${viewId}::${element.id}`,
+        viewId,
+        elementId: element.id,
         x: element.x,
         y: element.y,
         w: element.w,
         h: element.h,
         linkedViewId: element.linkedViewId,
         zIndex: element.zIndex,
+        nestingDepth: element.zIndex ?? 0,
         style: element.style,
+      });
+    }
+
+    const existingConnections = diagramConnectionsByViewRef.current[viewId] || [];
+    const nextConnections: DiagramConnectionState[] = [];
+    const representedRelationshipIds = new Set<string>();
+    const nodeIdsByElementId = new Map<string, string[]>();
+
+    for (const node of nextNodes) {
+      const nodeIds = nodeIdsByElementId.get(node.elementId) || [];
+      nodeIds.push(node.id);
+      nodeIdsByElementId.set(node.elementId, nodeIds);
+      elementLayoutsByViewRef.current[viewId] = {
+        ...(elementLayoutsByViewRef.current[viewId] || {}),
+        [node.elementId]: {
+          x: node.x,
+          y: node.y,
+          w: node.w,
+          h: node.h,
+          linkedViewId: node.linkedViewId,
+          zIndex: node.zIndex,
+          style: node.style,
+        },
+      };
+    }
+
+    for (const connection of existingConnections) {
+      const relationship = relationshipById.get(connection.relationshipId);
+      if (!relationship) continue;
+      if (!memberIds.has(relationship.sourceId) || !memberIds.has(relationship.targetId)) continue;
+      nextConnections.push({
+        ...connection,
+        sourceNodeId: connection.sourceNodeId || nodeIdsByElementId.get(relationship.sourceId)?.[0],
+        targetNodeId: connection.targetNodeId || nodeIdsByElementId.get(relationship.targetId)?.[0],
+      });
+      representedRelationshipIds.add(connection.relationshipId);
+      relationshipLayoutsByViewRef.current[viewId] = {
+        ...(relationshipLayoutsByViewRef.current[viewId] || {}),
+        [connection.relationshipId]: {
+          waypoints: connection.waypoints || [],
+          labelPos: connection.labelPos ?? 0.5,
+          relativeBendpoints: connection.relativeBendpoints,
+        },
       };
     }
 
     for (const relationship of relationships) {
       if (!memberIds.has(relationship.sourceId) || !memberIds.has(relationship.targetId)) continue;
-      relationshipLayout[relationship.id] = {
+      if (representedRelationshipIds.has(relationship.id)) continue;
+      nextConnections.push({
+        id: `${viewId}::${relationship.id}`,
+        viewId,
+        relationshipId: relationship.id,
+        sourceNodeId: nodeIdsByElementId.get(relationship.sourceId)?.[0],
+        targetNodeId: nodeIdsByElementId.get(relationship.targetId)?.[0],
         waypoints: relationship.waypoints || [],
         labelPos: relationship.labelPos ?? 0.5,
         relativeBendpoints: relationship.relativeBendpoints,
+      });
+      relationshipLayoutsByViewRef.current[viewId] = {
+        ...(relationshipLayoutsByViewRef.current[viewId] || {}),
+        [relationship.id]: {
+          waypoints: relationship.waypoints || [],
+          labelPos: relationship.labelPos ?? 0.5,
+          relativeBendpoints: relationship.relativeBendpoints,
+        },
       };
     }
 
     elementLayoutsByViewRef.current = {
       ...elementLayoutsByViewRef.current,
-      [viewId]: elementLayout,
+      [viewId]: Object.fromEntries(nextNodes.map(node => [node.elementId, {
+        x: node.x,
+        y: node.y,
+        w: node.w,
+        h: node.h,
+        linkedViewId: node.linkedViewId,
+        zIndex: node.zIndex,
+        style: node.style,
+      }])),
     };
     relationshipLayoutsByViewRef.current = {
       ...relationshipLayoutsByViewRef.current,
-      [viewId]: relationshipLayout,
+      [viewId]: Object.fromEntries(nextConnections.map(connection => [connection.relationshipId, {
+        waypoints: connection.waypoints || [],
+        labelPos: connection.labelPos ?? 0.5,
+        relativeBendpoints: connection.relativeBendpoints,
+      }])),
+    };
+    diagramNodesByViewRef.current = {
+      ...diagramNodesByViewRef.current,
+      [viewId]: nextNodes,
+    };
+    diagramConnectionsByViewRef.current = {
+      ...diagramConnectionsByViewRef.current,
+      [viewId]: nextConnections,
     };
   }, [views, elements, relationships]);
+  saveViewLayoutSnapshotRef.current = saveViewLayoutSnapshot;
 
   const applyViewLayout = useCallback((viewId: string) => {
     const elementLayout = elementLayoutsByViewRef.current[viewId] || {};
-    const relationshipLayout = relationshipLayoutsByViewRef.current[viewId] || {};
 
     setElements(prev => prev.map(element => {
       const layout = elementLayout[element.id];
@@ -411,17 +786,163 @@ export default function App() {
         style: layout.style ?? element.style,
       };
     }));
+  }, []);
 
-    setRelationships(prev => prev.map(relationship => {
-      const layout = relationshipLayout[relationship.id];
-      if (!layout) return relationship;
-      return {
-        ...relationship,
-        waypoints: layout.waypoints,
-        labelPos: layout.labelPos,
-        relativeBendpoints: layout.relativeBendpoints,
-      };
-    }));
+  const buildFragmentedSaveDocument = useCallback((): CanonicalModelDocument | null => {
+    const base = fragmentedSourceDocumentRef.current;
+    if (!base) return null;
+
+    return {
+      ...base,
+      viewNodes: Object.values(diagramNodesByViewRef.current).flat().map(node => ({
+        id: node.id,
+        viewId: node.viewId,
+        elementId: node.elementId,
+        x: node.x,
+        y: node.y,
+        width: node.w,
+        height: node.h,
+        linkedViewId: node.linkedViewId,
+        style: node.style ? {
+          fillColor: node.style.fillColor,
+          lineColor: node.style.lineColor,
+          fontColor: node.style.fontColor,
+        } : undefined,
+        parentNodeId: node.parentNodeId,
+        nestingDepth: node.nestingDepth ?? node.zIndex ?? 0,
+      })),
+      viewConnections: Object.values(diagramConnectionsByViewRef.current).flat().map(connection => ({
+        id: connection.id,
+        viewId: connection.viewId,
+        relationshipId: connection.relationshipId,
+        sourceNodeId: connection.sourceNodeId,
+        targetNodeId: connection.targetNodeId,
+        waypoints: connection.waypoints,
+        labelPosition: connection.labelPos,
+        relativeBendpoints: connection.relativeBendpoints,
+      })),
+    };
+  }, []);
+
+  const buildEditorModelForExport = useCallback((): OpenArchiModel => ({
+    version: 'openarchi-0.1',
+    elements,
+    relationships,
+    views,
+    diagramNodes: Object.values(diagramNodesByViewRef.current).flat().map(node => ({
+      id: node.id,
+      viewId: node.viewId,
+      elementId: node.elementId,
+      x: node.x,
+      y: node.y,
+      w: node.w,
+      h: node.h,
+      linkedViewId: node.linkedViewId,
+      zIndex: node.zIndex,
+      style: node.style,
+      parentNodeId: node.parentNodeId,
+      nestingDepth: node.nestingDepth,
+    })),
+    diagramConnections: Object.values(diagramConnectionsByViewRef.current).flat().map(connection => ({
+      id: connection.id,
+      viewId: connection.viewId,
+      relationshipId: connection.relationshipId,
+      sourceNodeId: connection.sourceNodeId,
+      targetNodeId: connection.targetNodeId,
+      waypoints: connection.waypoints,
+      labelPos: connection.labelPos,
+      relativeBendpoints: connection.relativeBendpoints,
+    })),
+  }), [elements, relationships, views]);
+
+  const currentNodeElementIdById = useMemo(() => {
+    const map = new Map<string, string>();
+    for (const node of diagramNodesByViewRef.current[currentViewId] || []) {
+      map.set(node.id, node.elementId);
+    }
+    return map;
+  }, [currentViewId, visibleDiagramElements]);
+
+  const updateCurrentDiagramNode = useCallback((nodeId: string, updater: (node: DiagramNodeState) => DiagramNodeState) => {
+    const nodes = diagramNodesByViewRef.current[currentViewId] || [];
+    diagramNodesByViewRef.current = {
+      ...diagramNodesByViewRef.current,
+      [currentViewId]: nodes.map(node => node.id === nodeId ? updater(node) : node),
+    };
+    setDiagramStateVersion(version => version + 1);
+  }, [currentViewId]);
+
+  const appendCurrentDiagramNode = useCallback((node: DiagramNodeState) => {
+    const nodes = diagramNodesByViewRef.current[currentViewId] || [];
+    diagramNodesByViewRef.current = {
+      ...diagramNodesByViewRef.current,
+      [currentViewId]: [...nodes, node],
+    };
+    setDiagramStateVersion(version => version + 1);
+  }, [currentViewId]);
+
+  const removeDiagramNodesForElement = useCallback((elementId: string) => {
+    let changed = false;
+    const next: DiagramNodesByView = {};
+    for (const [viewId, nodes] of Object.entries(diagramNodesByViewRef.current)) {
+      const filtered = nodes.filter(node => node.elementId !== elementId);
+      next[viewId] = filtered;
+      if (filtered.length !== nodes.length) changed = true;
+    }
+    if (!changed) return;
+    diagramNodesByViewRef.current = next;
+    setDiagramStateVersion(version => version + 1);
+  }, []);
+
+  const updateCurrentDiagramConnection = useCallback((connectionId: string, updater: (connection: DiagramConnectionState) => DiagramConnectionState) => {
+    const connections = diagramConnectionsByViewRef.current[currentViewId] || [];
+    diagramConnectionsByViewRef.current = {
+      ...diagramConnectionsByViewRef.current,
+      [currentViewId]: connections.map(connection => connection.id === connectionId ? updater(connection) : connection),
+    };
+    setDiagramStateVersion(version => version + 1);
+  }, [currentViewId]);
+
+  const appendCurrentDiagramConnection = useCallback((connection: DiagramConnectionState) => {
+    const connections = diagramConnectionsByViewRef.current[currentViewId] || [];
+    diagramConnectionsByViewRef.current = {
+      ...diagramConnectionsByViewRef.current,
+      [currentViewId]: [...connections, connection],
+    };
+    setDiagramStateVersion(version => version + 1);
+  }, [currentViewId]);
+
+  const removeDiagramConnectionsForRelationship = useCallback((relationshipId: string) => {
+    let changed = false;
+    const next: DiagramConnectionsByView = {};
+    for (const [viewId, connections] of Object.entries(diagramConnectionsByViewRef.current)) {
+      const filtered = connections.filter(connection => connection.relationshipId !== relationshipId);
+      next[viewId] = filtered;
+      if (filtered.length !== connections.length) changed = true;
+    }
+    if (!changed) return;
+    diagramConnectionsByViewRef.current = next;
+    setDiagramStateVersion(version => version + 1);
+  }, []);
+
+  const removeDiagramConnectionsForElement = useCallback((elementId: string) => {
+    const relationshipIds = new Set(
+      relationshipsRef.current
+        .filter(relationship => relationship.sourceId === elementId || relationship.targetId === elementId)
+        .map(relationship => relationship.id),
+    );
+    if (relationshipIds.size === 0) return;
+
+    let changed = false;
+    const next: DiagramConnectionsByView = {};
+    for (const [viewId, connections] of Object.entries(diagramConnectionsByViewRef.current)) {
+      const filtered = connections.filter(connection => !relationshipIds.has(connection.relationshipId));
+      next[viewId] = filtered;
+      if (filtered.length !== connections.length) changed = true;
+    }
+    if (!changed) return;
+    diagramConnectionsByViewRef.current = next;
+    setDiagramStateVersion(version => version + 1);
   }, []);
 
   // ==================== CAMERA ====================
@@ -565,18 +1086,17 @@ export default function App() {
   const parentIds = useMemo(() => {
     const ids = new Set<string>();
 
-    // Try structural detection first (from parsed nesting hierarchy)
-    const currentLayout = elementLayoutsByViewRef.current[currentViewId] || {};
-    for (const [elementId, layout] of Object.entries(currentLayout)) {
-      if (layout.isParent) ids.add(elementId);
+    const currentNodes = diagramNodesByViewRef.current[currentViewId] || [];
+    for (const node of currentNodes) {
+      if (node.parentNodeId) ids.add(node.parentNodeId);
     }
 
     // If no structural data available, fall back to spatial containment detection
-    if (ids.size === 0 && visibleElements.length > 0) {
-      const n = visibleElements.length;
+    if (ids.size === 0 && visibleDiagramElements.length > 0) {
+      const n = visibleDiagramElements.length;
       if (n < 200) {
-        for (const outer of visibleElements) {
-          for (const inner of visibleElements) {
+        for (const outer of visibleDiagramElements) {
+          for (const inner of visibleDiagramElements) {
             if (inner.id === outer.id) continue;
             if (inner.x >= outer.x && inner.y >= outer.y &&
                 inner.x + inner.w <= outer.x + outer.w &&
@@ -587,7 +1107,7 @@ export default function App() {
           }
         }
       } else {
-        const byArea = [...visibleElements].sort((a, b) => (b.w * b.h) - (a.w * a.h));
+        const byArea = [...visibleDiagramElements].sort((a, b) => (b.w * b.h) - (a.w * a.h));
         for (let i = 0; i < byArea.length && !ids.has(byArea[i].id); i++) {
           const outer = byArea[i];
           for (let j = i + 1; j < byArea.length; j++) {
@@ -603,7 +1123,7 @@ export default function App() {
       }
     }
     return ids;
-  }, [visibleElements, currentViewId]);
+  }, [currentViewId, visibleDiagramElements]);
 
   // Archi draw order: containers behind children, composites behind non-composites.
   // Sort by: 1) nesting depth (zIndex), 2) composites → regular → viewRefs, 3) area descending
@@ -614,7 +1134,7 @@ export default function App() {
       if (layer === 'composite' && el.type !== 'note') return 0; // behind everything
       return 1; // regular elements
     };
-    return [...visibleElements].sort((a, b) => {
+    return [...visibleDiagramElements].sort((a, b) => {
       // Primary: lower zIndex draws first (parents behind children)
       const za = a.zIndex ?? 0, zb = b.zIndex ?? 0;
       if (za !== zb) return za - zb;
@@ -624,7 +1144,7 @@ export default function App() {
       // Tertiary: larger elements draw first (behind smaller ones)
       return (b.w * b.h) - (a.w * a.h);
     });
-  }, [visibleElements]);
+  }, [visibleDiagramElements]);
 
   // Track canvas dimensions to avoid unnecessary reallocation
   const canvasDimsRef = useRef({ w: 0, h: 0 });
@@ -674,8 +1194,8 @@ export default function App() {
       drawElement(
         ctx,
         el,
-        selType === 'element' && selectedId === el.id,
-        (selType === 'element' && selectedId === el.id) || hovElId === el.id,
+        selType === 'element' && selectedNodeId === el.id,
+        (selType === 'element' && selectedNodeId === el.id) || hovElId === el.id,
         parentIds.has(el.id),
       );
     }
@@ -686,11 +1206,11 @@ export default function App() {
 
     if (skipCrossings) {
       for (const r of visibleRelationships) {
-        drawRelationship(ctx, r, visibleElements, selType === 'relationship' && selectedId === r.id, hovRelId === r.id, [], visibleElementMap);
+        drawRelationship(ctx, r, visibleDiagramElements, selType === 'relationship' && selectedConnectionId === r.id, hovRelId === r.id, [], visibleElementMap);
       }
     } else {
       const allRelSegs: RelSegments[] = visibleRelationships
-        .map(r => getRelSegments(r, visibleElements, visibleElementMap))
+        .map(r => getRelSegments(r, visibleDiagramElements, visibleElementMap))
         .filter((s): s is RelSegments => s !== null);
 
       // Pre-build a flat list of all segments with their owning relId for fast exclusion
@@ -698,7 +1218,7 @@ export default function App() {
 
       for (const r of visibleRelationships) {
         const otherSegs = allFlatSegs.filter(s => s.relId !== r.id);
-        drawRelationship(ctx, r, visibleElements, selType === 'relationship' && selectedId === r.id, hovRelId === r.id, otherSegs, visibleElementMap);
+        drawRelationship(ctx, r, visibleDiagramElements, selType === 'relationship' && selectedConnectionId === r.id, hovRelId === r.id, otherSegs, visibleElementMap);
       }
     }
 
@@ -709,7 +1229,9 @@ export default function App() {
 
     // 5. Drawing-in-progress relationship (with waypoints + arrowhead)
     if (drawingRel) {
-      const src = visibleElements.find(e => e.id === drawingRel.sourceId);
+      const src = drawingRel.sourceNodeId
+        ? visibleDiagramElements.find(element => element.id === drawingRel.sourceNodeId)
+        : visibleDiagramElements.find(element => element.elementId === drawingRel.sourceId);
       if (src) {
         const wps = drawingRel.waypoints;
         const startPt = wps.length > 0 ? wps[0] : null;
@@ -747,7 +1269,7 @@ export default function App() {
     }
 
     ctx.restore();
-  }, [visibleElements, visibleElementMap, visibleRelationships, sortedElements, parentIds, selectedId, selType, cam, cSize, hovElId, hovRelId, drawingRel, gridType, snapGuides]);
+  }, [visibleDiagramElements, visibleElementMap, visibleRelationships, sortedElements, parentIds, selectedConnectionId, selectedNodeId, selType, cam, cSize, hovElId, hovRelId, drawingRel, gridType, snapGuides]);
 
   // ==================== MOUSE HANDLERS ====================
   const isViewMode = interactionMode === 'view';
@@ -763,24 +1285,24 @@ export default function App() {
 
     // View mode: only allow selection (inspect), panning, and view navigation
     if (isViewMode) {
-      const linked = hitTestPopout(visibleElements, wx, wy);
+      const linked = hitTestPopout(visibleDiagramElements, wx, wy);
       if (linked) { navigateToView(linked); return; }
 
-      const el = hitTestElement(visibleElements, wx, wy, getLayer, isNote);
+      const el = hitTestElement(visibleDiagramElements, wx, wy, getLayer, isNote) as DiagramElementInstance | null;
       if (el) {
-        setSelectedId(el.id); setSelType('element');
+        setSelectedNodeId(el.id); setSelectedConnectionId(null); setSelectedId(el.elementId); setSelType('element');
       } else {
-        const rh = hitTestRelationship(visibleRelationships, visibleElements, wx, wy);
-        if (rh) { setSelectedId(rh.rel.id); setSelType('relationship'); }
-        else { setSelectedId(null); setSelType(null); setPanning({ sx: e.clientX, sy: e.clientY, cx: cam.x, cy: cam.y }); }
+        const rh = hitTestRelationship(visibleRelationships, visibleDiagramElements, wx, wy);
+        if (rh) { setSelectedNodeId(null); setSelectedConnectionId(rh.rel.id); setSelectedId((rh.rel as DiagramRelationshipInstance).relationshipId); setSelType('relationship'); }
+        else { setSelectedNodeId(null); setSelectedConnectionId(null); setSelectedId(null); setSelType(null); setPanning({ sx: e.clientX, sy: e.clientY, cx: cam.x, cy: cam.y }); }
       }
       return;
     }
 
     // During relationship drawing: click on element = complete, click on empty = add waypoint
     if (drawingRel) {
-      const tgtEl = hitTestElement(sortedElements, wx, wy, getLayer, isNote);
-      if (tgtEl && tgtEl.id !== drawingRel.sourceId) {
+      const tgtEl = hitTestElement(sortedElements, wx, wy, getLayer, isNote) as DiagramElementInstance | null;
+      if (tgtEl && tgtEl.id !== drawingRel.sourceNodeId) {
         // Clicked on target element — complete the connection (handled in mouseUp)
         // Let it fall through to normal handling
       } else {
@@ -790,12 +1312,12 @@ export default function App() {
       }
     }
 
-    const linked = hitTestPopout(visibleElements, wx, wy);
+    const linked = hitTestPopout(visibleDiagramElements, wx, wy);
     if (linked) { navigateToView(linked); return; }
 
     // Resize handles take priority over everything (they overlap anchor zones at corners)
-    if (selType === 'element' && selectedId) {
-      const selEl = visibleElements.find(e => e.id === selectedId);
+    if (selType === 'element' && selectedNodeId) {
+      const selEl = visibleDiagramElements.find(e => e.id === selectedNodeId);
       if (selEl) {
         const handle = hitTestResizeHandle(selEl, wx, wy);
         if (handle) {
@@ -807,13 +1329,16 @@ export default function App() {
     }
 
     const anch = hitTestAnchor(sortedElements, wx, wy, getLayer, isNote);
-    if (anch) { setDrawingRel({ sourceId: anch.elId, mx: wx, my: wy, waypoints: [] }); return; }
+    if (anch) {
+      setDrawingRel({ sourceId: currentNodeElementIdById.get(anch.elId) || anch.elId, sourceNodeId: anch.elId, mx: wx, my: wy, waypoints: [] });
+      return;
+    }
 
     // Endpoint dragging — only when a relationship is selected
-    if (selType === 'relationship' && selectedId) {
-      const selRel = visibleRelationships.find(r => r.id === selectedId);
+    if (selType === 'relationship' && selectedConnectionId) {
+      const selRel = visibleRelationships.find(r => r.id === selectedConnectionId);
       if (selRel) {
-        const ep = hitTestEndpoint(selRel, visibleElements, wx, wy);
+        const ep = hitTestEndpoint(selRel, visibleDiagramElements, wx, wy);
         if (ep) { pushHistory(); setDragEndpoint({ relId: selRel.id, endpoint: ep }); return; }
       }
     }
@@ -821,30 +1346,39 @@ export default function App() {
     const wp = hitTestWaypoint(visibleRelationships, wx, wy);
     if (wp) { pushHistory(); setDragWP({ ...wp, startX: wx, startY: wy }); return; }
 
-    const lbl = hitTestLabel(visibleRelationships, visibleElements, wx, wy);
-    if (lbl) { pushHistory(); setDragLabel({ relId: lbl.id }); setSelectedId(lbl.id); setSelType('relationship'); return; }
+    const lbl = hitTestLabel(visibleRelationships, visibleDiagramElements, wx, wy);
+    if (lbl) {
+      const relationship = visibleRelationships.find(candidate => candidate.id === lbl.id);
+      pushHistory();
+      setDragLabel({ relId: lbl.id });
+      setSelectedNodeId(null);
+      setSelectedConnectionId(lbl.id);
+      setSelectedId(relationship?.relationshipId || null);
+      setSelType('relationship');
+      return;
+    }
 
-    const el = hitTestElement(sortedElements, wx, wy, getLayer, isNote);
+    const el = hitTestElement(sortedElements, wx, wy, getLayer, isNote) as DiagramElementInstance | null;
     if (el) {
-      setSelectedId(el.id); setSelType('element');
+      setSelectedNodeId(el.id); setSelectedConnectionId(null); setSelectedId(el.elementId); setSelType('element');
       pushHistory();
       setDragging({ id: el.id, ox: wx - el.x, oy: wy - el.y });
     } else {
-      const rh = hitTestRelationship(visibleRelationships, visibleElements, wx, wy);
+      const rh = hitTestRelationship(visibleRelationships, visibleDiagramElements, wx, wy);
       if (rh) {
-        setSelectedId(rh.rel.id); setSelType('relationship');
+        setSelectedNodeId(null); setSelectedConnectionId(rh.rel.id); setSelectedId((rh.rel as DiagramRelationshipInstance).relationshipId); setSelType('relationship');
         // If already selected, start segment drag
-        if (selType === 'relationship' && selectedId === rh.rel.id) {
-          const orient = getSegmentOrientation(rh.rel, visibleElements, rh.segIdx, visibleElementMap);
+        if (selType === 'relationship' && selectedConnectionId === rh.rel.id) {
+          const orient = getSegmentOrientation(rh.rel, visibleDiagramElements, rh.segIdx, visibleElementMap);
           if (orient) {
             pushHistory();
             setDragSegment({ relId: rh.rel.id, segIdx: rh.segIdx, orientation: orient, startWx: wx, startWy: wy });
           }
         }
       }
-      else { setSelectedId(null); setSelType(null); setPanning({ sx: e.clientX, sy: e.clientY, cx: cam.x, cy: cam.y }); }
+      else { setSelectedNodeId(null); setSelectedConnectionId(null); setSelectedId(null); setSelType(null); setPanning({ sx: e.clientX, sy: e.clientY, cx: cam.x, cy: cam.y }); }
     }
-  }, [s2w, visibleElements, visibleRelationships, cam, relPicker, ctxMenu, drawingRel, editingElId, navigateToView, selType, selectedId, pushHistory, isViewMode]);
+  }, [s2w, visibleDiagramElements, visibleRelationships, cam, relPicker, ctxMenu, drawingRel, editingElId, navigateToView, selType, selectedConnectionId, selectedNodeId, pushHistory, isViewMode, currentNodeElementIdById]);
 
   const handleMouseMove = useCallback((e: React.MouseEvent) => {
     const canvas = canvasRef.current;
@@ -860,7 +1394,7 @@ export default function App() {
       const fixedTop = resizing.origY;
       const fixedRight = resizing.origX + resizing.origW;
       const fixedBottom = resizing.origY + resizing.origH;
-      const others = visibleElements.filter(el => el.id !== resizing.id);
+      const others = visibleDiagramElements.filter(el => el.id !== resizing.id);
       const snapThresh = 6;
 
       let left = fixedLeft, top = fixedTop, right = fixedRight, bottom = fixedBottom;
@@ -917,19 +1451,30 @@ export default function App() {
       if (bottom - top < 40) { if (rh.includes('n')) top = bottom - 40; else bottom = top + 40; }
 
       setSnapGuides(guides);
-      setElements(prev => prev.map(el => el.id === resizing.id ? { ...el, x: left, y: top, w: right - left, h: bottom - top } : el));
+      updateCurrentDiagramNode(resizing.id, node => ({
+        ...node,
+        x: left,
+        y: top,
+        w: right - left,
+        h: bottom - top,
+      }));
       return;
     }
     if (drawingRel) { setDrawingRel(p => p ? { ...p, mx: wx, my: wy } : null); return; }
     if (dragWP) {
-      setRelationships(prev => prev.map(r => r.id === dragWP.relId ? { ...r, waypoints: r.waypoints.map((w, i) => i === dragWP.wpIdx ? { x: snap(wx), y: snap(wy) } : w) } : r));
+      updateCurrentDiagramConnection(dragWP.relId, connection => ({
+        ...connection,
+        waypoints: connection.waypoints.map((waypoint, index) => index === dragWP.wpIdx ? { x: snap(wx), y: snap(wy) } : waypoint),
+        relativeBendpoints: undefined,
+      }));
       return;
     }
     if (dragSegment) {
-      setRelationships(prev => prev.map(r => {
-        if (r.id !== dragSegment.relId) return r;
-        const pts = getRelPoints(r, visibleElements, visibleElementMap);
-        if (!pts) return r;
+      updateCurrentDiagramConnection(dragSegment.relId, connection => {
+        const relationship = visibleRelationships.find(candidate => candidate.id === dragSegment.relId);
+        if (!relationship) return connection;
+        const pts = getRelPoints(relationship, visibleDiagramElements, visibleElementMap);
+        if (!pts) return connection;
         const allPts = [pts.start, ...pts.waypoints, pts.end];
         const si = dragSegment.segIdx;
         const wpCount = pts.waypoints.length;
@@ -940,10 +1485,10 @@ export default function App() {
           if (dragSegment.orientation === 'h') {
             // Horizontal segment → drag vertically → create Z-route
             const newY = snap(wy);
-            return { ...r, waypoints: [{ x: a.x, y: newY }, { x: b.x, y: newY }], relativeBendpoints: undefined };
+            return { ...connection, waypoints: [{ x: a.x, y: newY }, { x: b.x, y: newY }], relativeBendpoints: undefined };
           } else {
             const newX = snap(wx);
-            return { ...r, waypoints: [{ x: newX, y: a.y }, { x: newX, y: b.y }], relativeBendpoints: undefined };
+            return { ...connection, waypoints: [{ x: newX, y: a.y }, { x: newX, y: b.y }], relativeBendpoints: undefined };
           }
         }
 
@@ -966,43 +1511,50 @@ export default function App() {
           if (si < wpCount) newWaypoints[si] = { ...newWaypoints[si], x: newX };
         }
 
-        return { ...r, waypoints: newWaypoints, relativeBendpoints: undefined };
-      }));
+        return { ...connection, waypoints: newWaypoints, relativeBendpoints: undefined };
+      });
       return;
     }
     if (dragEndpoint) {
       const key = dragEndpoint.endpoint === 'source' ? 'sourceAnchor' : 'targetAnchor';
-      setRelationships(prev => prev.map(r => r.id === dragEndpoint.relId ? { ...r, [key]: { x: snap(wx), y: snap(wy) } } : r));
+      const relationshipId = visibleRelationships.find(relationship => relationship.id === dragEndpoint.relId)?.relationshipId;
+      if (relationshipId) {
+        setRelationships(prev => prev.map(r => r.id === relationshipId ? { ...r, [key]: { x: snap(wx), y: snap(wy) } } : r));
+      }
       return;
     }
     if (dragLabel) {
       const rel = visibleRelationships.find(r => r.id === dragLabel.relId);
       if (rel) {
-        const pts = getRelPoints(rel, visibleElements);
+        const pts = getRelPoints(rel, visibleDiagramElements, visibleElementMap);
         if (pts) {
           const allPts = [pts.start, ...pts.waypoints, pts.end];
           const newT = nearestTOnPath(allPts, wx, wy);
-          setRelationships(prev => prev.map(r => r.id === dragLabel.relId ? { ...r, labelPos: newT } : r));
+          updateCurrentDiagramConnection(dragLabel.relId, connection => ({ ...connection, labelPos: newT }));
         }
       }
       return;
     }
     if (dragging) {
-      const draggedEl = visibleElements.find(el => el.id === dragging.id);
+      const draggedEl = visibleDiagramElements.find(el => el.id === dragging.id);
       if (draggedEl) {
         const proposedX = snap(wx - dragging.ox);
         const proposedY = snap(wy - dragging.oy);
-        const others = visibleElements.filter(el => el.id !== dragging.id);
+        const others = visibleDiagramElements.filter(el => el.id !== dragging.id);
         const result = snapToElements({ x: proposedX, y: proposedY, w: draggedEl.w, h: draggedEl.h }, others);
         setSnapGuides(result.guides);
 
-        setElements(prev => prev.map(el => el.id === dragging.id ? { ...el, x: result.x, y: result.y } : el));
+        updateCurrentDiagramNode(dragging.id, node => ({
+          ...node,
+          x: result.x,
+          y: result.y,
+        }));
       }
     } else if (panning) {
       setCamThrottled(p => ({ ...p, x: panning.cx + e.clientX - panning.sx, y: panning.cy + e.clientY - panning.sy }));
     } else {
-      if (selType === 'element' && selectedId) {
-        const selElHov = visibleElements.find(e => e.id === selectedId);
+      if (selType === 'element' && selectedNodeId) {
+        const selElHov = visibleDiagramElements.find(e => e.id === selectedNodeId);
         if (selElHov) {
           const handle = hitTestResizeHandle(selElHov, wx, wy);
           if (handle) {
@@ -1012,15 +1564,15 @@ export default function App() {
           }
         }
       }
-      const el = hitTestElement(visibleElements, wx, wy, getLayer, isNote);
+      const el = hitTestElement(visibleDiagramElements, wx, wy, getLayer, isNote);
       setHovElId(el?.id || null);
       if (!el) {
-        const rh = hitTestRelationship(visibleRelationships, visibleElements, wx, wy);
+        const rh = hitTestRelationship(visibleRelationships, visibleDiagramElements, wx, wy);
         setHovRelId(rh?.rel?.id || null);
       } else setHovRelId(null);
       canvas.style.cursor = 'default';
     }
-  }, [s2w, dragging, panning, visibleElements, visibleRelationships, visibleElementMap, drawingRel, dragWP, dragEndpoint, dragLabel, dragSegment, resizing, selType, selectedId, setCamThrottled]);
+  }, [s2w, dragging, panning, visibleDiagramElements, visibleRelationships, visibleElementMap, drawingRel, dragWP, dragEndpoint, dragLabel, dragSegment, resizing, selType, selectedNodeId, setCamThrottled, updateCurrentDiagramNode, updateCurrentDiagramConnection]);
 
   const handleMouseUp = useCallback((e: React.MouseEvent) => {
     if (drawingRel) {
@@ -1028,24 +1580,31 @@ export default function App() {
       if (!canvas) return;
       const rect = canvas.getBoundingClientRect();
       const { x: wx, y: wy } = s2w(e.clientX - rect.left, e.clientY - rect.top);
-      const tgt = hitTestElement(visibleElements, wx, wy, getLayer, isNote);
-      if (tgt && tgt.id !== drawingRel.sourceId) {
+      const tgt = hitTestElement(visibleDiagramElements, wx, wy, getLayer, isNote) as DiagramElementInstance | null;
+      if (tgt && tgt.id !== drawingRel.sourceNodeId) {
         relPickerWaypoints.current = drawingRel.waypoints;
-        setRelPicker({ sx: e.clientX - rect.left, sy: e.clientY - rect.top, srcId: drawingRel.sourceId, tgtId: tgt.id });
+        setRelPicker({
+          sx: e.clientX - rect.left,
+          sy: e.clientY - rect.top,
+          srcId: drawingRel.sourceId,
+          tgtId: tgt.elementId,
+          sourceNodeId: drawingRel.sourceNodeId,
+          targetNodeId: tgt.id,
+        });
       }
       setDrawingRel(null); return;
     }
 
     // Archi behavior: when dropping an element onto another element, offer to create a relationship
     if (dragging && !isViewMode) {
-      const draggedEl = visibleElements.find(el => el.id === dragging.id);
+      const draggedEl = visibleDiagramElements.find(el => el.id === dragging.id);
       if (draggedEl) {
         const canvas = canvasRef.current;
         if (canvas) {
           const rect = canvas.getBoundingClientRect();
           const sx = e.clientX - rect.left, sy = e.clientY - rect.top;
           // Find element under the center of the dragged element
-          const dropTarget = visibleElements.find(el => {
+          const dropTarget = visibleDiagramElements.find(el => {
             if (el.id === dragging.id) return false;
             return draggedEl.x + draggedEl.w / 2 >= el.x && draggedEl.x + draggedEl.w / 2 <= el.x + el.w &&
                    draggedEl.y + draggedEl.h / 2 >= el.y && draggedEl.y + draggedEl.h / 2 <= el.y + el.h;
@@ -1053,12 +1612,19 @@ export default function App() {
           // Only offer if no relationship already exists between the two
           if (dropTarget) {
             const alreadyConnected = relationships.some(r =>
-              (r.sourceId === dragging.id && r.targetId === dropTarget.id) ||
-              (r.sourceId === dropTarget.id && r.targetId === dragging.id)
+              (r.sourceId === draggedEl.elementId && r.targetId === dropTarget.elementId) ||
+              (r.sourceId === dropTarget.elementId && r.targetId === draggedEl.elementId)
             );
             if (!alreadyConnected) {
               relPickerWaypoints.current = [];
-              setRelPicker({ sx, sy, srcId: dragging.id, tgtId: dropTarget.id });
+              setRelPicker({
+                sx,
+                sy,
+                srcId: draggedEl.elementId,
+                tgtId: dropTarget.elementId,
+                sourceNodeId: draggedEl.id,
+                targetNodeId: dropTarget.id,
+              });
             }
           }
         }
@@ -1067,7 +1633,7 @@ export default function App() {
 
     setDragging(null); setPanning(null); setDragWP(null); setDragEndpoint(null); setDragLabel(null); setDragSegment(null); setResizing(null);
     setSnapGuides([]);
-  }, [drawingRel, dragging, s2w, visibleElements, relationships, isViewMode]);
+  }, [drawingRel, dragging, s2w, visibleDiagramElements, relationships, isViewMode]);
 
   const handleDblClick = useCallback((e: React.MouseEvent) => {
     const canvas = canvasRef.current;
@@ -1075,7 +1641,7 @@ export default function App() {
     const rect = canvas.getBoundingClientRect();
     const { x: wx, y: wy } = s2w(e.clientX - rect.left, e.clientY - rect.top);
 
-    const el = hitTestElement(visibleElements, wx, wy, getLayer, isNote);
+    const el = hitTestElement(visibleDiagramElements, wx, wy, getLayer, isNote) as DiagramElementInstance | null;
     if (el) {
       // View navigation always allowed
       if (el.linkedViewId) {
@@ -1084,22 +1650,25 @@ export default function App() {
       }
       // Inline editing only in edit mode
       if (!isViewMode) {
-        setEditingElId(el.id);
+        setEditingElId(el.elementId);
         setEditingName(el.name);
-        setSelectedId(el.id);
+        setSelectedNodeId(el.id);
+        setSelectedConnectionId(null);
+        setSelectedId(el.elementId);
         setSelType('element');
       }
       return;
     }
 
     if (!isViewMode) {
-      const rh = hitTestRelationship(visibleRelationships, visibleElements, wx, wy);
+      const rh = hitTestRelationship(visibleRelationships, visibleDiagramElements, wx, wy);
       if (rh) {
+        const relationshipId = (rh.rel as DiagramRelationshipInstance).relationshipId;
         const name = prompt('Relationship label:', rh.rel.name || '');
-        if (name !== null) { pushHistory(); setRelationships(prev => prev.map(r => r.id === rh.rel.id ? { ...r, name } : r)); }
+        if (name !== null) { pushHistory(); setRelationships(prev => prev.map(r => r.id === relationshipId ? { ...r, name } : r)); }
       }
     }
-  }, [s2w, visibleElements, visibleRelationships, navigateToView, isViewMode, pushHistory]);
+  }, [s2w, visibleDiagramElements, visibleRelationships, navigateToView, isViewMode, pushHistory]);
 
   const handleContextMenu = useCallback((e: React.MouseEvent) => {
     e.preventDefault();
@@ -1110,9 +1679,9 @@ export default function App() {
     const sx = e.clientX - rect.left, sy = e.clientY - rect.top;
     const { x: wx, y: wy } = s2w(sx, sy);
 
-    const el = hitTestElement(visibleElements, wx, wy, getLayer, isNote);
+    const el = hitTestElement(visibleDiagramElements, wx, wy, getLayer, isNote) as DiagramElementInstance | null;
     if (el) {
-      setSelectedId(el.id); setSelType('element');
+      setSelectedNodeId(el.id); setSelectedConnectionId(null); setSelectedId(el.elementId); setSelType('element');
       const elTypeDef = ELEMENT_TYPES[el.type];
 
       // Build "Change type" submenu grouped by layer
@@ -1143,13 +1712,13 @@ export default function App() {
             label: v.label,
             icon: k,
             iconColor: L?.accent || '#888',
-            action: () => { pushHistory(); setElements(prev => prev.map(e => e.id === el.id ? { ...e, type: k } : e)); },
+            action: () => { pushHistory(); setElements(prev => prev.map(e => e.id === el.elementId ? { ...e, type: k } : e)); },
           });
         }
       }
 
       const items: CtxMenuItem[] = [
-        { label: 'Rename', action: () => { setEditingElId(el.id); setEditingName(el.name); } },
+        { label: 'Rename', action: () => { setEditingElId(el.elementId); setEditingName(el.name); } },
         { label: 'Change type', children: changeTypeChildren },
         { label: '', separator: true },
         {
@@ -1157,7 +1726,7 @@ export default function App() {
           action: () => {
             pushHistory();
             const maxZ = Math.max(0, ...elements.map(e => e.zIndex ?? 0));
-            setElements(prev => prev.map(e => e.id === el.id ? { ...e, zIndex: maxZ + 1 } : e));
+            setElements(prev => prev.map(e => e.id === el.elementId ? { ...e, zIndex: maxZ + 1 } : e));
           },
         },
         {
@@ -1165,7 +1734,7 @@ export default function App() {
           action: () => {
             pushHistory();
             const minZ = Math.min(0, ...elements.map(e => e.zIndex ?? 0));
-            setElements(prev => prev.map(e => e.id === el.id ? { ...e, zIndex: minZ - 1 } : e));
+            setElements(prev => prev.map(e => e.id === el.elementId ? { ...e, zIndex: minZ - 1 } : e));
           },
         },
         { label: '', separator: true },
@@ -1174,12 +1743,15 @@ export default function App() {
           color: '#e07070',
           action: () => {
             pushHistory();
-            setElements(prev => prev.filter(e => e.id !== el.id));
-            setRelationships(prev => prev.filter(r => r.sourceId !== el.id && r.targetId !== el.id));
+            setElements(prev => prev.filter(e => e.id !== el.elementId));
+            setRelationships(prev => prev.filter(r => r.sourceId !== el.elementId && r.targetId !== el.elementId));
+            removeDiagramConnectionsForElement(el.elementId);
             setViews(prev => prev.map(view => ({
               ...view,
-              elementIds: (view.elementIds || []).filter(elementId => elementId !== el.id),
+              elementIds: (view.elementIds || []).filter(elementId => elementId !== el.elementId),
             })));
+            setSelectedNodeId(null);
+            setSelectedConnectionId(null);
             setSelectedId(null);
             setSelType(null);
           },
@@ -1190,16 +1762,64 @@ export default function App() {
       return;
     }
 
-    const rh = hitTestRelationship(visibleRelationships, visibleElements, wx, wy);
+    const rh = hitTestRelationship(visibleRelationships, visibleDiagramElements, wx, wy);
     if (rh) {
+      const relationshipId = (rh.rel as DiagramRelationshipInstance).relationshipId;
+      setSelectedNodeId(null);
+      setSelectedConnectionId(rh.rel.id);
+      setSelectedId(relationshipId);
+      setSelType('relationship');
       setCtxMenu({
         x: sx, y: sy,
         items: [
-          { label: 'Add waypoint here', action: () => { pushHistory(); setRelationships(prev => prev.map(r => { if (r.id !== rh.rel.id) return r; const wps = [...(r.waypoints || [])]; wps.splice(rh.segIdx, 0, { x: snap(wx), y: snap(wy) }); return { ...r, waypoints: wps }; })); } },
-          { label: 'Edit label', action: () => { pushHistory(); const name = prompt('Label:', rh.rel.name || ''); if (name !== null) setRelationships(prev => prev.map(r => r.id === rh.rel.id ? { ...r, name } : r)); } },
-          ...(rh.rel.waypoints?.length > 0 ? [{ label: 'Remove all waypoints', action: () => { pushHistory(); setRelationships(prev => prev.map(r => r.id === rh.rel.id ? { ...r, waypoints: [] } : r)); } }] : []),
-          ...((rh.rel.sourceAnchor || rh.rel.targetAnchor) ? [{ label: 'Reset endpoints to auto', action: () => { pushHistory(); setRelationships(prev => prev.map(r => r.id === rh.rel.id ? { ...r, sourceAnchor: undefined, targetAnchor: undefined } : r)); } }] : []),
-          { label: 'Delete relationship', color: '#e07070', action: () => { pushHistory(); setRelationships(prev => prev.filter(r => r.id !== rh.rel.id)); if (selectedId === rh.rel.id) { setSelectedId(null); setSelType(null); } } },
+          {
+            label: 'Add waypoint here',
+            action: () => {
+              pushHistory();
+              updateCurrentDiagramConnection(rh.rel.id, connection => {
+                const waypoints = [...(connection.waypoints || [])];
+                waypoints.splice(rh.segIdx, 0, { x: snap(wx), y: snap(wy) });
+                return { ...connection, waypoints, relativeBendpoints: undefined };
+              });
+            },
+          },
+          {
+            label: 'Edit label',
+            action: () => {
+              pushHistory();
+              const name = prompt('Label:', rh.rel.name || '');
+              if (name !== null) setRelationships(prev => prev.map(r => r.id === relationshipId ? { ...r, name } : r));
+            },
+          },
+          ...(rh.rel.waypoints?.length > 0 ? [{
+            label: 'Remove all waypoints',
+            action: () => {
+              pushHistory();
+              updateCurrentDiagramConnection(rh.rel.id, connection => ({ ...connection, waypoints: [], relativeBendpoints: undefined }));
+            },
+          }] : []),
+          ...((rh.rel.sourceAnchor || rh.rel.targetAnchor) ? [{
+            label: 'Reset endpoints to auto',
+            action: () => {
+              pushHistory();
+              setRelationships(prev => prev.map(r => r.id === relationshipId ? { ...r, sourceAnchor: undefined, targetAnchor: undefined } : r));
+            },
+          }] : []),
+          {
+            label: 'Delete relationship',
+            color: '#e07070',
+            action: () => {
+              pushHistory();
+              setRelationships(prev => prev.filter(r => r.id !== relationshipId));
+              removeDiagramConnectionsForRelationship(relationshipId);
+              if (selectedId === relationshipId) {
+                setSelectedNodeId(null);
+                setSelectedConnectionId(null);
+                setSelectedId(null);
+                setSelType(null);
+              }
+            },
+          },
         ],
       });
       return;
@@ -1207,9 +1827,24 @@ export default function App() {
 
     const wp = hitTestWaypoint(visibleRelationships, wx, wy);
     if (wp) {
-      setCtxMenu({ x: sx, y: sy, items: [{ label: 'Remove waypoint', color: '#e07070', action: () => { pushHistory(); setRelationships(prev => prev.map(r => r.id === wp.relId ? { ...r, waypoints: r.waypoints.filter((_, i) => i !== wp.wpIdx) } : r)); } }] });
+      setCtxMenu({
+        x: sx,
+        y: sy,
+        items: [{
+          label: 'Remove waypoint',
+          color: '#e07070',
+          action: () => {
+            pushHistory();
+            updateCurrentDiagramConnection(wp.relId, connection => ({
+              ...connection,
+              waypoints: connection.waypoints.filter((_, index) => index !== wp.wpIdx),
+              relativeBendpoints: undefined,
+            }));
+          },
+        }],
+      });
     }
-  }, [s2w, visibleElements, visibleRelationships, selectedId, pushHistory, elements, isViewMode]);
+  }, [s2w, visibleDiagramElements, visibleRelationships, selectedId, pushHistory, elements, isViewMode, updateCurrentDiagramConnection, removeDiagramConnectionsForRelationship, removeDiagramConnectionsForElement]);
 
   const handleWheel = useCallback((e: React.WheelEvent) => {
     e.preventDefault();
@@ -1251,13 +1886,26 @@ export default function App() {
       documentation: '',
     };
     setElements(prev => [...prev, el]);
+    appendCurrentDiagramNode({
+      id: `${currentViewId}::${el.id}`,
+      viewId: currentViewId,
+      elementId: el.id,
+      x: el.x,
+      y: el.y,
+      w: el.w,
+      h: el.h,
+      linkedViewId: el.linkedViewId,
+      zIndex: el.zIndex,
+      nestingDepth: el.zIndex ?? 0,
+      style: el.style,
+    });
     setViews(prev => prev.map(view =>
       view.id === currentViewId
         ? { ...view, elementIds: [...new Set([...(view.elementIds || []), el.id])] }
         : view,
     ));
-    setSelectedId(el.id); setSelType('element');
-  }, [s2w, cSize, currentViewId, pushHistory]);
+    setSelectedNodeId(`${currentViewId}::${el.id}`); setSelectedConnectionId(null); setSelectedId(el.id); setSelType('element');
+  }, [s2w, cSize, currentViewId, pushHistory, appendCurrentDiagramNode]);
 
   const addView = useCallback((name?: string, parentViewId?: string) => {
     pushHistory();
@@ -1282,7 +1930,7 @@ export default function App() {
     saveViewLayoutSnapshot(currentViewId);
     setCurrentViewId(newView.id);
     setOpenTabIds(prev => [...prev, newView.id]);
-    setSelectedId(null); setSelType(null);
+    setSelectedNodeId(null); setSelectedConnectionId(null); setSelectedId(null); setSelType(null);
   }, [pushHistory, currentViewId, saveViewLayoutSnapshot]);
 
   const renameView = useCallback((viewId: string, newName: string) => {
@@ -1297,18 +1945,21 @@ export default function App() {
     if (selType === 'element') {
       setElements(prev => prev.filter(e => e.id !== selectedId));
       setRelationships(prev => prev.filter(r => r.sourceId !== selectedId && r.targetId !== selectedId));
+      removeDiagramNodesForElement(selectedId);
+      removeDiagramConnectionsForElement(selectedId);
       setViews(prev => prev.map(view => ({
         ...view,
         elementIds: (view.elementIds || []).filter(elementId => elementId !== selectedId),
       })));
     } else {
       setRelationships(prev => prev.filter(r => r.id !== selectedId));
+      removeDiagramConnectionsForRelationship(selectedId);
     }
-    setSelectedId(null); setSelType(null);
-  }, [selectedId, selType, pushHistory]);
+    setSelectedNodeId(null); setSelectedConnectionId(null); setSelectedId(null); setSelType(null);
+  }, [selectedId, selType, pushHistory, removeDiagramNodesForElement, removeDiagramConnectionsForElement, removeDiagramConnectionsForRelationship]);
 
   const exportModel = useCallback(() => {
-    const result = exportEditorModelToText({ version: 'openarchi-0.1', elements, relationships, views }, selectedFormatId);
+    const result = exportEditorModelToText(buildEditorModelForExport(), selectedFormatId);
     const hasError = result.diagnostics.some(diagnostic => diagnostic.severity === 'error');
     if (hasError) {
       const firstError = result.diagnostics.find(diagnostic => diagnostic.severity === 'error');
@@ -1321,7 +1972,7 @@ export default function App() {
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a'); a.href = url; a.download = result.suggestedFileName; a.click();
     URL.revokeObjectURL(url);
-  }, [elements, relationships, views, selectedFormatId, summarizeDiagnostics]);
+  }, [buildEditorModelForExport, selectedFormatId, summarizeDiagnostics]);
 
   const importModel = useCallback(() => {
     const acceptedExtensions = Array.from(new Set(modelFormats.flatMap(format => format.extensions.map(extension => `.${extension}`))));
@@ -1352,8 +2003,14 @@ export default function App() {
         const importedLayouts = result.document
           ? buildLayoutsFromCanonicalDocument(result.document)
           : buildLayoutsFromEditorModel(result.model.elements, result.model.relationships, result.model.views);
+        const importedDiagramState = result.document
+          ? buildDiagramStateFromCanonicalDocument(result.document)
+          : buildDiagramStateFromEditorModel(result.model.elements, result.model.relationships, result.model.views);
         elementLayoutsByViewRef.current = importedLayouts.elementLayouts;
         relationshipLayoutsByViewRef.current = importedLayouts.relationshipLayouts;
+        diagramNodesByViewRef.current = importedDiagramState.diagramNodesByView;
+        diagramConnectionsByViewRef.current = importedDiagramState.diagramConnectionsByView;
+        fragmentedSourceDocumentRef.current = null;
 
         setElements(result.model.elements);
         setRelationships(result.model.relationships);
@@ -1363,7 +2020,7 @@ export default function App() {
           setOpenTabIds([result.model.views[0].id]);
           applyViewLayout(result.model.views[0].id);
         }
-        setSelectedId(null); setSelType(null);
+        setSelectedNodeId(null); setSelectedConnectionId(null); setSelectedId(null); setSelType(null);
         // Fit camera to imported content using layout-resolved positions
         const firstViewId = result.model.views[0]?.id;
         const layoutEls = firstViewId ? importedLayouts.elementLayouts[firstViewId] : null;
@@ -1404,8 +2061,14 @@ export default function App() {
       const importedLayouts = result.document
         ? buildLayoutsFromCanonicalDocument(result.document)
         : buildLayoutsFromEditorModel(result.model.elements, result.model.relationships, result.model.views);
+      const importedDiagramState = result.document
+        ? buildDiagramStateFromCanonicalDocument(result.document)
+        : buildDiagramStateFromEditorModel(result.model.elements, result.model.relationships, result.model.views);
       elementLayoutsByViewRef.current = importedLayouts.elementLayouts;
       relationshipLayoutsByViewRef.current = importedLayouts.relationshipLayouts;
+      diagramNodesByViewRef.current = importedDiagramState.diagramNodesByView;
+      diagramConnectionsByViewRef.current = importedDiagramState.diagramConnectionsByView;
+      fragmentedSourceDocumentRef.current = null;
 
       setElements(result.model.elements);
       setRelationships(result.model.relationships);
@@ -1415,7 +2078,7 @@ export default function App() {
         setOpenTabIds([result.model.views[0].id]);
         applyViewLayout(result.model.views[0].id);
       }
-      setSelectedId(null); setSelType(null);
+      setSelectedNodeId(null); setSelectedConnectionId(null); setSelectedId(null); setSelType(null);
 
       // Fit camera to imported content
       const firstViewId = result.model.views[0]?.id;
@@ -1456,8 +2119,14 @@ export default function App() {
         : result.document
           ? buildLayoutsFromCanonicalDocument(result.document)
           : buildLayoutsFromEditorModel(result.model.elements, result.model.relationships, result.model.views);
+      const importedDiagramState = result.document
+        ? buildDiagramStateFromCanonicalDocument(result.document)
+        : buildDiagramStateFromEditorModel(result.model.elements, result.model.relationships, result.model.views);
       elementLayoutsByViewRef.current = importedLayouts.elementLayouts;
       relationshipLayoutsByViewRef.current = importedLayouts.relationshipLayouts;
+      diagramNodesByViewRef.current = importedDiagramState.diagramNodesByView;
+      diagramConnectionsByViewRef.current = importedDiagramState.diagramConnectionsByView;
+      fragmentedSourceDocumentRef.current = result.document ?? null;
 
       setElements(result.model.elements);
       setRelationships(result.model.relationships);
@@ -1467,7 +2136,7 @@ export default function App() {
         setOpenTabIds([result.model.views[0].id]);
         applyViewLayout(result.model.views[0].id);
       }
-      setSelectedId(null); setSelType(null);
+      setSelectedNodeId(null); setSelectedConnectionId(null); setSelectedId(null); setSelType(null);
 
       // Show import summary as a temporary visible diagnostic
       const m = result.model;
@@ -1520,17 +2189,29 @@ export default function App() {
 
   const handleSave = useCallback(async () => {
     // Fragmented save (coArchi directory)
-    if (wsIsFragmented && workspace.directoryHandle) {
+    if (wsKind === 'coarchi-directory') {
+      if (!workspace.directoryHandle) {
+        alert('Saving a coArchi directory requires direct write access to the opened folder.');
+        return;
+      }
       try {
-        const result = exportFragmentedEditorModel({ version: 'openarchi-0.1', elements, relationships, views });
+        saveViewLayoutSnapshot(currentViewId);
+        const saveDocument = buildFragmentedSaveDocument();
+        const result = exportFragmentedEditorModel(
+          { version: 'openarchi-0.1', elements, relationships, views },
+          saveDocument ?? fragmentedSourceDocumentRef.current ?? undefined,
+          saveDocument ? undefined : elementLayoutsByViewRef.current,
+          saveDocument ? undefined : relationshipLayoutsByViewRef.current,
+        );
         const hasError = result.diagnostics.some(d => d.severity === 'error');
         if (hasError) {
           const firstError = result.diagnostics.find(d => d.severity === 'error');
           alert(firstError?.message || 'Save failed');
           return;
         }
-        await wsSaveFragmented(result.files);
-        showTransientDiagnostic(`Saved ${result.files.length} files to ${wsDirName}/`);
+        await wsSaveFragmented(result.files, result.deletedPaths || []);
+        fragmentedSourceDocumentRef.current = result.document ?? fragmentedSourceDocumentRef.current;
+        showTransientDiagnostic(`Saved ${result.files.length} files to ${wsDirName || 'workspace'}/`);
       } catch (err) {
         alert(`Save failed: ${err}`);
       }
@@ -1544,7 +2225,7 @@ export default function App() {
       exportModel();
       return;
     }
-    const result = exportEditorModelToText({ version: 'openarchi-0.1', elements, relationships, views }, wsFormat);
+    const result = exportEditorModelToText(buildEditorModelForExport(), wsFormat);
     const hasError = result.diagnostics.some(d => d.severity === 'error');
     if (hasError) {
       const firstError = result.diagnostics.find(d => d.severity === 'error');
@@ -1568,14 +2249,14 @@ export default function App() {
       URL.revokeObjectURL(url);
       markClean();
     }
-  }, [wsIsFragmented, workspace.directoryHandle, getActiveFile, wsFormat, wsDirName, elements, relationships, views, exportModel, wsSaveFile, wsSaveFragmented, markClean, showTransientDiagnostic]);
+  }, [wsKind, workspace.directoryHandle, getActiveFile, wsFormat, wsDirName, exportModel, wsSaveFile, wsSaveFragmented, markClean, showTransientDiagnostic, saveViewLayoutSnapshot, currentViewId, buildFragmentedSaveDocument, buildEditorModelForExport]);
 
   // Mark dirty on model changes (skip initial render)
   const isInitialRender = useRef(true);
   useEffect(() => {
     if (isInitialRender.current) { isInitialRender.current = false; return; }
-    if (wsActiveFilePath || wsIsFragmented) markDirty();
-  }, [elements, relationships, views, wsActiveFilePath, wsIsFragmented, markDirty]);
+    if (wsActiveFilePath || wsKind === 'coarchi-directory') markDirty();
+  }, [elements, relationships, views, diagramStateVersion, wsActiveFilePath, wsKind, markDirty]);
 
   // Keyboard
   const isTextInputActive = useCallback((): boolean => {
@@ -1616,25 +2297,49 @@ export default function App() {
   useEffect(() => {
     if (!selectedId) return;
     if (selType === 'element' && !visibleElementIds.has(selectedId)) {
+      setSelectedNodeId(null);
+      setSelectedConnectionId(null);
       setSelectedId(null);
       setSelType(null);
       return;
     }
+    if (selType === 'element' && selectedNodeId) {
+      const nodeStillVisible = visibleDiagramElements.some(element => element.id === selectedNodeId);
+      if (!nodeStillVisible) setSelectedNodeId(null);
+    }
     if (selType === 'relationship') {
-      const isVisible = visibleRelationships.some(relationship => relationship.id === selectedId);
+      const isVisible = selectedConnectionId
+        ? visibleRelationships.some(relationship => relationship.id === selectedConnectionId)
+        : visibleRelationships.some(relationship => relationship.relationshipId === selectedId);
       if (!isVisible) {
+        setSelectedNodeId(null);
+        setSelectedConnectionId(null);
         setSelectedId(null);
         setSelType(null);
       }
     }
-  }, [selectedId, selType, visibleElementIds, visibleRelationships]);
+  }, [selectedId, selectedNodeId, selectedConnectionId, selType, visibleElementIds, visibleDiagramElements, visibleRelationships]);
 
   // ==================== DERIVED STATE ====================
   const selEl = selType === 'element' ? elements.find(e => e.id === selectedId) || null : null;
-  const selRel = selType === 'relationship' ? relationships.find(r => r.id === selectedId) || null : null;
+  const semanticSelectedRelationship = selType === 'relationship' ? relationships.find(r => r.id === selectedId) || null : null;
+  const selectedDiagramRelationship = useMemo(
+    () => (selectedConnectionId ? visibleRelationships.find(relationship => relationship.id === selectedConnectionId) || null : null),
+    [selectedConnectionId, visibleRelationships],
+  );
+  const selRel = useMemo(() => {
+    if (!semanticSelectedRelationship) return null;
+    if (!selectedDiagramRelationship) return semanticSelectedRelationship;
+    return {
+      ...semanticSelectedRelationship,
+      waypoints: selectedDiagramRelationship.waypoints,
+      labelPos: selectedDiagramRelationship.labelPos,
+      relativeBendpoints: selectedDiagramRelationship.relativeBendpoints,
+    };
+  }, [semanticSelectedRelationship, selectedDiagramRelationship]);
 
   const propEditPushedRef = useRef(false);
-  useEffect(() => { propEditPushedRef.current = false; }, [selectedId]);
+  useEffect(() => { propEditPushedRef.current = false; }, [selectedId, selectedConnectionId]);
 
   const updEl = useCallback((k: string, v: unknown) => {
     if (!propEditPushedRef.current) { pushHistory(); propEditPushedRef.current = true; }
@@ -1643,8 +2348,15 @@ export default function App() {
 
   const updRel = useCallback((k: string, v: unknown) => {
     if (!propEditPushedRef.current) { pushHistory(); propEditPushedRef.current = true; }
+    if ((k === 'labelPos' || k === 'waypoints' || k === 'relativeBendpoints') && selectedConnectionId) {
+      updateCurrentDiagramConnection(selectedConnectionId, connection => ({
+        ...connection,
+        [k]: v,
+      }));
+      return;
+    }
     setRelationships(p => p.map(r => r.id === selectedId ? { ...r, [k]: v } : r));
-  }, [selectedId, pushHistory]);
+  }, [selectedId, selectedConnectionId, pushHistory, updateCurrentDiagramConnection]);
 
   // Position for inline editing overlay
   const editingEl = editingElId ? elements.find(e => e.id === editingElId) : null;
@@ -1720,7 +2432,7 @@ export default function App() {
                 if (state && state.activeFilePath) {
                   const entry = wsGetFile(state.activeFilePath);
                   if (entry) await loadFileEntry(entry);
-                } else if (state && state.isFragmented && state.files.length > 0) {
+                } else if (state && state.kind === 'coarchi-directory' && state.files.length > 0) {
                   await loadFragmentedModel(state.files);
                 }
               }}
@@ -2015,12 +2727,25 @@ export default function App() {
                   linkedViewId: viewId,
                 };
                 setElements(prev => [...prev, el]);
+                appendCurrentDiagramNode({
+                  id: `${currentViewId}::${el.id}`,
+                  viewId: currentViewId,
+                  elementId: el.id,
+                  x: el.x,
+                  y: el.y,
+                  w: el.w,
+                  h: el.h,
+                  linkedViewId: el.linkedViewId,
+                  zIndex: el.zIndex,
+                  nestingDepth: el.zIndex ?? 0,
+                  style: el.style,
+                });
                 setViews(prev => prev.map(v =>
                   v.id === currentViewId
                     ? { ...v, elementIds: [...new Set([...(v.elementIds || []), el.id])] }
                     : v,
                 ));
-                setSelectedId(el.id); setSelType('element');
+                setSelectedNodeId(`${currentViewId}::${el.id}`); setSelectedConnectionId(null); setSelectedId(el.id); setSelType('element');
               } catch { /* invalid drag data */ }
             }}
           />
@@ -2099,7 +2824,17 @@ export default function App() {
               y={Math.min(relPicker.sy, cSize.h - 420)}
               onSelect={t => {
                 pushHistory();
-                setRelationships(p => [...p, { id: uid(), type: t, sourceId: relPicker.srcId, targetId: relPicker.tgtId, name: '', waypoints: relPickerWaypoints.current, labelPos: 0.5 }]);
+                const relationshipId = uid();
+                setRelationships(p => [...p, { id: relationshipId, type: t, sourceId: relPicker.srcId, targetId: relPicker.tgtId, name: '', waypoints: relPickerWaypoints.current, labelPos: 0.5 }]);
+                appendCurrentDiagramConnection({
+                  id: `${currentViewId}::${relationshipId}`,
+                  viewId: currentViewId,
+                  relationshipId,
+                  sourceNodeId: relPicker.sourceNodeId,
+                  targetNodeId: relPicker.targetNodeId,
+                  waypoints: relPickerWaypoints.current,
+                  labelPos: 0.5,
+                });
                 relPickerWaypoints.current = [];
                 setRelPicker(null);
               }}
@@ -2114,10 +2849,14 @@ export default function App() {
               elements={elements}
               views={views}
               onSelectElement={id => {
+                setSelectedNodeId(null);
+                setSelectedConnectionId(null);
                 setSelectedId(id);
                 setSelType('element');
-                const inView = visibleElements.find(element => element.id === id);
-                const el = inView || elements.find(element => element.id === id);
+                const inView = visibleDiagramElements.find(element => element.elementId === id);
+                if (inView) setSelectedNodeId(inView.id);
+                const semanticInView = visibleElements.find(element => element.id === id);
+                const el = inView || semanticInView || elements.find(element => element.id === id);
                 if (el) setCam(p => ({ ...p, x: cSize.w / 2 - el.x * p.s, y: cSize.h / 2 - el.y * p.s }));
               }}
               onSelectView={id => navigateToView(id)}
@@ -2154,7 +2893,7 @@ export default function App() {
           onImport={importModel}
           onExport={exportModel}
           onSave={handleSave}
-          canSave={!!wsActiveFilePath || wsIsFragmented}
+          canSave={!!wsActiveFilePath || wsKind === 'coarchi-directory'}
           isDirty={isDirty}
           dirState={!!wsDirName}
           dirFiles={wsFiles}

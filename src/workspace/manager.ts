@@ -4,12 +4,13 @@ import {
   openDirectoryNative,
   openDirectoryFallback,
   rescanDirectory,
+  deleteFileAtPath,
   writeFileAtPath,
 } from '../io/filesystem';
 import { isFragmentedModelDirectory } from '../model/service';
 import { detectGitBranch } from './git';
 import { saveWorkspace, loadWorkspace, clearWorkspace } from './persistence';
-import type { WorkspaceState, WorkspaceMetadata } from './types';
+import type { WorkspaceState, WorkspaceMetadata, WorkspaceKind } from './types';
 import { INITIAL_WORKSPACE_STATE } from './types';
 
 export type WorkspaceListener = (state: WorkspaceState) => void;
@@ -53,6 +54,7 @@ export class WorkspaceManager {
     }
 
     const isFragmented = isFragmentedModelDirectory(dirState.files);
+    const kind: WorkspaceKind = isFragmented ? 'coarchi-directory' : null;
     const format = isFragmented ? 'coarchi-xml' : null;
 
     let gitBranch: string | null = null;
@@ -63,6 +65,7 @@ export class WorkspaceManager {
     this.update({
       directoryHandle: dirState.directoryHandle ?? null,
       directoryName: dirState.directoryName,
+      kind,
       files: dirState.files,
       isFragmented,
       format,
@@ -86,6 +89,7 @@ export class WorkspaceManager {
   setActiveFile(relativePath: string, format: string): void {
     this.update({
       activeFilePath: relativePath,
+      kind: 'single-file',
       format,
       isDirty: false,
     });
@@ -126,10 +130,17 @@ export class WorkspaceManager {
    * Write multiple files to the directory (fragmented save).
    * Requires a directory handle (File System Access API).
    */
-  async saveFragmented(files: { relativePath: string; content: string }[]): Promise<void> {
+  async saveFragmented(
+    files: { relativePath: string; content: string }[],
+    deletedPaths: string[] = [],
+  ): Promise<void> {
     const handle = this._state.directoryHandle;
     if (!handle) {
       throw new Error('No directory handle — cannot save fragmented model');
+    }
+
+    for (const path of deletedPaths) {
+      await deleteFileAtPath(handle, path);
     }
 
     for (const file of files) {
@@ -223,10 +234,13 @@ export class WorkspaceManager {
   ): Promise<{ state: WorkspaceState; permissionNeeded: false; directoryName: string | null }> {
     const dirState = await rescanDirectory(handle);
     const gitBranch = await detectGitBranch(handle);
+    const kind: WorkspaceKind = metadata.kind
+      ?? (metadata.isFragmented ? 'coarchi-directory' : metadata.activeFilePath ? 'single-file' : null);
 
     this.update({
       directoryHandle: handle,
       directoryName: dirState.directoryName,
+      kind,
       files: dirState.files,
       isFragmented: metadata.isFragmented,
       format: metadata.format,
@@ -268,10 +282,11 @@ export class WorkspaceManager {
   // ---------------------------------------------------------------------------
 
   private async persist(): Promise<void> {
-    const { directoryHandle, format, activeFilePath, isFragmented, directoryName } = this._state;
+    const { directoryHandle, kind, format, activeFilePath, isFragmented, directoryName } = this._state;
     if (!directoryHandle) return;
     try {
       await saveWorkspace(directoryHandle, {
+        kind,
         format,
         activeFilePath,
         isFragmented,

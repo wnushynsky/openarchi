@@ -28,6 +28,8 @@ export interface FragmentedSerializeResult {
   diagnostics: ModelDiagnostic[];
   /** Paths that should be removed (elements deleted from the model) */
   deletedPaths?: string[];
+  /** Canonical document used for the fragmented serialization */
+  document?: CanonicalModelDocument;
 }
 
 export interface ModelFormatAdapter {
@@ -61,4 +63,3 @@ export class AdapterRegistry {
     );
   }
 }
-

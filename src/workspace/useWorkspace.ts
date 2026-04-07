@@ -18,7 +18,10 @@ export interface UseWorkspaceReturn {
   /** Save content to the active single file */
   saveFile: (entry: OpenFileEntry, content: string) => Promise<void>;
   /** Save fragmented files to the directory */
-  saveFragmented: (files: { relativePath: string; content: string }[]) => Promise<void>;
+  saveFragmented: (
+    files: { relativePath: string; content: string }[],
+    deletedPaths?: string[],
+  ) => Promise<void>;
   /** Get a file entry by relative path */
   getFile: (relativePath: string) => OpenFileEntry | undefined;
   /** Get the currently active file entry */
@@ -100,8 +103,11 @@ export function useWorkspace(): UseWorkspaceReturn {
     await manager.saveFile(entry, content);
   }, [manager]);
 
-  const saveFragmented = useCallback(async (files: { relativePath: string; content: string }[]) => {
-    await manager.saveFragmented(files);
+  const saveFragmented = useCallback(async (
+    files: { relativePath: string; content: string }[],
+    deletedPaths: string[] = [],
+  ) => {
+    await manager.saveFragmented(files, deletedPaths);
   }, [manager]);
 
   const getFile = useCallback((relativePath: string) => {

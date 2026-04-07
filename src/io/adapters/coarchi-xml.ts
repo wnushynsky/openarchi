@@ -2,6 +2,8 @@ import { ELEMENT_TYPES, RELATIONSHIP_TYPES } from '../../core';
 import type {
   CanonicalElement,
   CanonicalModelDocument,
+  CoArchiFolderEntry,
+  CoArchiMetadata,
   CanonicalRelationship,
   CanonicalView,
   CanonicalViewConnection,
@@ -325,6 +327,8 @@ interface PendingConnection {
   id: string;
   viewId: string;
   relationshipId: string;
+  sourceNodeId?: string;
+  targetNodeId?: string;
   rawBendpoints: RawBendpoint[];
   labelPosition: number;
   style?: import('../../model/canonical').DiagramStyle;
@@ -415,6 +419,8 @@ function walkViewChildren(
           id: connId,
           viewId: ctx.viewId,
           relationshipId: relId,
+          sourceNodeId: getAttr(child, ['source', 'sourceRef']),
+          targetNodeId: getAttr(child, ['target', 'targetRef']),
           rawBendpoints: parseRawBendpoints(child),
           labelPosition: asNumber(getAttr(child, ['labelPos', 'labelPosition'])) ?? 0.5,
           style,
@@ -546,6 +552,8 @@ function walkViewChildren(
           id: connId,
           viewId: ctx.viewId,
           relationshipId: relId,
+          sourceNodeId: getAttr(conn, ['source', 'sourceRef']),
+          targetNodeId: getAttr(conn, ['target', 'targetRef']),
           rawBendpoints: parseRawBendpoints(conn),
           labelPosition: asNumber(getAttr(conn, ['labelPos', 'labelPosition'])) ?? 0.5,
           style: parseStyle(conn),
@@ -560,22 +568,25 @@ function walkViewChildren(
 function resolvePendingViewConnections(ctx: ViewWalkContext): void {
   // Pre-build lookup maps to avoid O(n) .find() per connection
   const relById = new Map(ctx.relationships.map(r => [r.id, r]));
+  const nodeById = new Map<string, CanonicalViewNode>();
   const nodeByElementId = new Map<string, CanonicalViewNode>();
   for (const vn of ctx.viewNodes) {
-    if (vn.viewId === ctx.viewId && !nodeByElementId.has(vn.elementId)) {
-      nodeByElementId.set(vn.elementId, vn);
-    }
+    if (vn.viewId !== ctx.viewId) continue;
+    nodeById.set(vn.id, vn);
+    if (!nodeByElementId.has(vn.elementId)) nodeByElementId.set(vn.elementId, vn);
   }
 
   for (const conn of ctx.pendingConnections) {
     const rel = relById.get(conn.relationshipId);
     let sourceCenter: { x: number; y: number } | null = null;
     let targetCenter: { x: number; y: number } | null = null;
+    const srcNode = conn.sourceNodeId ? nodeById.get(conn.sourceNodeId) : undefined;
+    const tgtNode = conn.targetNodeId ? nodeById.get(conn.targetNodeId) : undefined;
+    const resolvedSourceNode = srcNode || (rel ? nodeByElementId.get(rel.sourceId) : undefined);
+    const resolvedTargetNode = tgtNode || (rel ? nodeByElementId.get(rel.targetId) : undefined);
     if (rel) {
-      const srcNode = nodeByElementId.get(rel.sourceId);
-      const tgtNode = nodeByElementId.get(rel.targetId);
-      if (srcNode) sourceCenter = { x: srcNode.x + srcNode.width / 2, y: srcNode.y + srcNode.height / 2 };
-      if (tgtNode) targetCenter = { x: tgtNode.x + tgtNode.width / 2, y: tgtNode.y + tgtNode.height / 2 };
+      if (resolvedSourceNode) sourceCenter = { x: resolvedSourceNode.x + resolvedSourceNode.width / 2, y: resolvedSourceNode.y + resolvedSourceNode.height / 2 };
+      if (resolvedTargetNode) targetCenter = { x: resolvedTargetNode.x + resolvedTargetNode.width / 2, y: resolvedTargetNode.y + resolvedTargetNode.height / 2 };
     }
 
     // Preserve raw relative bendpoints for dynamic resolution during drags
@@ -587,6 +598,8 @@ function resolvePendingViewConnections(ctx: ViewWalkContext): void {
       id: conn.id,
       viewId: conn.viewId,
       relationshipId: conn.relationshipId,
+      sourceNodeId: resolvedSourceNode?.id || conn.sourceNodeId,
+      targetNodeId: resolvedTargetNode?.id || conn.targetNodeId,
       waypoints: resolveBendpoints(conn.rawBendpoints, sourceCenter, targetCenter),
       labelPosition: conn.labelPosition,
       style: conn.style,
@@ -852,6 +865,7 @@ function finalizeCoArchiModel(
   viewNodes: CanonicalViewNode[],
   viewConnections: CanonicalViewConnection[],
   diagnostics: ModelDiagnostic[],
+  coArchiMetadata?: CoArchiMetadata,
 ): ParseResult {
   if (views.length === 0) {
     views.push({ id: 'v1', name: 'Imported View', childViewIds: [] });
@@ -951,10 +965,68 @@ function finalizeCoArchiModel(
     viewConnections,
     metadata: {
       sourceFormat: 'coarchi-xml',
+      ...(coArchiMetadata ? { coArchi: coArchiMetadata } : {}),
     },
   };
 
   return { model, diagnostics };
+}
+
+interface ParsedCoArchiFolderInfo {
+  root?: {
+    path: string;
+    modelName?: string;
+    modelId?: string;
+    modelVersion?: string;
+    modelPurpose?: string;
+  };
+  folder?: CoArchiFolderEntry;
+}
+
+function parseCoArchiFolderInfo(doc: Document, path: string): ParsedCoArchiFolderInfo | null {
+  const root = doc.documentElement;
+  if (!root) return null;
+
+  const tag = localName(root).toLowerCase();
+  if (tag === 'model') {
+    let purpose = '';
+    for (const child of Array.from(root.children)) {
+      if (localName(child).toLowerCase() === 'purpose') {
+        purpose = child.textContent?.trim() || '';
+        break;
+      }
+    }
+    return {
+      root: {
+        path,
+        modelName: getName(root) || undefined,
+        modelId: getAttr(root, ['identifier', 'id']),
+        modelVersion: getAttr(root, ['version']),
+        modelPurpose: purpose || undefined,
+      },
+    };
+  }
+
+  if (tag === 'folder') {
+    return {
+      folder: {
+        path,
+        name: getName(root) || undefined,
+        id: getAttr(root, ['identifier', 'id']),
+        type: getAttr(root, ['type']),
+      },
+    };
+  }
+
+  return null;
+}
+
+function dedupeFolderEntries(folders: CoArchiFolderEntry[]): CoArchiFolderEntry[] {
+  const byPath = new Map<string, CoArchiFolderEntry>();
+  for (const folder of folders) {
+    if (!byPath.has(folder.path)) byPath.set(folder.path, folder);
+  }
+  return [...byPath.values()];
 }
 
 /**
@@ -979,6 +1051,8 @@ export function parseCoArchiFragments(xmlContents: string[], filePaths?: string[
   const allViews: CanonicalView[] = [];
   const allViewNodes: CanonicalViewNode[] = [];
   const allViewConnections: CanonicalViewConnection[] = [];
+  const coArchiFolders: CoArchiFolderEntry[] = [];
+  let coArchiRoot: CoArchiMetadata | undefined;
 
   const elementIds = new Set<string>();
   const relationshipIds = new Set<string>();
@@ -991,7 +1065,6 @@ export function parseCoArchiFragments(xmlContents: string[], filePaths?: string[
   // fully known before views reference them via walkViewChildren.
 
   // Collect parsed documents and deferred view candidates
-  const parsedDocs: Document[] = [];
   const deferredViews: { doc: Document; node: Element; id: string; path?: string }[] = [];
   let skippedRelCount = 0;
   const skippedRelSample: { id: string; tag: string; sourceId: string; targetId: string; attrs: string }[] = [];
@@ -1001,7 +1074,23 @@ export function parseCoArchiFragments(xmlContents: string[], filePaths?: string[
     const raw = xmlContents[fileIdx];
     const doc = new DOMParser().parseFromString(raw, 'application/xml');
     if (doc.querySelector('parsererror')) continue;
-    parsedDocs.push(doc);
+    const path = filePaths?.[fileIdx];
+
+    if (path && path.toLowerCase().endsWith('folder.xml')) {
+      const folderInfo = parseCoArchiFolderInfo(doc, path);
+      if (folderInfo?.root) {
+        coArchiRoot = {
+          ...coArchiRoot,
+          rootFilePath: folderInfo.root.path,
+          modelName: folderInfo.root.modelName,
+          modelId: folderInfo.root.modelId,
+          modelVersion: folderInfo.root.modelVersion,
+          modelPurpose: folderInfo.root.modelPurpose,
+        };
+      } else if (folderInfo?.folder) {
+        coArchiFolders.push(folderInfo.folder);
+      }
+    }
 
     const allNodes = Array.from(doc.querySelectorAll('*'));
 
@@ -1048,6 +1137,7 @@ export function parseCoArchiFragments(xmlContents: string[], filePaths?: string[
           sourceId,
           targetId,
           name: getName(node),
+          sourcePath: path,
         });
         relationshipIds.add(id);
         continue;
@@ -1077,6 +1167,7 @@ export function parseCoArchiFragments(xmlContents: string[], filePaths?: string[
         type: mappedType,
         name: getName(node) || id,
         documentation: getDocumentation(node),
+        sourcePath: path,
       });
       elementIds.add(id);
     }
@@ -1098,11 +1189,12 @@ export function parseCoArchiFragments(xmlContents: string[], filePaths?: string[
     viewNameById.set(dv.id, getName(dv.node) || dv.id);
   }
 
-  for (const { node, id } of deferredViews) {
+  for (const { node, id, path } of deferredViews) {
     allViews.push({
       id,
       name: getName(node) || id,
       childViewIds: [],
+      sourcePath: path,
     });
 
     const walkCtx: ViewWalkContext = {
@@ -1186,7 +1278,18 @@ export function parseCoArchiFragments(xmlContents: string[], filePaths?: string[
     });
   }
 
-  return finalizeCoArchiModel(allElements, allRelationships, allViews, allViewNodes, allViewConnections, diagnostics);
+  return finalizeCoArchiModel(
+    allElements,
+    allRelationships,
+    allViews,
+    allViewNodes,
+    allViewConnections,
+    diagnostics,
+    {
+      ...coArchiRoot,
+      folders: dedupeFolderEntries(coArchiFolders),
+    },
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -1222,6 +1325,8 @@ export async function parseCoArchiFragmentsStreaming(
   const allViews: CanonicalView[] = [];
   const allViewNodes: CanonicalViewNode[] = [];
   const allViewConnections: CanonicalViewConnection[] = [];
+  const coArchiFolders: CoArchiFolderEntry[] = [];
+  let coArchiRoot: CoArchiMetadata | undefined;
 
   const elementIds = new Set<string>();
   const relationshipIds = new Set<string>();
@@ -1241,6 +1346,22 @@ export async function parseCoArchiFragmentsStreaming(
 
     const doc = new DOMParser().parseFromString(content, 'application/xml');
     if (doc.querySelector('parsererror')) continue;
+
+    if (path.toLowerCase().endsWith('folder.xml')) {
+      const folderInfo = parseCoArchiFolderInfo(doc, path);
+      if (folderInfo?.root) {
+        coArchiRoot = {
+          ...coArchiRoot,
+          rootFilePath: folderInfo.root.path,
+          modelName: folderInfo.root.modelName,
+          modelId: folderInfo.root.modelId,
+          modelVersion: folderInfo.root.modelVersion,
+          modelPurpose: folderInfo.root.modelPurpose,
+        };
+      } else if (folderInfo?.folder) {
+        coArchiFolders.push(folderInfo.folder);
+      }
+    }
 
     const allNodes = Array.from(doc.querySelectorAll('*'));
 
@@ -1282,6 +1403,7 @@ export async function parseCoArchiFragmentsStreaming(
           sourceId,
           targetId,
           name: getName(node),
+          sourcePath: path,
         });
         relationshipIds.add(id);
         continue;
@@ -1311,6 +1433,7 @@ export async function parseCoArchiFragmentsStreaming(
         type: mappedType,
         name: getName(node) || id,
         documentation: getDocumentation(node),
+        sourcePath: path,
       });
       elementIds.add(id);
     }
@@ -1347,6 +1470,7 @@ export async function parseCoArchiFragmentsStreaming(
       id: dv.id,
       name: dv.name,
       childViewIds: [],
+      sourcePath: dv.path,
     });
 
     // Re-parse just this view's XML
@@ -1440,7 +1564,18 @@ export async function parseCoArchiFragmentsStreaming(
 
   onProgress?.('Finalizing', 1, 1);
 
-  return finalizeCoArchiModel(allElements, allRelationships, allViews, allViewNodes, allViewConnections, diagnostics);
+  return finalizeCoArchiModel(
+    allElements,
+    allRelationships,
+    allViews,
+    allViewNodes,
+    allViewConnections,
+    diagnostics,
+    {
+      ...coArchiRoot,
+      folders: dedupeFolderEntries(coArchiFolders),
+    },
+  );
 }
 
 function serializeCoArchiXml(model: CanonicalModelDocument): SerializeResult {
@@ -1525,6 +1660,49 @@ function styleAttrs(style: import('../../model/canonical').DiagramStyle | undefi
   return attrs;
 }
 
+function getDirName(path: string): string {
+  const slash = path.lastIndexOf('/');
+  return slash >= 0 ? path.slice(0, slash) : '';
+}
+
+function getRootModelFilePath(model: CanonicalModelDocument): string {
+  return model.metadata?.coArchi?.rootFilePath || 'model/folder.xml';
+}
+
+function getDefaultFolderXmlPath(model: CanonicalModelDocument, folderName: string): string {
+  const rootDir = getDirName(getRootModelFilePath(model)) || 'model';
+  return `${rootDir}/${folderName}/folder.xml`;
+}
+
+function getFolderEntryMaps(model: CanonicalModelDocument): {
+  byPath: Map<string, CoArchiFolderEntry>;
+  byType: Map<string, CoArchiFolderEntry>;
+} {
+  const byPath = new Map<string, CoArchiFolderEntry>();
+  const byType = new Map<string, CoArchiFolderEntry>();
+  for (const folder of model.metadata?.coArchi?.folders || []) {
+    if (!byPath.has(folder.path)) byPath.set(folder.path, folder);
+    if (folder.type && !byType.has(folder.type)) byType.set(folder.type, folder);
+  }
+  return { byPath, byType };
+}
+
+function buildFolderEntry(
+  folderXmlPath: string,
+  defaults: { name: string; id: string; type: string },
+  folderByPath: Map<string, CoArchiFolderEntry>,
+  folderByType: Map<string, CoArchiFolderEntry>,
+): CoArchiFolderEntry {
+  return folderByPath.get(folderXmlPath)
+    || folderByType.get(defaults.type)
+    || {
+      path: folderXmlPath,
+      name: defaults.name,
+      id: defaults.id,
+      type: defaults.type,
+    };
+}
+
 /**
  * Serialize a CanonicalModelDocument into the GRAFICO fragmented directory format.
  * Returns a list of { relativePath, content } pairs to be written to disk.
@@ -1532,16 +1710,20 @@ function styleAttrs(style: import('../../model/canonical').DiagramStyle | undefi
 export function serializeCoArchiFragmented(model: CanonicalModelDocument): import('../adapter').FragmentedSerializeResult {
   const files: { relativePath: string; content: string }[] = [];
   const diagnostics: import('../../model/diagnostics').ModelDiagnostic[] = [];
+  const requiredFolders = new Map<string, CoArchiFolderEntry>();
+  const { byPath: folderByPath, byType: folderByType } = getFolderEntryMaps(model);
+  const rootFilePath = getRootModelFilePath(model);
+  const rootMeta = model.metadata?.coArchi;
 
   // Root folder.xml
   files.push({
-    relativePath: 'model/folder.xml',
+    relativePath: rootFilePath,
     content: XML_HEADER +
       `<archimate:model xmlns:archimate="${ARCHIMATE_NS}"\n` +
-      `    name="OpenArchi Model"\n` +
-      `    id="model-root"\n` +
-      `    version="5.0.0">\n` +
-      `  <purpose></purpose>\n` +
+      `    name="${escapeXml(rootMeta?.modelName || 'OpenArchi Model')}"\n` +
+      `    id="${escapeXml(rootMeta?.modelId || 'model-root')}"\n` +
+      `    version="${escapeXml(rootMeta?.modelVersion || '5.0.0')}">\n` +
+      `  <purpose>${escapeXml(rootMeta?.modelPurpose || '')}</purpose>\n` +
       `</archimate:model>\n`,
   });
 
@@ -1566,22 +1748,28 @@ export function serializeCoArchiFragmented(model: CanonicalModelDocument): impor
     composite: 'other',
   };
 
+  function registerFolder(folderXmlPath: string, defaults: { name: string; id: string; type: string }): void {
+    if (requiredFolders.has(folderXmlPath)) return;
+    requiredFolders.set(folderXmlPath, buildFolderEntry(folderXmlPath, defaults, folderByPath, folderByType));
+  }
+
   for (const [layer, elements] of elementsByLayer) {
     const folder = layerFolderMap[layer] ?? 'other';
-
-    // folder.xml for the layer
-    files.push({
-      relativePath: `model/${folder}/folder.xml`,
-      content: XML_HEADER +
-        `<archimate:Folder xmlns:archimate="${ARCHIMATE_NS}"\n` +
-        `    name="${escapeXml(toPascalCase(layer))}"\n` +
-        `    id="folder-${folder}"\n` +
-        `    type="${folder}">\n` +
-        `</archimate:Folder>\n`,
+    const defaultFolderXmlPath = getDefaultFolderXmlPath(model, folder);
+    registerFolder(defaultFolderXmlPath, {
+      name: toPascalCase(layer),
+      id: `folder-${folder}`,
+      type: folder,
     });
 
     for (const el of elements) {
       const tag = elementTypeToXmlTag(el.type);
+      const elementPath = el.sourcePath || `${getDirName(defaultFolderXmlPath)}/${tag}_${el.id}.xml`;
+      registerFolder(`${getDirName(elementPath)}/folder.xml`, {
+        name: toPascalCase(layer),
+        id: `folder-${folder}`,
+        type: folder,
+      });
       let xml = XML_HEADER +
         `<archimate:${tag} xmlns:archimate="${ARCHIMATE_NS}"\n` +
         `    name="${escapeXml(el.name)}"\n` +
@@ -1600,7 +1788,7 @@ export function serializeCoArchiFragmented(model: CanonicalModelDocument): impor
       }
 
       files.push({
-        relativePath: `model/${folder}/${tag}_${el.id}.xml`,
+        relativePath: elementPath,
         content: xml,
       });
     }
@@ -1608,18 +1796,21 @@ export function serializeCoArchiFragmented(model: CanonicalModelDocument): impor
 
   // Relations folder
   if (model.relationships.length > 0) {
-    files.push({
-      relativePath: 'model/relations/folder.xml',
-      content: XML_HEADER +
-        `<archimate:Folder xmlns:archimate="${ARCHIMATE_NS}"\n` +
-        `    name="Relations"\n` +
-        `    id="folder-relations"\n` +
-        `    type="relations">\n` +
-        `</archimate:Folder>\n`,
+    const defaultRelationsFolderPath = getDefaultFolderXmlPath(model, 'relations');
+    registerFolder(defaultRelationsFolderPath, {
+      name: 'Relations',
+      id: 'folder-relations',
+      type: 'relations',
     });
 
     for (const rel of model.relationships) {
       const tag = relationshipTypeToXmlTag(rel.type);
+      const relationPath = rel.sourcePath || `${getDirName(defaultRelationsFolderPath)}/${tag}_${rel.id}.xml`;
+      registerFolder(`${getDirName(relationPath)}/folder.xml`, {
+        name: 'Relations',
+        id: 'folder-relations',
+        type: 'relations',
+      });
       let xml = XML_HEADER +
         `<archimate:${tag} xmlns:archimate="${ARCHIMATE_NS}"\n` +
         `    name="${escapeXml(rel.name)}"\n` +
@@ -1630,7 +1821,7 @@ export function serializeCoArchiFragmented(model: CanonicalModelDocument): impor
       xml += `/>\n`;
 
       files.push({
-        relativePath: `model/relations/${tag}_${rel.id}.xml`,
+        relativePath: relationPath,
         content: xml,
       });
     }
@@ -1638,17 +1829,20 @@ export function serializeCoArchiFragmented(model: CanonicalModelDocument): impor
 
   // Views folder
   if (model.views.length > 0) {
-    files.push({
-      relativePath: 'model/views/folder.xml',
-      content: XML_HEADER +
-        `<archimate:Folder xmlns:archimate="${ARCHIMATE_NS}"\n` +
-        `    name="Views"\n` +
-        `    id="folder-views"\n` +
-        `    type="diagrams">\n` +
-        `</archimate:Folder>\n`,
+    const defaultViewsFolderPath = getDefaultFolderXmlPath(model, 'views');
+    registerFolder(defaultViewsFolderPath, {
+      name: 'Views',
+      id: 'folder-views',
+      type: 'diagrams',
     });
 
     for (const view of model.views) {
+      const viewPath = view.sourcePath || `${getDirName(defaultViewsFolderPath)}/${view.id}.xml`;
+      registerFolder(`${getDirName(viewPath)}/folder.xml`, {
+        name: 'Views',
+        id: 'folder-views',
+        type: 'diagrams',
+      });
       const viewNodes = model.viewNodes.filter(vn => vn.viewId === view.id);
       const viewConnections = model.viewConnections.filter(vc => vc.viewId === view.id);
 
@@ -1661,13 +1855,16 @@ export function serializeCoArchiFragmented(model: CanonicalModelDocument): impor
       }
 
       // Build connection lookup by source element
-      const connectionsBySource = new Map<string, typeof viewConnections>();
+      const connectionsBySourceNodeId = new Map<string, typeof viewConnections>();
       for (const vc of viewConnections) {
-        const rel = model.relationships.find(r => r.id === vc.relationshipId);
-        if (rel) {
-          if (!connectionsBySource.has(rel.sourceId)) connectionsBySource.set(rel.sourceId, []);
-          connectionsBySource.get(rel.sourceId)!.push(vc);
-        }
+        const sourceNodeId = vc.sourceNodeId
+          || viewNodes.find(vn => {
+            const rel = model.relationships.find(r => r.id === vc.relationshipId);
+            return vn.elementId === rel?.sourceId;
+          })?.id;
+        if (!sourceNodeId) continue;
+        if (!connectionsBySourceNodeId.has(sourceNodeId)) connectionsBySourceNodeId.set(sourceNodeId, []);
+        connectionsBySourceNodeId.get(sourceNodeId)!.push(vc);
       }
 
       function serializeViewNode(vn: CanonicalViewNode, indent: string): string {
@@ -1702,7 +1899,7 @@ export function serializeCoArchiFragmented(model: CanonicalModelDocument): impor
         // Children of this node
         const nestedChildren = childrenByParent.get(vn.id) ?? [];
         // Source connections from this node's element
-        const nodeConnections = connectionsBySource.get(vn.elementId) ?? [];
+        const nodeConnections = connectionsBySourceNodeId.get(vn.id) ?? [];
 
         const hasChildren = nestedChildren.length > 0 || nodeConnections.length > 0;
 
@@ -1731,8 +1928,10 @@ export function serializeCoArchiFragmented(model: CanonicalModelDocument): impor
         let line = `${indent}<sourceConnections xsi:type="archimate:DiagramModelArchimateConnection"`;
         line += ` id="${escapeXml(vc.id)}"`;
         // Source and target diagram node references
-        const srcNode = viewNodes.find(vn => vn.elementId === rel?.sourceId);
-        const tgtNode = viewNodes.find(vn => vn.elementId === rel?.targetId);
+        const srcNode = (vc.sourceNodeId && viewNodes.find(vn => vn.id === vc.sourceNodeId))
+          || viewNodes.find(vn => vn.elementId === rel?.sourceId);
+        const tgtNode = (vc.targetNodeId && viewNodes.find(vn => vn.id === vc.targetNodeId))
+          || viewNodes.find(vn => vn.elementId === rel?.targetId);
         if (srcNode) line += ` source="${escapeXml(srcNode.id)}"`;
         if (tgtNode) line += ` target="${escapeXml(tgtNode.id)}"`;
         line += ` archimateRelationship="${escapeXml(vc.relationshipId)}"`;
@@ -1769,13 +1968,27 @@ export function serializeCoArchiFragmented(model: CanonicalModelDocument): impor
       xml += `</archimate:ArchimateDiagramModel>\n`;
 
       files.push({
-        relativePath: `model/views/${view.id}.xml`,
+        relativePath: viewPath,
         content: xml,
       });
     }
   }
 
-  return { files, diagnostics };
+  for (const folder of [...requiredFolders.values()].sort((a, b) => a.path.localeCompare(b.path))) {
+    files.push({
+      relativePath: folder.path,
+      content: XML_HEADER +
+        `<archimate:Folder xmlns:archimate="${ARCHIMATE_NS}"\n` +
+        `    name="${escapeXml(folder.name || 'Folder')}"\n` +
+        `    id="${escapeXml(folder.id || `folder-${folder.type || 'default'}`)}"\n` +
+        (folder.type ? `    type="${escapeXml(folder.type)}">\n` : '>\n') +
+        `</archimate:Folder>\n`,
+    });
+  }
+
+  files.sort((a, b) => a.relativePath.localeCompare(b.relativePath));
+
+  return { files, diagnostics, document: model };
 }
 
 export const coArchiXmlAdapter: ModelFormatAdapter = {

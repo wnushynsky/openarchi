@@ -6,7 +6,12 @@ import { coArchiXmlAdapter, parseCoArchiFragmentsStreaming, serializeCoArchiFrag
 import type { ProgressCallback } from '../io/adapters/coarchi-xml';
 import { archiMateExchangeXmlAdapter } from '../io/adapters/archimate-exchange-xml';
 import { canonicalToEditorModel, canonicalToEditorModelWithLayouts, editorToCanonicalModel } from './mapper';
-import type { ElementLayoutsByView, RelationshipLayoutsByView } from './mapper';
+import type {
+  ElementLayoutsByView,
+  RelationshipLayoutsByView,
+  ElementViewLayout,
+  RelationshipViewLayout,
+} from './mapper';
 import { hasDiagnosticErrors, type ModelDiagnostic } from './diagnostics';
 import type { CanonicalModelDocument } from './canonical';
 import type { OpenFileEntry } from '../io/filesystem';
@@ -31,6 +36,208 @@ export interface ModelExportResult {
   mimeType: string;
   suggestedFileName: string;
   diagnostics: ModelDiagnostic[];
+}
+
+function mergeEditorModelIntoCanonical(
+  model: OpenArchiModel,
+  baseDocument?: CanonicalModelDocument,
+): CanonicalModelDocument {
+  const canonical = editorToCanonicalModel(model);
+  if (!baseDocument) return canonical;
+
+  const elementById = new Map(baseDocument.elements.map(element => [element.id, element]));
+  const relationshipById = new Map(baseDocument.relationships.map(relationship => [relationship.id, relationship]));
+  const viewById = new Map(baseDocument.views.map(view => [view.id, view]));
+
+  canonical.elements = canonical.elements.map(element => ({
+    ...element,
+    sourcePath: elementById.get(element.id)?.sourcePath,
+  }));
+
+  canonical.relationships = canonical.relationships.map(relationship => ({
+    ...relationship,
+    sourcePath: relationshipById.get(relationship.id)?.sourcePath,
+  }));
+
+  canonical.views = canonical.views.map(view => ({
+    ...view,
+    sourcePath: viewById.get(view.id)?.sourcePath,
+  }));
+
+  canonical.metadata = {
+    ...(baseDocument.metadata || {}),
+    ...(canonical.metadata || {}),
+    sourceFormat: baseDocument.metadata?.sourceFormat || canonical.metadata?.sourceFormat,
+    coArchi: baseDocument.metadata?.coArchi,
+  };
+
+  return canonical;
+}
+
+function collectDeletedFragmentPaths(
+  previous: { id: string; sourcePath?: string }[],
+  nextIds: Set<string>,
+): string[] {
+  return previous
+    .filter(entry => !!entry.sourcePath && !nextIds.has(entry.id))
+    .map(entry => entry.sourcePath!)
+    .sort((a, b) => a.localeCompare(b));
+}
+
+function fallbackElementLayout(
+  model: OpenArchiModel,
+  viewId: string,
+  elementId: string,
+): ElementViewLayout | undefined {
+  const view = model.views.find(candidate => candidate.id === viewId);
+  if (!view?.elementIds.includes(elementId)) return undefined;
+  const element = model.elements.find(candidate => candidate.id === elementId);
+  if (!element) return undefined;
+  return {
+    x: element.x,
+    y: element.y,
+    w: element.w,
+    h: element.h,
+    linkedViewId: element.linkedViewId,
+    zIndex: element.zIndex,
+    style: element.style,
+  };
+}
+
+function fallbackRelationshipLayout(
+  model: OpenArchiModel,
+  viewId: string,
+  relationshipId: string,
+): RelationshipViewLayout | undefined {
+  const view = model.views.find(candidate => candidate.id === viewId);
+  const relationship = model.relationships.find(candidate => candidate.id === relationshipId);
+  if (!view || !relationship) return undefined;
+  const memberIds = new Set(view.elementIds || []);
+  if (!memberIds.has(relationship.sourceId) || !memberIds.has(relationship.targetId)) return undefined;
+  return {
+    waypoints: relationship.waypoints || [],
+    labelPos: relationship.labelPos ?? 0.5,
+    relativeBendpoints: relationship.relativeBendpoints,
+  };
+}
+
+function applyLayoutsToCanonical(
+  canonical: CanonicalModelDocument,
+  model: OpenArchiModel,
+  elementLayouts?: ElementLayoutsByView,
+  relationshipLayouts?: RelationshipLayoutsByView,
+  baseDocument?: CanonicalModelDocument,
+): CanonicalModelDocument {
+  if (!baseDocument) return canonical;
+
+  const elementById = new Map(canonical.elements.map(element => [element.id, element]));
+  const relationshipById = new Map(canonical.relationships.map(relationship => [relationship.id, relationship]));
+  const baseViewNodesByViewId = new Map<string, typeof baseDocument.viewNodes>();
+  const baseViewConnectionsByViewId = new Map<string, typeof baseDocument.viewConnections>();
+
+  for (const node of baseDocument.viewNodes) {
+    if (!baseViewNodesByViewId.has(node.viewId)) baseViewNodesByViewId.set(node.viewId, []);
+    baseViewNodesByViewId.get(node.viewId)!.push(node);
+  }
+
+  for (const connection of baseDocument.viewConnections) {
+    if (!baseViewConnectionsByViewId.has(connection.viewId)) baseViewConnectionsByViewId.set(connection.viewId, []);
+    baseViewConnectionsByViewId.get(connection.viewId)!.push(connection);
+  }
+
+  const nextViewNodes: CanonicalModelDocument['viewNodes'] = [];
+  const nextViewConnections: CanonicalModelDocument['viewConnections'] = [];
+
+  for (const view of canonical.views) {
+    const memberIds = new Set(model.views.find(candidate => candidate.id === view.id)?.elementIds || []);
+    const relMemberIds = new Set<string>();
+    for (const relationship of canonical.relationships) {
+      if (memberIds.has(relationship.sourceId) && memberIds.has(relationship.targetId)) {
+        relMemberIds.add(relationship.id);
+      }
+    }
+
+    const baseNodes = baseViewNodesByViewId.get(view.id) || [];
+    const baseConnections = baseViewConnectionsByViewId.get(view.id) || [];
+    const representedElementIds = new Set<string>();
+    const representedRelationshipIds = new Set<string>();
+
+    for (const baseNode of baseNodes) {
+      if (!memberIds.has(baseNode.elementId) || !elementById.has(baseNode.elementId)) continue;
+      const layout = elementLayouts?.[view.id]?.[baseNode.elementId]
+        || fallbackElementLayout(model, view.id, baseNode.elementId);
+      nextViewNodes.push({
+        ...baseNode,
+        x: layout?.x ?? baseNode.x,
+        y: layout?.y ?? baseNode.y,
+        width: layout?.w ?? baseNode.width,
+        height: layout?.h ?? baseNode.height,
+        linkedViewId: layout?.linkedViewId ?? baseNode.linkedViewId,
+        style: layout?.style
+          ? {
+            ...baseNode.style,
+            fillColor: layout.style.fillColor ?? baseNode.style?.fillColor,
+            lineColor: layout.style.lineColor ?? baseNode.style?.lineColor,
+            fontColor: layout.style.fontColor ?? baseNode.style?.fontColor,
+          }
+          : baseNode.style,
+      });
+      representedElementIds.add(baseNode.elementId);
+    }
+
+    for (const elementId of memberIds) {
+      if (representedElementIds.has(elementId) || !elementById.has(elementId)) continue;
+      const layout = elementLayouts?.[view.id]?.[elementId] || fallbackElementLayout(model, view.id, elementId);
+      if (!layout) continue;
+      nextViewNodes.push({
+        id: `${view.id}::${elementId}`,
+        viewId: view.id,
+        elementId,
+        x: layout.x,
+        y: layout.y,
+        width: layout.w,
+        height: layout.h,
+        linkedViewId: layout.linkedViewId,
+        nestingDepth: layout.zIndex ?? 0,
+        style: layout.style ? {
+          fillColor: layout.style.fillColor,
+          lineColor: layout.style.lineColor,
+          fontColor: layout.style.fontColor,
+        } : undefined,
+      });
+    }
+
+    for (const baseConnection of baseConnections) {
+      if (!relMemberIds.has(baseConnection.relationshipId) || !relationshipById.has(baseConnection.relationshipId)) continue;
+      const layout = relationshipLayouts?.[view.id]?.[baseConnection.relationshipId]
+        || fallbackRelationshipLayout(model, view.id, baseConnection.relationshipId);
+      nextViewConnections.push({
+        ...baseConnection,
+        waypoints: layout?.waypoints ?? baseConnection.waypoints,
+        labelPosition: layout?.labelPos ?? baseConnection.labelPosition,
+        relativeBendpoints: layout?.relativeBendpoints ?? baseConnection.relativeBendpoints,
+      });
+      representedRelationshipIds.add(baseConnection.relationshipId);
+    }
+
+    for (const relationshipId of relMemberIds) {
+      if (representedRelationshipIds.has(relationshipId) || !relationshipById.has(relationshipId)) continue;
+      const layout = relationshipLayouts?.[view.id]?.[relationshipId]
+        || fallbackRelationshipLayout(model, view.id, relationshipId);
+      nextViewConnections.push({
+        id: `${view.id}::${relationshipId}`,
+        viewId: view.id,
+        relationshipId,
+        waypoints: layout?.waypoints || [],
+        labelPosition: layout?.labelPos ?? 0.5,
+        relativeBendpoints: layout?.relativeBendpoints,
+      });
+    }
+  }
+
+  canonical.viewNodes = nextViewNodes;
+  canonical.viewConnections = nextViewConnections;
+  return canonical;
 }
 
 export function listModelFormats(): ModelFormatAdapter[] {
@@ -190,7 +397,36 @@ export function exportEditorModelToText(model: OpenArchiModel, formatId: string)
  * Export an editor model as fragmented coArchi/GRAFICO files.
  * Returns the list of { relativePath, content } pairs to write to disk.
  */
-export function exportFragmentedEditorModel(model: OpenArchiModel): FragmentedSerializeResult {
-  const canonical = editorToCanonicalModel(model);
-  return serializeCoArchiFragmented(canonical);
+export function exportFragmentedEditorModel(
+  model: OpenArchiModel,
+  baseDocument?: CanonicalModelDocument,
+  elementLayouts?: ElementLayoutsByView,
+  relationshipLayouts?: RelationshipLayoutsByView,
+): FragmentedSerializeResult {
+  const canonical = applyLayoutsToCanonical(
+    mergeEditorModelIntoCanonical(model, baseDocument),
+    model,
+    elementLayouts,
+    relationshipLayouts,
+    baseDocument,
+  );
+  const result = serializeCoArchiFragmented(canonical);
+
+  if (!baseDocument) return result;
+
+  const nextElementIds = new Set(canonical.elements.map(element => element.id));
+  const nextRelationshipIds = new Set(canonical.relationships.map(relationship => relationship.id));
+  const nextViewIds = new Set(canonical.views.map(view => view.id));
+
+  const deletedPaths = [
+    ...collectDeletedFragmentPaths(baseDocument.elements, nextElementIds),
+    ...collectDeletedFragmentPaths(baseDocument.relationships, nextRelationshipIds),
+    ...collectDeletedFragmentPaths(baseDocument.views, nextViewIds),
+  ];
+
+  return {
+    ...result,
+    deletedPaths,
+    document: canonical,
+  };
 }

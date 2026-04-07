@@ -226,3 +226,27 @@ export async function writeFileAtPath(
   const fileHandle = await dirHandle.getFileHandle(fileName, { create: true });
   await writeFileHandle(fileHandle, content);
 }
+
+export async function deleteFileAtPath(
+  rootHandle: FileSystemDirectoryHandle,
+  relativePath: string,
+): Promise<void> {
+  const parts = relativePath.split('/');
+  const fileName = parts.pop();
+  if (!fileName) return;
+
+  let dirHandle = rootHandle;
+  for (const part of parts) {
+    try {
+      dirHandle = await dirHandle.getDirectoryHandle(part);
+    } catch {
+      return;
+    }
+  }
+
+  try {
+    await dirHandle.removeEntry(fileName);
+  } catch {
+    // Ignore missing files; fragmented saves should be idempotent.
+  }
+}

@@ -16,7 +16,7 @@ import {
   snapToElements, type SnapGuide,
 } from './core';
 import { drawDotGrid, drawLineGrid, drawElement, drawRelationship, drawSnapGuides, getRelSegments, type RelSegments } from './canvas';
-import { RelPicker, CtxMenu, SearchPanel, ViewNav, PropertyPanel, Btn, CanvasIcon, FloatingToolbar } from './components';
+import { RelPicker, CtxMenu, SearchPanel, ViewNav, PropertyPanel, ModelTree, Btn, CanvasIcon, FloatingToolbar } from './components';
 import {
   detectModelFormatByFileName,
   exportEditorModelToText,
@@ -26,6 +26,35 @@ import {
   isFragmentedModelDirectory,
   listModelFormats,
 } from './model/service';
+import { buildOrganizationTree } from './model/organization';
+import {
+  getAllowedElementTypesForViewpoint,
+  getAllowedLayersForViewpoint,
+  getSuggestedPurposeForViewpoint,
+  getViewpointDefinition,
+  isElementTypeAllowedInViewpoint,
+} from './model/viewpoints';
+import {
+  VIEW_TEMPLATES,
+  createCustomViewTemplate,
+  instantiateViewTemplate,
+  type ViewTemplateDefinition,
+} from './model/view-templates';
+import {
+  isSameOrDescendantFolder,
+  getDefaultElementFolder,
+  getDefaultRelationshipFolder,
+  getDefaultViewFolder,
+  getRelativeFolderPathFromSourcePath,
+  moveElementSourcePath,
+  moveRelationshipSourcePath,
+  moveViewSourcePath,
+  normalizeRelativeFolderPath,
+  rebaseRelativeFolderPath,
+  removeCoArchiFolderEntry,
+  upsertCoArchiFolderEntry,
+  renameCoArchiFolderEntries,
+} from './model/source-paths';
 import {
   type OpenFileEntry,
 } from './io/filesystem';
@@ -34,6 +63,7 @@ import type { ModelDiagnostic } from './model/diagnostics';
 
 const getLayer = (type: string) => ELEMENT_TYPES[type]?.layer;
 const isNote = (type: string) => !!ELEMENT_TYPES[type]?.isNote;
+const CUSTOM_VIEW_TEMPLATES_STORAGE_KEY = 'openarchi.customViewTemplates';
 
 interface ElementViewLayout {
   x: number;
@@ -299,6 +329,34 @@ function cloneDiagramConnectionsByView(source: DiagramConnectionsByView): Diagra
   return cloned;
 }
 
+function cloneCanonicalDocument(document: CanonicalModelDocument | null): CanonicalModelDocument | null {
+  if (!document) return null;
+  return JSON.parse(JSON.stringify(document)) as CanonicalModelDocument;
+}
+
+function buildFragmentedSavePreview(changeSet: {
+  createdPaths: string[];
+  deletedPaths: string[];
+  createdFolderPaths: string[];
+  deletedFolderPaths: string[];
+}): string | null {
+  const sections: string[] = [];
+  const appendPreview = (title: string, paths: string[]) => {
+    if (paths.length === 0) return;
+    const preview = paths.slice(0, 6).map(path => `- ${path}`).join('\n');
+    const suffix = paths.length > 6 ? `\n- ...and ${paths.length - 6} more` : '';
+    sections.push(`${title} (${paths.length})\n${preview}${suffix}`);
+  };
+
+  appendPreview('Create files', changeSet.createdPaths);
+  appendPreview('Delete files', changeSet.deletedPaths.filter(path => !changeSet.deletedFolderPaths.includes(path)));
+  appendPreview('Create folder manifests', changeSet.createdFolderPaths);
+  appendPreview('Delete folder manifests', changeSet.deletedFolderPaths);
+
+  if (sections.length === 0) return null;
+  return `Fragmented save will make these path changes:\n\n${sections.join('\n\n')}\n\nContinue?`;
+}
+
 export default function App() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
@@ -333,6 +391,7 @@ export default function App() {
   const [showSearch, setShowSearch] = useState(false);
   const [ioFormatId, setIoFormatId] = useState<string>('auto');
   const [leftPanelWidth, setLeftPanelWidth] = useState(244);
+  const [leftNavMode, setLeftNavMode] = useState<'views' | 'model'>('views');
   const [propSide, setPropSide] = useState<'left' | 'right'>('left');
   const [openTabIds, setOpenTabIds] = useState<string[]>(['v1']);
   const [editingElId, setEditingElId] = useState<string | null>(null);
@@ -340,10 +399,39 @@ export default function App() {
   const [editingName, setEditingName] = useState('');
   const [editingTabId, setEditingTabId] = useState<string | null>(null);
   const [editingTabName, setEditingTabName] = useState('');
+  const [createViewDraft, setCreateViewDraft] = useState<{
+    parentViewId?: string;
+    mode: 'choice' | 'empty' | 'template';
+    viewpoint: string;
+    templateId: string;
+    name: string;
+  } | null>(null);
+  const [customViewTemplates, setCustomViewTemplates] = useState<ViewTemplateDefinition[]>([]);
   const [showLegend, setShowLegend] = useState(false);
   const [snapGuides, setSnapGuides] = useState<SnapGuide[]>([]);
   const [diagramStateVersion, setDiagramStateVersion] = useState(0);
+  const [organizationBaseDocument, setOrganizationBaseDocument] = useState<CanonicalModelDocument | null>(null);
   const saveViewLayoutSnapshotRef = useRef<(viewId: string) => void>(() => {});
+
+  useEffect(() => {
+    try {
+      const raw = window.localStorage.getItem(CUSTOM_VIEW_TEMPLATES_STORAGE_KEY);
+      if (!raw) return;
+      const parsed = JSON.parse(raw);
+      if (!Array.isArray(parsed)) return;
+      setCustomViewTemplates(parsed.filter(template => template && typeof template.id === 'string'));
+    } catch {
+      // Ignore invalid local template storage and continue with built-ins.
+    }
+  }, []);
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(CUSTOM_VIEW_TEMPLATES_STORAGE_KEY, JSON.stringify(customViewTemplates));
+    } catch {
+      // Ignore storage write failures.
+    }
+  }, [customViewTemplates]);
 
   // Workspace (directory, file, dirty, git branch – persisted to IndexedDB)
   const {
@@ -388,6 +476,7 @@ export default function App() {
     views: ModelView[];
     diagramNodesByView: DiagramNodesByView;
     diagramConnectionsByView: DiagramConnectionsByView;
+    organizationBaseDocument: CanonicalModelDocument | null;
   }
   const historyRef = useRef<HistorySnapshot[]>([{
     elements: SAMPLE_ELEMENTS.map(e => ({ ...e })),
@@ -395,6 +484,7 @@ export default function App() {
     views: SAMPLE_VIEWS.map(v => ({ ...v, elementIds: [...v.elementIds], childViewIds: [...v.childViewIds] })),
     diagramNodesByView: cloneDiagramNodesByView(buildDiagramStateFromEditorModel(SAMPLE_ELEMENTS, SAMPLE_RELATIONSHIPS, SAMPLE_VIEWS).diagramNodesByView),
     diagramConnectionsByView: cloneDiagramConnectionsByView(buildDiagramStateFromEditorModel(SAMPLE_ELEMENTS, SAMPLE_RELATIONSHIPS, SAMPLE_VIEWS).diagramConnectionsByView),
+    organizationBaseDocument: null,
   }]);
   const historyIndexRef = useRef(0);
 
@@ -402,9 +492,11 @@ export default function App() {
   const elementsRef = useRef(elements);
   const relationshipsRef = useRef(relationships);
   const viewsRef = useRef(views);
+  const organizationBaseDocumentRef = useRef<CanonicalModelDocument | null>(null);
   useEffect(() => { elementsRef.current = elements; }, [elements]);
   useEffect(() => { relationshipsRef.current = relationships; }, [relationships]);
   useEffect(() => { viewsRef.current = views; }, [views]);
+  useEffect(() => { organizationBaseDocumentRef.current = organizationBaseDocument; }, [organizationBaseDocument]);
 
   /** Call BEFORE a mutation to save the current state as an undo point */
   const pushHistory = useCallback(() => {
@@ -415,6 +507,7 @@ export default function App() {
       views: viewsRef.current.map(v => ({ ...v, elementIds: [...v.elementIds], childViewIds: [...v.childViewIds] })),
       diagramNodesByView: cloneDiagramNodesByView(diagramNodesByViewRef.current),
       diagramConnectionsByView: cloneDiagramConnectionsByView(diagramConnectionsByViewRef.current),
+      organizationBaseDocument: cloneCanonicalDocument(organizationBaseDocumentRef.current),
     };
     // Trim forward history
     historyRef.current = historyRef.current.slice(0, historyIndexRef.current + 1);
@@ -433,6 +526,7 @@ export default function App() {
     setViews(snap.views.map(v => ({ ...v, elementIds: [...v.elementIds], childViewIds: [...v.childViewIds] })));
     diagramNodesByViewRef.current = cloneDiagramNodesByView(snap.diagramNodesByView);
     diagramConnectionsByViewRef.current = cloneDiagramConnectionsByView(snap.diagramConnectionsByView);
+    setOrganizationBaseDocument(cloneCanonicalDocument(snap.organizationBaseDocument));
   }, []);
 
   const undo = useCallback(() => {
@@ -446,6 +540,7 @@ export default function App() {
         views: viewsRef.current.map(v => ({ ...v, elementIds: [...v.elementIds], childViewIds: [...v.childViewIds] })),
         diagramNodesByView: cloneDiagramNodesByView(diagramNodesByViewRef.current),
         diagramConnectionsByView: cloneDiagramConnectionsByView(diagramConnectionsByViewRef.current),
+        organizationBaseDocument: cloneCanonicalDocument(organizationBaseDocumentRef.current),
       };
       historyRef.current.push(current);
     }
@@ -474,12 +569,24 @@ export default function App() {
   const fragmentedSourceDocumentRef = useRef<CanonicalModelDocument | null>(null);
 
   const modelFormats = useMemo(() => listModelFormats(), []);
+  const viewTemplates = useMemo(
+    () => [...customViewTemplates, ...VIEW_TEMPLATES],
+    [customViewTemplates],
+  );
 
   const selectedFormatId = ioFormatId === 'auto' ? 'openarchi-json' : ioFormatId;
   const activeView = useMemo(() => {
     if (views.length === 0) return null;
     return views.find(view => view.id === currentViewId) || views[0];
   }, [views, currentViewId]);
+  const activeViewpoint = activeView?.viewpoint;
+  const allowedLayersForActiveView = useMemo(() => getAllowedLayersForViewpoint(activeViewpoint), [activeViewpoint]);
+  const allowedElementTypesForActiveView = useMemo(() => getAllowedElementTypesForViewpoint(activeViewpoint), [activeViewpoint]);
+
+  useEffect(() => {
+    if (allowedLayersForActiveView.includes(activeLayer)) return;
+    setActiveLayer(allowedLayersForActiveView[0] || 'business');
+  }, [activeLayer, allowedLayersForActiveView]);
 
   const visibleElementIds = useMemo(() => {
     if (!activeView) {
@@ -855,6 +962,17 @@ export default function App() {
     })),
   }), [elements, relationships, views]);
 
+  const organizationTree = useMemo(() => buildOrganizationTree({
+    document: organizationBaseDocument,
+    elements,
+    relationships,
+    views,
+  }), [organizationBaseDocument, elements, relationships, views]);
+
+  useEffect(() => {
+    if (!organizationTree && leftNavMode !== 'views') setLeftNavMode('views');
+  }, [organizationTree, leftNavMode]);
+
   const currentNodeElementIdById = useMemo(() => {
     const map = new Map<string, string>();
     for (const node of diagramNodesByViewRef.current[currentViewId] || []) {
@@ -1065,6 +1183,97 @@ export default function App() {
       return next;
     });
   }, [currentViewId, saveViewLayoutSnapshot, applyViewLayout]);
+
+  const deleteViewById = useCallback((viewId: string) => {
+    const view = views.find(candidate => candidate.id === viewId);
+    if (!view) return;
+    if (views.length <= 1) {
+      alert('At least one view must remain in the model.');
+      return;
+    }
+    if (!window.confirm(`Delete view "${view.name}"? This removes the diagram only and keeps the concepts in the model.`)) return;
+
+    const parentView = views.find(candidate => (candidate.childViewIds || []).includes(viewId));
+    const siblingViews = views.filter(candidate => candidate.id !== viewId);
+    const nextViewId = currentViewId === viewId
+      ? (view.childViewIds?.[0] || parentView?.id || siblingViews[0]?.id || currentViewId)
+      : currentViewId;
+
+    pushHistory();
+
+    setViews(prev => prev
+      .filter(candidate => candidate.id !== viewId)
+      .map(candidate => {
+        const withoutDeleted = (candidate.childViewIds || []).filter(childId => childId !== viewId);
+        if (candidate.id !== parentView?.id) {
+          return withoutDeleted.length === (candidate.childViewIds || []).length
+            ? candidate
+            : { ...candidate, childViewIds: withoutDeleted };
+        }
+        const reparented = [...withoutDeleted];
+        for (const childId of view.childViewIds || []) {
+          if (!reparented.includes(childId)) reparented.push(childId);
+        }
+        return { ...candidate, childViewIds: reparented };
+      }));
+
+    setElements(prev => prev.map(element => (
+      element.linkedViewId === viewId ? { ...element, linkedViewId: undefined } : element
+    )));
+
+    delete elementLayoutsByViewRef.current[viewId];
+    delete relationshipLayoutsByViewRef.current[viewId];
+    delete diagramNodesByViewRef.current[viewId];
+    delete diagramConnectionsByViewRef.current[viewId];
+
+    for (const [otherViewId, layouts] of Object.entries(elementLayoutsByViewRef.current)) {
+      let changed = false;
+      const nextLayouts: Record<string, ElementViewLayout> = {};
+      for (const [elementId, layout] of Object.entries(layouts)) {
+        if (layout.linkedViewId === viewId) {
+          nextLayouts[elementId] = { ...layout, linkedViewId: undefined };
+          changed = true;
+        } else {
+          nextLayouts[elementId] = layout;
+        }
+      }
+      if (changed) elementLayoutsByViewRef.current[otherViewId] = nextLayouts;
+    }
+
+    for (const [otherViewId, nodes] of Object.entries(diagramNodesByViewRef.current)) {
+      let changed = false;
+      const nextNodes = nodes.map(node => {
+        if (node.linkedViewId !== viewId) return node;
+        changed = true;
+        return { ...node, linkedViewId: undefined };
+      });
+      if (changed) diagramNodesByViewRef.current[otherViewId] = nextNodes;
+    }
+
+    viewHistory.current = viewHistory.current.filter(id => id !== viewId);
+    if (!viewHistory.current.includes(nextViewId)) viewHistory.current.push(nextViewId);
+    historyIdx.current = Math.max(0, viewHistory.current.lastIndexOf(nextViewId));
+
+    setOpenTabIds(prev => {
+      const next = prev.filter(id => id !== viewId);
+      return next.includes(nextViewId) ? next : [...next, nextViewId];
+    });
+
+    if (currentViewId === viewId) {
+      applyViewLayout(nextViewId);
+      setCurrentViewId(nextViewId);
+    }
+
+    if (selectedId === viewId) {
+      setSelectedId(null);
+      setSelectedNodeId(null);
+      setSelectedConnectionId(null);
+      setSelType(null);
+    }
+
+    if (editingTabId === viewId) setEditingTabId(null);
+    setDiagramStateVersion(version => version + 1);
+  }, [applyViewLayout, currentViewId, editingTabId, pushHistory, selectedId, views]);
 
   // Resize observer
   useEffect(() => {
@@ -1873,6 +2082,11 @@ export default function App() {
 
   // ==================== ACTIONS ====================
   const addElement = useCallback((type: string) => {
+    if (!isElementTypeAllowedInViewpoint(type, activeViewpoint)) {
+      const viewpointLabel = getViewpointDefinition(activeViewpoint)?.label || 'active';
+      showTransientDiagnostic(`"${ELEMENT_TYPES[type]?.label || type}" is outside the ${viewpointLabel} viewpoint.`);
+      return;
+    }
     pushHistory();
     const c = s2w(cSize.w / 2, cSize.h / 2);
     const isG = type === 'grouping' || type === 'location';
@@ -1905,16 +2119,70 @@ export default function App() {
         : view,
     ));
     setSelectedNodeId(`${currentViewId}::${el.id}`); setSelectedConnectionId(null); setSelectedId(el.id); setSelType('element');
-  }, [s2w, cSize, currentViewId, pushHistory, appendCurrentDiagramNode]);
+  }, [s2w, cSize, currentViewId, pushHistory, appendCurrentDiagramNode, activeViewpoint, showTransientDiagnostic]);
 
-  const addView = useCallback((name?: string, parentViewId?: string) => {
-    pushHistory();
+  const createEmptyView = useCallback((name?: string, parentViewId?: string, viewpoint?: string) => {
+    const nextViewpoint = viewpoint || activeView?.viewpoint || 'landscape';
     const newView: ModelView = {
       id: uid(),
-      name: name || 'New View',
+      name: name?.trim() || 'New View',
       elementIds: [],
       childViewIds: [],
+      viewpoint: nextViewpoint,
+      purpose: getSuggestedPurposeForViewpoint(nextViewpoint),
     };
+
+    pushHistory();
+    setViews(prev => {
+      const updated = [...prev, newView];
+      if (parentViewId) {
+        return updated.map(view => (
+          view.id === parentViewId
+            ? { ...view, childViewIds: [...(view.childViewIds || []), newView.id] }
+            : view
+        ));
+      }
+      return updated;
+    });
+    diagramNodesByViewRef.current = {
+      ...diagramNodesByViewRef.current,
+      [newView.id]: [],
+    };
+    diagramConnectionsByViewRef.current = {
+      ...diagramConnectionsByViewRef.current,
+      [newView.id]: [],
+    };
+    elementLayoutsByViewRef.current = {
+      ...elementLayoutsByViewRef.current,
+      [newView.id]: {},
+    };
+    relationshipLayoutsByViewRef.current = {
+      ...relationshipLayoutsByViewRef.current,
+      [newView.id]: {},
+    };
+    setDiagramStateVersion(version => version + 1);
+    saveViewLayoutSnapshot(currentViewId);
+    setCurrentViewId(newView.id);
+    setOpenTabIds(prev => [...prev, newView.id]);
+    setSelectedNodeId(null); setSelectedConnectionId(null); setSelectedId(null); setSelType(null);
+  }, [activeView, currentViewId, pushHistory, saveViewLayoutSnapshot]);
+
+  const createViewFromTemplate = useCallback((templateId: string, name?: string, parentViewId?: string) => {
+    const template = viewTemplates.find(candidate => candidate.id === templateId) || viewTemplates[0] || VIEW_TEMPLATES[0];
+    pushHistory();
+    const instance = instantiateViewTemplate(template, {
+      viewId: uid(),
+      name,
+      makeId: uid,
+    });
+    const newView = instance.view;
+    const starterElements = instance.elements;
+    const starterRelationships = instance.relationships;
+    const starterNodes = instance.diagramNodes;
+    const starterConnections = instance.diagramConnections;
+
+    setElements(prev => [...prev, ...starterElements]);
+    setRelationships(prev => [...prev, ...starterRelationships]);
     setViews(prev => {
       const updated = [...prev, newView];
       if (parentViewId) {
@@ -1926,18 +2194,154 @@ export default function App() {
       }
       return updated;
     });
+    diagramNodesByViewRef.current = {
+      ...diagramNodesByViewRef.current,
+      [newView.id]: starterNodes,
+    };
+    diagramConnectionsByViewRef.current = {
+      ...diagramConnectionsByViewRef.current,
+      [newView.id]: starterConnections,
+    };
+    elementLayoutsByViewRef.current = {
+      ...elementLayoutsByViewRef.current,
+      [newView.id]: Object.fromEntries(starterNodes.map(node => [node.elementId, {
+        x: node.x,
+        y: node.y,
+        w: node.w,
+        h: node.h,
+        linkedViewId: node.linkedViewId,
+        zIndex: node.zIndex,
+        style: node.style,
+      }])),
+    };
+    relationshipLayoutsByViewRef.current = {
+      ...relationshipLayoutsByViewRef.current,
+      [newView.id]: Object.fromEntries(starterConnections.map(connection => [connection.relationshipId, {
+        waypoints: connection.waypoints || [],
+        labelPos: connection.labelPos ?? 0.5,
+        relativeBendpoints: connection.relativeBendpoints,
+      }])),
+    };
+    setDiagramStateVersion(version => version + 1);
     // Navigate to the new view
     saveViewLayoutSnapshot(currentViewId);
     setCurrentViewId(newView.id);
     setOpenTabIds(prev => [...prev, newView.id]);
     setSelectedNodeId(null); setSelectedConnectionId(null); setSelectedId(null); setSelType(null);
-  }, [pushHistory, currentViewId, saveViewLayoutSnapshot]);
+    fitToContent(starterElements);
+  }, [pushHistory, currentViewId, saveViewLayoutSnapshot, fitToContent, viewTemplates]);
+
+  const saveViewAsTemplate = useCallback((viewId: string) => {
+    const view = views.find(candidate => candidate.id === viewId);
+    if (!view) return;
+    const label = window.prompt('Template name', `${view.name} Template`)?.trim();
+    if (!label) return;
+    const template = createCustomViewTemplate(
+      `custom-${uid()}`,
+      label,
+      view,
+      elements,
+      relationships,
+      diagramNodesByViewRef.current[viewId] || [],
+      diagramConnectionsByViewRef.current[viewId] || [],
+    );
+    setCustomViewTemplates(prev => [template, ...prev]);
+    showTransientDiagnostic(`Saved "${label}" as a reusable view template.`);
+  }, [elements, relationships, showTransientDiagnostic, views]);
+
+  const openCreateViewDialog = useCallback((parentViewId?: string) => {
+    const inheritedViewpoint = views.find(view => view.id === (parentViewId || currentViewId))?.viewpoint || activeView?.viewpoint || 'landscape';
+    const defaultTemplate = viewTemplates.find(template => template.viewpoint === inheritedViewpoint) || VIEW_TEMPLATES[0];
+    setCreateViewDraft({
+      parentViewId,
+      mode: 'choice',
+      viewpoint: inheritedViewpoint,
+      templateId: defaultTemplate.id,
+      name: 'New View',
+    });
+  }, [activeView, currentViewId, viewTemplates, views]);
+
+  const submitCreateViewDraft = useCallback(() => {
+    if (!createViewDraft) return;
+    if (createViewDraft.mode === 'empty') {
+      createEmptyView(createViewDraft.name, createViewDraft.parentViewId, createViewDraft.viewpoint);
+    } else if (createViewDraft.mode === 'template') {
+      createViewFromTemplate(createViewDraft.templateId, createViewDraft.name, createViewDraft.parentViewId);
+    } else {
+      return;
+    }
+    setCreateViewDraft(null);
+  }, [createEmptyView, createViewDraft, createViewFromTemplate]);
 
   const renameView = useCallback((viewId: string, newName: string) => {
     if (!newName.trim()) return;
     pushHistory();
     setViews(prev => prev.map(v => v.id === viewId ? { ...v, name: newName.trim() } : v));
   }, [pushHistory]);
+
+  const openViewContextMenu = useCallback((viewId: string, x: number, y: number) => {
+    const view = views.find(candidate => candidate.id === viewId);
+    if (!view) return;
+    setCtxMenu({
+      x,
+      y,
+      items: [
+        { label: 'Open View', action: () => navigateToView(viewId) },
+        {
+          label: 'Rename View',
+          action: () => {
+            setEditingTabId(viewId);
+            setEditingTabName(view.name);
+            if (viewId !== currentViewId) navigateToView(viewId);
+          },
+        },
+        { label: 'Set as Template', action: () => saveViewAsTemplate(viewId) },
+        { label: '', separator: true },
+        { label: 'Delete View', color: '#e07070', action: () => deleteViewById(viewId) },
+      ],
+    });
+  }, [currentViewId, deleteViewById, navigateToView, saveViewAsTemplate, views]);
+
+  const selectViewFromTree = useCallback((viewId: string) => {
+    navigateToView(viewId);
+    setSelectedNodeId(null);
+    setSelectedConnectionId(null);
+    setSelectedId(null);
+    setSelType(null);
+  }, [navigateToView]);
+
+  const selectElementFromTree = useCallback((elementId: string) => {
+    const targetViewId = views.find(view => (view.elementIds || []).includes(elementId))?.id;
+    if (targetViewId && targetViewId !== currentViewId) navigateToView(targetViewId);
+
+    const nodes = diagramNodesByViewRef.current[targetViewId || currentViewId] || [];
+    const nodeId = nodes.find(node => node.elementId === elementId)?.id || null;
+
+    setSelectedId(elementId);
+    setSelectedNodeId(nodeId);
+    setSelectedConnectionId(null);
+    setSelType('element');
+  }, [currentViewId, navigateToView, views]);
+
+  const selectRelationshipFromTree = useCallback((relationshipId: string) => {
+    const relationship = relationships.find(candidate => candidate.id === relationshipId);
+    if (!relationship) return;
+
+    const targetViewId = views.find(view => {
+      const memberIds = new Set(view.elementIds || []);
+      return memberIds.has(relationship.sourceId) && memberIds.has(relationship.targetId);
+    })?.id;
+
+    if (targetViewId && targetViewId !== currentViewId) navigateToView(targetViewId);
+
+    const connections = diagramConnectionsByViewRef.current[targetViewId || currentViewId] || [];
+    const connectionId = connections.find(connection => connection.relationshipId === relationshipId)?.id || null;
+
+    setSelectedId(relationshipId);
+    setSelectedNodeId(null);
+    setSelectedConnectionId(connectionId);
+    setSelType('relationship');
+  }, [currentViewId, navigateToView, relationships, views]);
 
   const deleteSelected = useCallback(() => {
     if (!selectedId) return;
@@ -2011,6 +2415,7 @@ export default function App() {
         diagramNodesByViewRef.current = importedDiagramState.diagramNodesByView;
         diagramConnectionsByViewRef.current = importedDiagramState.diagramConnectionsByView;
         fragmentedSourceDocumentRef.current = null;
+        setOrganizationBaseDocument(result.document ?? null);
 
         setElements(result.model.elements);
         setRelationships(result.model.relationships);
@@ -2069,6 +2474,7 @@ export default function App() {
       diagramNodesByViewRef.current = importedDiagramState.diagramNodesByView;
       diagramConnectionsByViewRef.current = importedDiagramState.diagramConnectionsByView;
       fragmentedSourceDocumentRef.current = null;
+      setOrganizationBaseDocument(result.document ?? null);
 
       setElements(result.model.elements);
       setRelationships(result.model.relationships);
@@ -2127,6 +2533,7 @@ export default function App() {
       diagramNodesByViewRef.current = importedDiagramState.diagramNodesByView;
       diagramConnectionsByViewRef.current = importedDiagramState.diagramConnectionsByView;
       fragmentedSourceDocumentRef.current = result.document ?? null;
+      setOrganizationBaseDocument(result.document ?? null);
 
       setElements(result.model.elements);
       setRelationships(result.model.relationships);
@@ -2209,9 +2616,19 @@ export default function App() {
           alert(firstError?.message || 'Save failed');
           return;
         }
+        const preview = result.changeSet ? buildFragmentedSavePreview(result.changeSet) : null;
+        if (preview && !window.confirm(preview)) return;
         await wsSaveFragmented(result.files, result.deletedPaths || []);
         fragmentedSourceDocumentRef.current = result.document ?? fragmentedSourceDocumentRef.current;
-        showTransientDiagnostic(`Saved ${result.files.length} files to ${wsDirName || 'workspace'}/`);
+        setOrganizationBaseDocument(result.document ?? fragmentedSourceDocumentRef.current);
+        const summary = result.changeSet
+          ? `Saved ${result.files.length} files to ${wsDirName || 'workspace'}/`
+            + ` | +${result.changeSet.createdPaths.length} files`
+            + ` | -${result.changeSet.deletedPaths.length} files`
+            + ` | +${result.changeSet.createdFolderPaths.length} folders`
+            + ` | -${result.changeSet.deletedFolderPaths.length} folders`
+          : `Saved ${result.files.length} files to ${wsDirName || 'workspace'}/`;
+        showTransientDiagnostic(summary);
       } catch (err) {
         alert(`Save failed: ${err}`);
       }
@@ -2296,29 +2713,35 @@ export default function App() {
 
   useEffect(() => {
     if (!selectedId) return;
-    if (selType === 'element' && !visibleElementIds.has(selectedId)) {
-      setSelectedNodeId(null);
-      setSelectedConnectionId(null);
-      setSelectedId(null);
-      setSelType(null);
-      return;
+    if (selType === 'element') {
+      const elementStillExists = elements.some(element => element.id === selectedId);
+      if (!elementStillExists) {
+        setSelectedNodeId(null);
+        setSelectedConnectionId(null);
+        setSelectedId(null);
+        setSelType(null);
+        return;
+      }
     }
     if (selType === 'element' && selectedNodeId) {
       const nodeStillVisible = visibleDiagramElements.some(element => element.id === selectedNodeId);
       if (!nodeStillVisible) setSelectedNodeId(null);
     }
     if (selType === 'relationship') {
-      const isVisible = selectedConnectionId
-        ? visibleRelationships.some(relationship => relationship.id === selectedConnectionId)
-        : visibleRelationships.some(relationship => relationship.relationshipId === selectedId);
-      if (!isVisible) {
+      const relationshipStillExists = relationships.some(relationship => relationship.id === selectedId);
+      if (!relationshipStillExists) {
         setSelectedNodeId(null);
         setSelectedConnectionId(null);
         setSelectedId(null);
         setSelType(null);
+        return;
+      }
+      if (selectedConnectionId) {
+        const connectionStillVisible = visibleRelationships.some(relationship => relationship.id === selectedConnectionId);
+        if (!connectionStillVisible) setSelectedConnectionId(null);
       }
     }
-  }, [selectedId, selectedNodeId, selectedConnectionId, selType, visibleElementIds, visibleDiagramElements, visibleRelationships]);
+  }, [selectedId, selectedNodeId, selectedConnectionId, selType, elements, relationships, visibleDiagramElements, visibleRelationships]);
 
   // ==================== DERIVED STATE ====================
   const selEl = selType === 'element' ? elements.find(e => e.id === selectedId) || null : null;
@@ -2337,9 +2760,19 @@ export default function App() {
       relativeBendpoints: selectedDiagramRelationship.relativeBendpoints,
     };
   }, [semanticSelectedRelationship, selectedDiagramRelationship]);
+  const folderDocument = organizationBaseDocument ?? fragmentedSourceDocumentRef.current;
+  const elementFolderPath = selEl
+    ? getRelativeFolderPathFromSourcePath(selEl.sourcePath, folderDocument) || getDefaultElementFolder(selEl.type)
+    : undefined;
+  const relationshipFolderPath = selRel
+    ? getRelativeFolderPathFromSourcePath(selRel.sourcePath, folderDocument) || getDefaultRelationshipFolder()
+    : undefined;
+  const viewFolderPath = activeView
+    ? getRelativeFolderPathFromSourcePath(activeView.sourcePath, folderDocument) || getDefaultViewFolder()
+    : undefined;
 
   const propEditPushedRef = useRef(false);
-  useEffect(() => { propEditPushedRef.current = false; }, [selectedId, selectedConnectionId]);
+  useEffect(() => { propEditPushedRef.current = false; }, [selectedId, selectedConnectionId, currentViewId]);
 
   const updEl = useCallback((k: string, v: unknown) => {
     if (!propEditPushedRef.current) { pushHistory(); propEditPushedRef.current = true; }
@@ -2357,6 +2790,160 @@ export default function App() {
     }
     setRelationships(p => p.map(r => r.id === selectedId ? { ...r, [k]: v } : r));
   }, [selectedId, selectedConnectionId, pushHistory, updateCurrentDiagramConnection]);
+
+  const updView = useCallback((viewId: string, k: string, v: unknown) => {
+    if (!propEditPushedRef.current) { pushHistory(); propEditPushedRef.current = true; }
+    setViews(prev => prev.map(view => {
+      if (view.id !== viewId) return view;
+      if (k === 'viewpoint') {
+        const nextViewpoint = typeof v === 'string' && v ? v : undefined;
+        return {
+          ...view,
+          viewpoint: nextViewpoint,
+          purpose: view.purpose || getSuggestedPurposeForViewpoint(nextViewpoint),
+        };
+      }
+      return { ...view, [k]: v };
+    }));
+  }, [pushHistory]);
+  const moveElementToFolderById = useCallback((elementId: string, folderPath: string) => {
+    const element = elements.find(candidate => candidate.id === elementId);
+    if (!element) return;
+    const normalizedFolder = normalizeRelativeFolderPath(folderPath) || getDefaultElementFolder(element.type);
+    const currentFolder = getRelativeFolderPathFromSourcePath(element.sourcePath, folderDocument) || getDefaultElementFolder(element.type);
+    if (normalizedFolder === currentFolder) return;
+    pushHistory();
+    setElements(prev => prev.map(candidate => (
+      candidate.id === elementId
+        ? { ...candidate, sourcePath: moveElementSourcePath(candidate, normalizedFolder, folderDocument) }
+        : candidate
+    )));
+  }, [elements, folderDocument, pushHistory]);
+  const moveRelationshipToFolderById = useCallback((relationshipId: string, folderPath: string) => {
+    const relationship = relationships.find(candidate => candidate.id === relationshipId);
+    if (!relationship) return;
+    const normalizedFolder = normalizeRelativeFolderPath(folderPath) || getDefaultRelationshipFolder();
+    const currentFolder = getRelativeFolderPathFromSourcePath(relationship.sourcePath, folderDocument) || getDefaultRelationshipFolder();
+    if (normalizedFolder === currentFolder) return;
+    pushHistory();
+    setRelationships(prev => prev.map(candidate => (
+      candidate.id === relationshipId
+        ? { ...candidate, sourcePath: moveRelationshipSourcePath(candidate, normalizedFolder, folderDocument) }
+        : candidate
+    )));
+  }, [folderDocument, pushHistory, relationships]);
+  const moveViewToFolderById = useCallback((viewId: string, folderPath: string) => {
+    const view = views.find(candidate => candidate.id === viewId);
+    if (!view) return;
+    const normalizedFolder = normalizeRelativeFolderPath(folderPath) || getDefaultViewFolder();
+    const currentFolder = getRelativeFolderPathFromSourcePath(view.sourcePath, folderDocument) || getDefaultViewFolder();
+    if (normalizedFolder === currentFolder) return;
+    pushHistory();
+    setViews(prev => prev.map(candidate => (
+      candidate.id === viewId
+        ? { ...candidate, sourcePath: moveViewSourcePath(candidate, normalizedFolder, folderDocument) }
+        : candidate
+    )));
+  }, [folderDocument, pushHistory, views]);
+  const moveSelectedElementToFolder = useCallback((folderPath: string) => {
+    if (!selEl) return;
+    moveElementToFolderById(selEl.id, folderPath);
+  }, [moveElementToFolderById, selEl]);
+  const moveSelectedRelationshipToFolder = useCallback((folderPath: string) => {
+    if (!selRel) return;
+    moveRelationshipToFolderById(selRel.id, folderPath);
+  }, [moveRelationshipToFolderById, selRel]);
+  const moveCurrentViewToFolder = useCallback((folderPath: string) => {
+    if (!activeView) return;
+    moveViewToFolderById(activeView.id, folderPath);
+  }, [activeView, moveViewToFolderById]);
+  const moveTreeItemToFolder = useCallback((item: { kind: 'view' | 'element' | 'relationship'; id: string }, folderPath: string) => {
+    if (item.kind === 'element') {
+      moveElementToFolderById(item.id, folderPath);
+      return;
+    }
+    if (item.kind === 'relationship') {
+      moveRelationshipToFolderById(item.id, folderPath);
+      return;
+    }
+    moveViewToFolderById(item.id, folderPath);
+  }, [moveElementToFolderById, moveRelationshipToFolderById, moveViewToFolderById]);
+  const createFolder = useCallback((parentFolderPath: string) => {
+    if (!folderDocument) return;
+    const defaultName = 'new-folder';
+    const name = window.prompt('New folder name', defaultName);
+    if (!name) return;
+    const segment = normalizeRelativeFolderPath(name);
+    if (!segment) return;
+    const nextFolderPath = normalizeRelativeFolderPath(parentFolderPath)
+      ? `${normalizeRelativeFolderPath(parentFolderPath)}/${segment}`
+      : segment;
+    pushHistory();
+    setOrganizationBaseDocument(current => upsertCoArchiFolderEntry(current ?? folderDocument, nextFolderPath));
+  }, [folderDocument, pushHistory]);
+  const renameFolder = useCallback((folderPath: string) => {
+    if (!folderDocument) return;
+    const currentFolder = normalizeRelativeFolderPath(folderPath);
+    const nextFolderInput = window.prompt('Rename folder path', currentFolder);
+    if (!nextFolderInput) return;
+    const nextFolderPath = normalizeRelativeFolderPath(nextFolderInput);
+    if (!nextFolderPath || nextFolderPath === currentFolder) return;
+    if (isSameOrDescendantFolder(nextFolderPath, currentFolder)) {
+      alert('A folder cannot be renamed into itself or one of its descendants.');
+      return;
+    }
+
+    pushHistory();
+
+    setElements(prev => prev.map(element => {
+      const currentRelativeFolder = getRelativeFolderPathFromSourcePath(element.sourcePath, folderDocument) || getDefaultElementFolder(element.type);
+      if (!isSameOrDescendantFolder(currentRelativeFolder, currentFolder)) return element;
+      return {
+        ...element,
+        sourcePath: moveElementSourcePath(
+          element,
+          rebaseRelativeFolderPath(currentRelativeFolder, currentFolder, nextFolderPath),
+          folderDocument,
+        ),
+      };
+    }));
+
+    setRelationships(prev => prev.map(relationship => {
+      const currentRelativeFolder = getRelativeFolderPathFromSourcePath(relationship.sourcePath, folderDocument) || getDefaultRelationshipFolder();
+      if (!isSameOrDescendantFolder(currentRelativeFolder, currentFolder)) return relationship;
+      return {
+        ...relationship,
+        sourcePath: moveRelationshipSourcePath(
+          relationship,
+          rebaseRelativeFolderPath(currentRelativeFolder, currentFolder, nextFolderPath),
+          folderDocument,
+        ),
+      };
+    }));
+
+    setViews(prev => prev.map(view => {
+      const currentRelativeFolder = getRelativeFolderPathFromSourcePath(view.sourcePath, folderDocument) || getDefaultViewFolder();
+      if (!isSameOrDescendantFolder(currentRelativeFolder, currentFolder)) return view;
+      return {
+        ...view,
+        sourcePath: moveViewSourcePath(
+          view,
+          rebaseRelativeFolderPath(currentRelativeFolder, currentFolder, nextFolderPath),
+          folderDocument,
+        ),
+      };
+    }));
+
+    setOrganizationBaseDocument(current => renameCoArchiFolderEntries(current ?? folderDocument, currentFolder, nextFolderPath));
+  }, [folderDocument, pushHistory]);
+  const deleteFolder = useCallback((folderPath: string) => {
+    if (!folderDocument) return;
+    const normalizedFolder = normalizeRelativeFolderPath(folderPath);
+    if (!normalizedFolder) return;
+    if (!window.confirm(`Delete folder "${normalizedFolder}"?`)) return;
+    pushHistory();
+    setOrganizationBaseDocument(current => removeCoArchiFolderEntry(current ?? folderDocument, normalizedFolder));
+  }, [folderDocument, pushHistory]);
 
   // Position for inline editing overlay
   const editingEl = editingElId ? elements.find(e => e.id === editingElId) : null;
@@ -2450,6 +3037,249 @@ export default function App() {
                 fontFamily: 'inherit', fontSize: 12, cursor: 'pointer',
               }}
             >Dismiss</button>
+          </div>
+        )}
+
+        {createViewDraft && (
+          <div style={{
+            position: 'absolute', inset: 0, zIndex: 40,
+            display: 'flex', alignItems: 'center', justifyContent: 'center',
+            background: 'rgba(243,244,246,0.72)',
+            backdropFilter: 'blur(10px)',
+          }}>
+            <div style={{
+              width: 640,
+              maxWidth: 'calc(100vw - 40px)',
+              maxHeight: 'calc(100vh - 80px)',
+              overflow: 'auto',
+              background: 'var(--glass-strong, rgba(255,255,255,0.95))',
+              border: '1px solid var(--glass-border, rgba(255,255,255,0.55))',
+              borderRadius: 'var(--radius-lg, 14px)',
+              boxShadow: 'var(--shadow-xl, 0 8px 40px rgba(0,0,0,0.12))',
+              padding: '18px 18px 16px',
+              fontFamily: FONT,
+            }}>
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 12 }}>
+                <div>
+                  <div style={{ fontSize: 11, fontWeight: 600, color: 'var(--text-faint, #b0b0b8)', textTransform: 'uppercase', letterSpacing: '0.5px' }}>
+                    New View
+                  </div>
+                  <div style={{ fontSize: 18, fontWeight: 600, color: 'var(--text-primary, #1a1a1a)', marginTop: 2 }}>
+                    Choose a template
+                  </div>
+                </div>
+                <button
+                  onClick={() => setCreateViewDraft(null)}
+                  style={{
+                    width: 28, height: 28, borderRadius: 8, border: 'none',
+                    background: 'transparent', color: 'var(--text-faint, #b0b0b8)',
+                    cursor: 'pointer', fontSize: 16, lineHeight: 1,
+                  }}
+                >
+                  {'\u00D7'}
+                </button>
+              </div>
+
+              {createViewDraft.mode === 'choice' && (
+                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, minmax(0, 1fr))', gap: 10, marginBottom: 14 }}>
+                  <button
+                    onClick={() => setCreateViewDraft(prev => prev ? {
+                      ...prev,
+                      mode: 'empty',
+                      name: 'New View',
+                    } : prev)}
+                    style={{
+                      textAlign: 'left',
+                      borderRadius: 10,
+                      border: '1px solid var(--border, rgba(0,0,0,0.06))',
+                      background: 'var(--surface-solid, #fff)',
+                      padding: '14px 14px 12px',
+                      cursor: 'pointer',
+                      fontFamily: 'inherit',
+                    }}
+                  >
+                    <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--text-primary, #1a1a1a)' }}>Empty View</div>
+                    <div style={{ fontSize: 11.5, color: 'var(--text-secondary, #555)', lineHeight: 1.5, marginTop: 8 }}>
+                      Start with a blank canvas and the inherited viewpoint.
+                    </div>
+                  </button>
+                  <button
+                    onClick={() => setCreateViewDraft(prev => {
+                      if (!prev) return prev;
+                      const selectedTemplate = viewTemplates.find(template => template.id === prev.templateId) || viewTemplates[0] || VIEW_TEMPLATES[0];
+                      return {
+                        ...prev,
+                        mode: 'template',
+                        templateId: selectedTemplate.id,
+                        name: selectedTemplate.defaultName,
+                      };
+                    })}
+                    style={{
+                      textAlign: 'left',
+                      borderRadius: 10,
+                      border: '1px solid var(--border, rgba(0,0,0,0.06))',
+                      background: 'var(--surface-solid, #fff)',
+                      padding: '14px 14px 12px',
+                      cursor: 'pointer',
+                      fontFamily: 'inherit',
+                    }}
+                  >
+                    <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--text-primary, #1a1a1a)' }}>View From Template</div>
+                    <div style={{ fontSize: 11.5, color: 'var(--text-secondary, #555)', lineHeight: 1.5, marginTop: 8 }}>
+                      Start from a built-in or saved custom scaffold.
+                    </div>
+                  </button>
+                </div>
+              )}
+
+              {createViewDraft.mode === 'template' && (
+                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: 10, marginBottom: 14 }}>
+                  {viewTemplates.map(template => {
+                    const selected = template.id === createViewDraft.templateId;
+                    return (
+                      <button
+                        key={template.id}
+                        onClick={() => setCreateViewDraft(prev => prev ? {
+                          ...prev,
+                          templateId: template.id,
+                          name: template.defaultName,
+                        } : prev)}
+                        style={{
+                          textAlign: 'left',
+                          borderRadius: 10,
+                          border: selected ? '1px solid rgba(37,99,235,0.35)' : '1px solid var(--border, rgba(0,0,0,0.06))',
+                          background: selected ? 'var(--surface-selected, rgba(37,99,235,0.07))' : 'var(--surface-solid, #fff)',
+                          padding: '12px 12px 10px',
+                          cursor: 'pointer',
+                          fontFamily: 'inherit',
+                        }}
+                      >
+                        <div style={{ fontSize: 13, fontWeight: 600, color: selected ? 'var(--accent-text, #1d4ed8)' : 'var(--text-primary, #1a1a1a)' }}>
+                          {template.label}
+                        </div>
+                        <div style={{ fontSize: 10, color: 'var(--text-faint, #b0b0b8)', textTransform: 'uppercase', letterSpacing: '0.4px', marginTop: 4 }}>
+                          {template.kind === 'custom'
+                            ? `Custom • ${getViewpointDefinition(template.viewpoint)?.label || template.viewpoint}`
+                            : (getViewpointDefinition(template.viewpoint)?.label || template.viewpoint)}
+                        </div>
+                        <div style={{ fontSize: 11.5, color: 'var(--text-secondary, #555)', lineHeight: 1.5, marginTop: 8 }}>
+                          {template.description}
+                        </div>
+                      </button>
+                    );
+                  })}
+                </div>
+              )}
+
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10, marginBottom: 16 }}>
+                <div>
+                  <div style={{ fontSize: 10, fontWeight: 500, color: 'var(--text-faint, #b0b0b8)', marginBottom: 5, textTransform: 'uppercase', letterSpacing: '0.4px' }}>
+                    View Name
+                  </div>
+                  <input
+                    autoFocus
+                    value={createViewDraft.name}
+                    onChange={event => setCreateViewDraft(prev => prev ? { ...prev, name: event.target.value } : prev)}
+                    style={{
+                      width: '100%',
+                      padding: '8px 10px',
+                      borderRadius: 8,
+                      border: '1px solid var(--border, rgba(0,0,0,0.06))',
+                      background: 'var(--surface-solid, #fff)',
+                      fontSize: 13,
+                      fontFamily: 'inherit',
+                      boxSizing: 'border-box',
+                    }}
+                  />
+                </div>
+                <div>
+                  <div style={{ fontSize: 10, fontWeight: 500, color: 'var(--text-faint, #b0b0b8)', marginBottom: 5, textTransform: 'uppercase', letterSpacing: '0.4px' }}>
+                    Viewpoint
+                  </div>
+                  <div style={{
+                    padding: '8px 10px',
+                    borderRadius: 8,
+                    border: '1px solid var(--border, rgba(0,0,0,0.06))',
+                    background: 'var(--surface-hover, rgba(0,0,0,0.02))',
+                    fontSize: 13,
+                    color: 'var(--text-secondary, #555)',
+                  }}>
+                    {getViewpointDefinition(
+                      createViewDraft.mode === 'template'
+                        ? (viewTemplates.find(template => template.id === createViewDraft.templateId)?.viewpoint)
+                        : createViewDraft.viewpoint,
+                    )?.label || 'Landscape'}
+                  </div>
+                </div>
+              </div>
+
+              <div style={{
+                padding: '10px 12px',
+                borderRadius: 10,
+                background: 'var(--surface-hover, rgba(0,0,0,0.03))',
+                color: 'var(--text-secondary, #555)',
+                fontSize: 12,
+                lineHeight: 1.6,
+                marginBottom: 16,
+              }}>
+                {createViewDraft.mode === 'empty'
+                  ? 'Empty views start with a blank canvas and inherit the active viewpoint so you can model from scratch.'
+                  : createViewDraft.mode === 'template'
+                    ? ((viewTemplates.find(template => template.id === createViewDraft.templateId)?.starterSummary)
+                      || 'New views start with a focused starter scaffold so the template opens with visible structure and initial semantics.')
+                    : 'Choose whether the new view should start blank or from a reusable template.'}
+              </div>
+
+              <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8 }}>
+                {createViewDraft.mode !== 'choice' && (
+                  <button
+                    onClick={() => setCreateViewDraft(prev => prev ? { ...prev, mode: 'choice' } : prev)}
+                    style={{
+                      padding: '8px 12px',
+                      borderRadius: 8,
+                      border: '1px solid var(--border, rgba(0,0,0,0.06))',
+                      background: 'transparent',
+                      color: 'var(--text-muted, #8a8a90)',
+                      cursor: 'pointer',
+                      fontFamily: 'inherit',
+                    }}
+                  >
+                    Back
+                  </button>
+                )}
+                <button
+                  onClick={() => setCreateViewDraft(null)}
+                  style={{
+                    padding: '8px 12px',
+                    borderRadius: 8,
+                    border: '1px solid var(--border, rgba(0,0,0,0.06))',
+                    background: 'transparent',
+                    color: 'var(--text-muted, #8a8a90)',
+                    cursor: 'pointer',
+                    fontFamily: 'inherit',
+                  }}
+                >
+                  Cancel
+                </button>
+                <button
+                  onClick={submitCreateViewDraft}
+                  disabled={createViewDraft.mode === 'choice'}
+                  style={{
+                    padding: '8px 14px',
+                    borderRadius: 8,
+                    border: 'none',
+                    background: createViewDraft.mode === 'choice' ? 'var(--surface-active, rgba(0,0,0,0.08))' : 'var(--accent, #2563eb)',
+                    color: '#fff',
+                    cursor: createViewDraft.mode === 'choice' ? 'not-allowed' : 'pointer',
+                    fontFamily: 'inherit',
+                    fontWeight: 600,
+                    opacity: createViewDraft.mode === 'choice' ? 0.7 : 1,
+                  }}
+                >
+                  Create View
+                </button>
+              </div>
+            </div>
           </div>
         )}
 
@@ -2573,6 +3403,15 @@ export default function App() {
                 key={tid}
                 onClick={() => { if (editingTabId !== tid) navigateToView(tid); }}
                 onDoubleClick={() => { setEditingTabId(tid); setEditingTabName(v?.name || ''); }}
+                onContextMenu={event => {
+                  event.preventDefault();
+                  openViewContextMenu(tid, event.clientX, event.clientY);
+                }}
+                onMouseDown={event => {
+                  if (event.button !== 1) return;
+                  event.preventDefault();
+                  closeTab(tid);
+                }}
                 style={{
                   display: 'flex', alignItems: 'center', gap: 5, padding: '0 10px', fontSize: 12, fontFamily: 'inherit',
                   cursor: 'pointer', userSelect: 'none', whiteSpace: 'nowrap',
@@ -2628,7 +3467,7 @@ export default function App() {
           })}
           {/* New view tab button */}
           <div
-            onClick={() => addView()}
+            onClick={() => openCreateViewDialog()}
             title="New View"
             style={{
               display: 'flex', alignItems: 'center', justifyContent: 'center',
@@ -2678,7 +3517,74 @@ export default function App() {
               window.addEventListener('mouseup', onUp);
             }}
           />
-          <ViewNav views={views} currentViewId={currentViewId} onNavigate={navigateToView} onAddView={(parentId) => addView(undefined, parentId)} />
+          {organizationTree && (
+            <div style={{ padding: '8px 10px 0' }}>
+              <div style={{
+                display: 'grid',
+                gridTemplateColumns: '1fr 1fr',
+                gap: 4,
+                padding: 3,
+                borderRadius: 8,
+                background: 'var(--surface-hover, rgba(0,0,0,0.035))',
+              }}>
+                <button
+                  onClick={() => setLeftNavMode('views')}
+                  style={{
+                    border: 'none',
+                    borderRadius: 6,
+                    padding: '5px 8px',
+                    cursor: 'pointer',
+                    background: leftNavMode === 'views' ? 'var(--glass, rgba(255,255,255,0.82))' : 'transparent',
+                    color: leftNavMode === 'views' ? 'var(--text-primary, #1a1a1a)' : 'var(--text-muted, #8a8a90)',
+                    fontSize: 11,
+                    fontFamily: 'inherit',
+                    fontWeight: leftNavMode === 'views' ? 500 : 400,
+                  }}
+                >
+                  Views
+                </button>
+                <button
+                  onClick={() => setLeftNavMode('model')}
+                  style={{
+                    border: 'none',
+                    borderRadius: 6,
+                    padding: '5px 8px',
+                    cursor: 'pointer',
+                    background: leftNavMode === 'model' ? 'var(--glass, rgba(255,255,255,0.82))' : 'transparent',
+                    color: leftNavMode === 'model' ? 'var(--text-primary, #1a1a1a)' : 'var(--text-muted, #8a8a90)',
+                    fontSize: 11,
+                    fontFamily: 'inherit',
+                    fontWeight: leftNavMode === 'model' ? 500 : 400,
+                  }}
+                >
+                  Model
+                </button>
+              </div>
+            </div>
+          )}
+          {organizationTree && leftNavMode === 'model' ? (
+            <ModelTree
+              tree={organizationTree}
+              currentViewId={currentViewId}
+              selectedId={selectedId}
+              selectedType={selType}
+              onSelectView={selectViewFromTree}
+              onSelectElement={selectElementFromTree}
+              onSelectRelationship={selectRelationshipFromTree}
+              onMoveItemToFolder={moveTreeItemToFolder}
+              onCreateFolder={createFolder}
+              onRenameFolder={renameFolder}
+              onDeleteFolder={deleteFolder}
+            />
+          ) : (
+            <ViewNav
+              views={views}
+              currentViewId={currentViewId}
+              onNavigate={navigateToView}
+              onAddView={(parentId) => openCreateViewDialog(parentId)}
+              onViewContextMenu={openViewContextMenu}
+            />
+          )}
           {/* Property panel on left side */}
           {propSide === 'left' && (
             <PropertyPanel
@@ -2687,10 +3593,17 @@ export default function App() {
               elements={elements}
               onUpdateElement={updEl}
               onUpdateRelationship={updRel}
+              onUpdateView={updView}
               side="left"
               onToggleSide={() => setPropSide('right')}
               currentView={views.find(v => v.id === currentViewId) ?? null}
               onRenameView={renameView}
+              elementFolderPath={folderDocument ? elementFolderPath : undefined}
+              relationshipFolderPath={folderDocument ? relationshipFolderPath : undefined}
+              viewFolderPath={folderDocument ? viewFolderPath : undefined}
+              onMoveElementToFolder={folderDocument ? moveSelectedElementToFolder : undefined}
+              onMoveRelationshipToFolder={folderDocument ? moveSelectedRelationshipToFolder : undefined}
+              onMoveViewToFolder={folderDocument ? moveCurrentViewToFolder : undefined}
             />
           )}
         </div>
@@ -2910,6 +3823,9 @@ export default function App() {
           onSearch={() => setShowSearch(s => !s)}
           interactionMode={interactionMode}
           onToggleMode={() => setInteractionMode(m => m === 'view' ? 'edit' : 'view')}
+          allowedLayers={allowedLayersForActiveView}
+          allowedElementTypes={allowedElementTypesForActiveView}
+          viewpointLabel={getViewpointDefinition(activeViewpoint)?.label}
         />
 
         {/* ====== Legend toggle + panel (bottom-right) ====== */}
@@ -3086,10 +4002,17 @@ export default function App() {
               elements={elements}
               onUpdateElement={updEl}
               onUpdateRelationship={updRel}
+              onUpdateView={updView}
               side="right"
               onToggleSide={() => setPropSide('left')}
               currentView={views.find(v => v.id === currentViewId) ?? null}
               onRenameView={renameView}
+              elementFolderPath={folderDocument ? elementFolderPath : undefined}
+              relationshipFolderPath={folderDocument ? relationshipFolderPath : undefined}
+              viewFolderPath={folderDocument ? viewFolderPath : undefined}
+              onMoveElementToFolder={folderDocument ? moveSelectedElementToFolder : undefined}
+              onMoveRelationshipToFolder={folderDocument ? moveSelectedRelationshipToFolder : undefined}
+              onMoveViewToFolder={folderDocument ? moveCurrentViewToFolder : undefined}
             />
           </div>
         )}

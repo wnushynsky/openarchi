@@ -107,6 +107,36 @@ function getDocumentation(node: Element): string {
   return '';
 }
 
+function getProperties(node: Element): import('../../types').PropertyRecord[] | undefined {
+  const properties: import('../../types').PropertyRecord[] = [];
+
+  const candidates: Element[] = [];
+  for (const child of Array.from(node.children)) {
+    const childName = localName(child).toLowerCase();
+    if (childName === 'property') candidates.push(child);
+    if (childName === 'properties') {
+      for (const prop of Array.from(child.children)) {
+        if (localName(prop).toLowerCase() === 'property') candidates.push(prop);
+      }
+    }
+  }
+
+  for (const candidate of candidates) {
+    const key = getAttr(candidate, ['key', 'name', 'propertyDefinitionRef']);
+    if (!key) continue;
+
+    let value = getAttr(candidate, ['value']) || '';
+    if (!value) {
+      const valueChild = Array.from(candidate.children).find(child => localName(child).toLowerCase() === 'value');
+      value = valueChild?.textContent?.trim() || candidate.textContent?.trim() || '';
+    }
+
+    properties.push({ key, value });
+  }
+
+  return properties.length > 0 ? properties : undefined;
+}
+
 /** Extract text from a <content> child element (used by DiagramModelNote) */
 function getContentText(node: Element): string {
   const byAttr = getAttr(node, ['content']);
@@ -692,6 +722,8 @@ function parseCoArchiXml(raw: string): ParseResult {
         sourceId,
         targetId,
         name: getName(node),
+        documentation: getDocumentation(node),
+        properties: getProperties(node),
       });
       relationshipIds.add(id);
       continue;
@@ -711,6 +743,7 @@ function parseCoArchiXml(raw: string): ParseResult {
       type: mappedType,
       name: getName(node) || id,
       documentation: getDocumentation(node),
+      properties: getProperties(node),
     });
     elementIds.add(id);
   }
@@ -749,6 +782,8 @@ function parseCoArchiXml(raw: string): ParseResult {
       id,
       name: getName(viewNode) || id,
       childViewIds: [],
+      documentation: getDocumentation(viewNode),
+      properties: getProperties(viewNode),
     });
     viewIds.add(id);
 
@@ -1137,6 +1172,8 @@ export function parseCoArchiFragments(xmlContents: string[], filePaths?: string[
           sourceId,
           targetId,
           name: getName(node),
+          documentation: getDocumentation(node),
+          properties: getProperties(node),
           sourcePath: path,
         });
         relationshipIds.add(id);
@@ -1167,6 +1204,7 @@ export function parseCoArchiFragments(xmlContents: string[], filePaths?: string[
         type: mappedType,
         name: getName(node) || id,
         documentation: getDocumentation(node),
+        properties: getProperties(node),
         sourcePath: path,
       });
       elementIds.add(id);
@@ -1194,6 +1232,8 @@ export function parseCoArchiFragments(xmlContents: string[], filePaths?: string[
       id,
       name: getName(node) || id,
       childViewIds: [],
+      documentation: getDocumentation(node),
+      properties: getProperties(node),
       sourcePath: path,
     });
 
@@ -1466,13 +1506,6 @@ export async function parseCoArchiFragmentsStreaming(
   for (let vi = 0; vi < deferredViews.length; vi++) {
     const dv = deferredViews[vi];
 
-    allViews.push({
-      id: dv.id,
-      name: dv.name,
-      childViewIds: [],
-      sourcePath: dv.path,
-    });
-
     // Re-parse just this view's XML
     const viewDoc = new DOMParser().parseFromString(dv.xml, 'application/xml');
     if (viewDoc.querySelector('parsererror')) continue;
@@ -1482,6 +1515,15 @@ export async function parseCoArchiFragmentsStreaming(
     const viewRoot = viewNodes.find(n => {
       const nId = getAttr(n, ['identifier', 'id']);
       return nId === dv.id;
+    });
+
+    allViews.push({
+      id: dv.id,
+      name: dv.name,
+      childViewIds: [],
+      documentation: viewRoot ? getDocumentation(viewRoot) : '',
+      properties: viewRoot ? getProperties(viewRoot) : undefined,
+      sourcePath: dv.path,
     });
 
     if (viewRoot) {
@@ -1660,6 +1702,16 @@ function styleAttrs(style: import('../../model/canonical').DiagramStyle | undefi
   return attrs;
 }
 
+function propertiesXml(properties: { key: string; value: string }[] | undefined, indent: string): string {
+  if (!properties || properties.length === 0) return '';
+  let xml = `${indent}<properties>\n`;
+  for (const property of properties) {
+    xml += `${indent}  <property key="${escapeXml(property.key)}" value="${escapeXml(property.value)}"/>\n`;
+  }
+  xml += `${indent}</properties>\n`;
+  return xml;
+}
+
 function getDirName(path: string): string {
   const slash = path.lastIndexOf('/');
   return slash >= 0 ? path.slice(0, slash) : '';
@@ -1780,9 +1832,14 @@ export function serializeCoArchiFragmented(model: CanonicalModelDocument): impor
         xml += `\n    type="or"`;
       }
 
-      if (el.documentation) {
-        xml += `>\n  <documentation>${escapeXml(el.documentation)}</documentation>\n` +
-          `</archimate:${tag}>\n`;
+      const hasChildren = !!el.documentation || !!(el.properties && el.properties.length > 0);
+      if (hasChildren) {
+        xml += `>\n`;
+        if (el.documentation) {
+          xml += `  <documentation>${escapeXml(el.documentation)}</documentation>\n`;
+        }
+        xml += propertiesXml(el.properties, '  ');
+        xml += `</archimate:${tag}>\n`;
       } else {
         xml += `/>\n`;
       }
@@ -1817,8 +1874,17 @@ export function serializeCoArchiFragmented(model: CanonicalModelDocument): impor
         `    id="${escapeXml(rel.id)}"\n` +
         `    source="${escapeXml(rel.sourceId)}"\n` +
         `    target="${escapeXml(rel.targetId)}"`;
-
-      xml += `/>\n`;
+      const hasChildren = !!rel.documentation || !!(rel.properties && rel.properties.length > 0);
+      if (hasChildren) {
+        xml += `>\n`;
+        if (rel.documentation) {
+          xml += `  <documentation>${escapeXml(rel.documentation)}</documentation>\n`;
+        }
+        xml += propertiesXml(rel.properties, '  ');
+        xml += `</archimate:${tag}>\n`;
+      } else {
+        xml += `/>\n`;
+      }
 
       files.push({
         relativePath: relationPath,
@@ -1958,6 +2024,11 @@ export function serializeCoArchiFragmented(model: CanonicalModelDocument): impor
         `    xmlns:archimate="${ARCHIMATE_NS}"\n` +
         `    name="${escapeXml(view.name)}"\n` +
         `    id="${escapeXml(view.id)}">\n`;
+
+      if (view.documentation) {
+        xml += `  <documentation>${escapeXml(view.documentation)}</documentation>\n`;
+      }
+      xml += propertiesXml(view.properties, '  ');
 
       // Serialize top-level nodes (no parent)
       const topLevel = childrenByParent.get(undefined) ?? [];

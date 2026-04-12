@@ -35,8 +35,19 @@ const popoverGlass: React.CSSProperties = {
 // Element picker popover — opens from layer dot
 // ============================================================
 
-function ElementPicker({ layerKey, onAddElement, onClose }: { layerKey: string; onAddElement: (type: string) => void; onClose: () => void }) {
-  const items = Object.entries(ELEMENT_TYPES).filter(([, d]) => d.layer === layerKey && !d.isNote);
+function ElementPicker({
+  layerKey,
+  onAddElement,
+  onClose,
+  allowedElementTypes,
+}: {
+  layerKey: string;
+  onAddElement: (type: string) => void;
+  onClose: () => void;
+  allowedElementTypes?: string[];
+}) {
+  const allowed = allowedElementTypes ? new Set(allowedElementTypes) : null;
+  const items = Object.entries(ELEMENT_TYPES).filter(([type, d]) => d.layer === layerKey && !d.isNote && (!allowed || allowed.has(type)));
   const L = LAYERS[layerKey];
   return (
     <div
@@ -206,6 +217,9 @@ export interface FloatingToolbarProps {
   onSearch: () => void;
   interactionMode: 'view' | 'edit';
   onToggleMode: () => void;
+  allowedLayers?: string[];
+  allowedElementTypes?: string[];
+  viewpointLabel?: string;
 }
 
 export function FloatingToolbar(props: FloatingToolbarProps) {
@@ -215,9 +229,13 @@ export function FloatingToolbar(props: FloatingToolbarProps) {
     ioFormatId, onFormatChange, modelFormats,
     gridType, onToggleGrid, onSearch,
     interactionMode, onToggleMode,
+    allowedLayers,
+    allowedElementTypes,
+    viewpointLabel,
   } = props;
 
   const isViewMode = interactionMode === 'view';
+  const allowedLayerSet = allowedLayers ? new Set(allowedLayers) : null;
 
   const [pickerLayer, setPickerLayer] = useState<string | null>(null);
   const [showMenu, setShowMenu] = useState(false);
@@ -261,7 +279,14 @@ export function FloatingToolbar(props: FloatingToolbarProps) {
 
   return (
     <div ref={ref} style={{ position: 'absolute', bottom: 14, left: '50%', transform: 'translateX(-50%)', zIndex: 100, fontFamily: FONT }}>
-      {pickerLayer && <ElementPicker layerKey={pickerLayer} onAddElement={(type) => { onLayerChange(pickerLayer); onAddElement(type); }} onClose={() => setPickerLayer(null)} />}
+      {pickerLayer && (
+        <ElementPicker
+          layerKey={pickerLayer}
+          allowedElementTypes={allowedElementTypes}
+          onAddElement={(type) => { onLayerChange(pickerLayer); onAddElement(type); }}
+          onClose={() => setPickerLayer(null)}
+        />
+      )}
       {showMenu && <FileMenu onOpenDir={onOpenDir} onImport={onImport} onExport={onExport} onSave={onSave} canSave={canSave} isDirty={isDirty} dirState={dirState} dirFiles={dirFiles} activeFilePath={activeFilePath} onSelectFile={onSelectFile} ioFormatId={ioFormatId} onFormatChange={onFormatChange} modelFormats={modelFormats} onClose={() => setShowMenu(false)} />}
 
       <div style={{
@@ -294,23 +319,28 @@ export function FloatingToolbar(props: FloatingToolbarProps) {
           const fill = L.fill === 'transparent' ? '#dddde0' : L.fill;
           const isOpen = pickerLayer === k;
           const isActiveLayer = activeLayer === k;
+          const isAllowedLayer = !allowedLayerSet || allowedLayerSet.has(k);
           return (
             <button key={k}
-              onClick={() => { if (!isViewMode) { setPickerLayer(prev => prev === k ? null : k); setShowMenu(false); } }}
-              title={L.label}
+              onClick={() => { if (!isViewMode && isAllowedLayer) { setPickerLayer(prev => prev === k ? null : k); setShowMenu(false); } }}
+              title={isAllowedLayer ? L.label : `${L.label} not allowed in this viewpoint`}
               style={{
                 width: 24, height: 24, borderRadius: '50%', padding: 0, flexShrink: 0,
                 background: `radial-gradient(circle at 40% 35%, ${fill}, ${L.stroke}40)`,
                 border: isOpen || isActiveLayer ? `2px solid ${L.stroke}` : `1.5px solid ${L.stroke}60`,
-                cursor: isViewMode ? 'default' : 'pointer',
-                opacity: isViewMode ? 0.35 : 1,
+                cursor: isViewMode || !isAllowedLayer ? 'default' : 'pointer',
+                opacity: isViewMode ? 0.35 : isAllowedLayer ? 1 : 0.2,
                 transition: 'transform var(--transition-fast, 0.12s ease), border-color var(--transition-fast, 0.12s ease), box-shadow var(--transition-fast, 0.12s ease)',
                 boxSizing: 'border-box',
                 boxShadow: isOpen || isActiveLayer
                   ? `0 0 0 3px ${L.accent}20, inset 0 1px 2px rgba(255,255,255,0.4)`
                   : 'inset 0 1px 2px rgba(255,255,255,0.3)',
               }}
-              onMouseEnter={e => { e.currentTarget.style.transform = 'scale(1.15)'; e.currentTarget.style.borderColor = L.stroke; }}
+              onMouseEnter={e => {
+                if (!isAllowedLayer) return;
+                e.currentTarget.style.transform = 'scale(1.15)';
+                e.currentTarget.style.borderColor = L.stroke;
+              }}
               onMouseLeave={e => {
                 e.currentTarget.style.transform = 'scale(1)';
                 if (!isOpen && !isActiveLayer) e.currentTarget.style.borderColor = `${L.stroke}60`;
@@ -320,6 +350,20 @@ export function FloatingToolbar(props: FloatingToolbarProps) {
         })}
 
         {div}
+
+        {viewpointLabel && (
+          <>
+            <div style={{
+              padding: '0 8px',
+              fontSize: 11,
+              color: 'var(--text-muted, #8a8a90)',
+              whiteSpace: 'nowrap',
+            }}>
+              {viewpointLabel}
+            </div>
+            {div}
+          </>
+        )}
 
         {/* Note */}
         <button onClick={() => { if (!isViewMode) { onAddElement('note'); close(); } }} title="Note" disabled={isViewMode} style={tb(false, isViewMode)}

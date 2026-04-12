@@ -6,6 +6,7 @@ import type {
   DiagramNodeRecord,
   DiagramConnectionRecord,
   RelativeBendpoint,
+  PropertyRecord,
 } from '../../types';
 import { editorToCanonicalModel, canonicalToEditorModel } from '../../model/mapper';
 import type { ModelDiagnostic } from '../../model/diagnostics';
@@ -23,6 +24,18 @@ function isNumber(value: unknown): value is number {
 
 function isString(value: unknown): value is string {
   return typeof value === 'string';
+}
+
+function parseProperties(raw: unknown): PropertyRecord[] | undefined {
+  if (!Array.isArray(raw)) return undefined;
+  const properties = raw
+    .filter((property): property is JsonRecord => isRecord(property))
+    .filter((property): property is JsonRecord & { key: string } => isString(property.key))
+    .map(property => ({
+      key: property.key,
+      value: isString(property.value) ? property.value : '',
+    }));
+  return properties.length > 0 ? properties : undefined;
 }
 
 function parseElements(raw: unknown[], diagnostics: ModelDiagnostic[]): ModelElement[] {
@@ -58,6 +71,7 @@ function parseElements(raw: unknown[], diagnostics: ModelDiagnostic[]): ModelEle
       w: isNumber(item.w) ? item.w : 160,
       h: isNumber(item.h) ? item.h : 72,
       documentation: isString(item.documentation) ? item.documentation : '',
+      properties: parseProperties(item.properties),
       linkedViewId: isString(item.linkedViewId) ? item.linkedViewId : undefined,
     });
   }
@@ -104,6 +118,8 @@ function parseRelationships(raw: unknown[], diagnostics: ModelDiagnostic[]): Mod
       sourceId: item.sourceId,
       targetId: item.targetId,
       name: isString(item.name) ? item.name : '',
+      documentation: isString(item.documentation) ? item.documentation : '',
+      properties: parseProperties(item.properties),
       waypoints,
       labelPos: isNumber(item.labelPos) ? item.labelPos : 0.5,
     });
@@ -145,6 +161,11 @@ function parseViews(raw: unknown[], diagnostics: ModelDiagnostic[]): ModelView[]
       childViewIds: Array.isArray(item.childViewIds)
         ? item.childViewIds.filter((viewId): viewId is string => isString(viewId))
         : [],
+      documentation: isString(item.documentation) ? item.documentation : '',
+      purpose: isString(item.purpose) ? item.purpose : '',
+      viewpoint: isString(item.viewpoint) ? item.viewpoint : undefined,
+      properties: parseProperties(item.properties),
+      sourcePath: isString(item.sourcePath) ? item.sourcePath : undefined,
     });
   }
 

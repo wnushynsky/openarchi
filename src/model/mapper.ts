@@ -57,6 +57,9 @@ function buildSemanticRelationships(
       sourceId: relationship.sourceId,
       targetId: relationship.targetId,
       name: relationship.name,
+      documentation: relationship.documentation || '',
+      properties: relationship.properties?.map(property => ({ ...property })),
+      sourcePath: relationship.sourcePath,
       waypoints: fallbackConnection?.waypoints || [],
       labelPos: fallbackConnection?.labelPosition ?? 0.5,
       relativeBendpoints: fallbackConnection?.relativeBendpoints,
@@ -84,6 +87,8 @@ export function editorToCanonicalModel(model: OpenArchiModel): CanonicalModelDoc
     type: element.type,
     name: element.name,
     documentation: element.documentation || '',
+    properties: element.properties?.map(property => ({ ...property })),
+    sourcePath: element.sourcePath,
   }));
 
   const relationships: CanonicalRelationship[] = model.relationships.map(relationship => ({
@@ -92,12 +97,20 @@ export function editorToCanonicalModel(model: OpenArchiModel): CanonicalModelDoc
     sourceId: relationship.sourceId,
     targetId: relationship.targetId,
     name: relationship.name,
+    documentation: relationship.documentation || '',
+    properties: relationship.properties?.map(property => ({ ...property })),
+    sourcePath: relationship.sourcePath,
   }));
 
   const canonicalViews: CanonicalView[] = views.map(view => ({
     id: view.id,
     name: view.name,
     childViewIds: view.childViewIds || [],
+    documentation: view.documentation || '',
+    purpose: view.purpose,
+    viewpoint: view.viewpoint,
+    properties: view.properties?.map(property => ({ ...property })),
+    sourcePath: view.sourcePath,
   }));
 
   const elementById = new Map(model.elements.map(element => [element.id, element]));
@@ -203,6 +216,8 @@ export function canonicalToEditorModel(document: CanonicalModelDocument): OpenAr
       w: node?.width ?? DEFAULT_ELEMENT_WIDTH,
       h: node?.height ?? DEFAULT_ELEMENT_HEIGHT,
       documentation: element.documentation || '',
+      properties: element.properties?.map(property => ({ ...property })),
+      sourcePath: element.sourcePath,
       linkedViewId: node?.linkedViewId,
       zIndex: node?.nestingDepth ?? 0,
       style: node?.style ? {
@@ -237,6 +252,11 @@ export function canonicalToEditorModel(document: CanonicalModelDocument): OpenAr
     name: view.name,
     elementIds: [...(nodeIdsByView.get(view.id) || [])],
     childViewIds: view.childViewIds || [],
+    documentation: view.documentation || '',
+    purpose: view.purpose,
+    viewpoint: view.viewpoint,
+    properties: view.properties?.map(property => ({ ...property })),
+    sourcePath: view.sourcePath,
   }));
 
   const views: ModelView[] = mappedViews.length > 0
@@ -357,6 +377,8 @@ export function canonicalToEditorModelWithLayouts(document: CanonicalModelDocume
       w: node?.width ?? DEFAULT_ELEMENT_WIDTH,
       h: node?.height ?? DEFAULT_ELEMENT_HEIGHT,
       documentation: element.documentation || '',
+      properties: element.properties?.map(property => ({ ...property })),
+      sourcePath: element.sourcePath,
       linkedViewId: node?.linkedViewId,
       zIndex: node?.nestingDepth ?? 0,
       style: node?.style ? {
@@ -390,6 +412,11 @@ export function canonicalToEditorModelWithLayouts(document: CanonicalModelDocume
     name: view.name,
     elementIds: [...(nodeIdsByView.get(view.id) || [])],
     childViewIds: view.childViewIds || [],
+    documentation: view.documentation || '',
+    purpose: view.purpose,
+    viewpoint: view.viewpoint,
+    properties: view.properties?.map(property => ({ ...property })),
+    sourcePath: view.sourcePath,
   }));
 
   const views: ModelView[] = mappedViews.length > 0

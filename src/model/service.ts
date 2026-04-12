@@ -2,6 +2,7 @@ import type { OpenArchiModel } from '../types';
 import { AdapterRegistry } from '../io/adapter';
 import type { ModelFormatAdapter, FragmentedSerializeResult } from '../io/adapter';
 import { openArchiJsonAdapter } from '../io/adapters/openarchi-json';
+import { openArchiMarkdownAdapter } from '../io/adapters/openarchi-markdown';
 import { coArchiXmlAdapter, parseCoArchiFragmentsStreaming, serializeCoArchiFragmented } from '../io/adapters/coarchi-xml';
 import type { ProgressCallback } from '../io/adapters/coarchi-xml';
 import { archiMateExchangeXmlAdapter } from '../io/adapters/archimate-exchange-xml';
@@ -15,9 +16,12 @@ import type {
 import { hasDiagnosticErrors, type ModelDiagnostic } from './diagnostics';
 import type { CanonicalModelDocument } from './canonical';
 import type { OpenFileEntry } from '../io/filesystem';
+import { validateCanonicalDocument } from './validation';
+import { ensureCanonicalSourcePaths } from './source-paths';
 
 const registry = new AdapterRegistry([
   openArchiJsonAdapter,
+  openArchiMarkdownAdapter,
   coArchiXmlAdapter,
   archiMateExchangeXmlAdapter,
 ]);
@@ -51,17 +55,28 @@ function mergeEditorModelIntoCanonical(
 
   canonical.elements = canonical.elements.map(element => ({
     ...element,
-    sourcePath: elementById.get(element.id)?.sourcePath,
+    summary: elementById.get(element.id)?.summary,
+    tags: elementById.get(element.id)?.tags,
+    properties: element.properties ?? elementById.get(element.id)?.properties,
+    sourcePath: element.sourcePath || elementById.get(element.id)?.sourcePath,
   }));
 
   canonical.relationships = canonical.relationships.map(relationship => ({
     ...relationship,
-    sourcePath: relationshipById.get(relationship.id)?.sourcePath,
+    documentation: relationship.documentation ?? relationshipById.get(relationship.id)?.documentation,
+    tags: relationshipById.get(relationship.id)?.tags,
+    properties: relationship.properties ?? relationshipById.get(relationship.id)?.properties,
+    sourcePath: relationship.sourcePath || relationshipById.get(relationship.id)?.sourcePath,
   }));
 
   canonical.views = canonical.views.map(view => ({
     ...view,
-    sourcePath: viewById.get(view.id)?.sourcePath,
+    documentation: view.documentation ?? viewById.get(view.id)?.documentation,
+    purpose: view.purpose ?? viewById.get(view.id)?.purpose,
+    viewpoint: view.viewpoint ?? viewById.get(view.id)?.viewpoint,
+    tags: viewById.get(view.id)?.tags,
+    properties: view.properties ?? viewById.get(view.id)?.properties,
+    sourcePath: view.sourcePath || viewById.get(view.id)?.sourcePath,
   }));
 
   canonical.metadata = {
@@ -69,6 +84,7 @@ function mergeEditorModelIntoCanonical(
     ...(canonical.metadata || {}),
     sourceFormat: baseDocument.metadata?.sourceFormat || canonical.metadata?.sourceFormat,
     coArchi: baseDocument.metadata?.coArchi,
+    ai: baseDocument.metadata?.ai,
   };
 
   return canonical;
@@ -76,12 +92,45 @@ function mergeEditorModelIntoCanonical(
 
 function collectDeletedFragmentPaths(
   previous: { id: string; sourcePath?: string }[],
-  nextIds: Set<string>,
+  nextEntries: { id: string; sourcePath?: string }[],
 ): string[] {
+  const nextById = new Map(nextEntries.map(entry => [entry.id, entry.sourcePath]));
   return previous
-    .filter(entry => !!entry.sourcePath && !nextIds.has(entry.id))
+    .filter(entry => {
+      if (!entry.sourcePath) return false;
+      if (!nextById.has(entry.id)) return true;
+      return nextById.get(entry.id) !== entry.sourcePath;
+    })
     .map(entry => entry.sourcePath!)
     .sort((a, b) => a.localeCompare(b));
+}
+
+function collectCreatedFragmentPaths(
+  previous: { id: string; sourcePath?: string }[],
+  nextEntries: { id: string; sourcePath?: string }[],
+): string[] {
+  const previousById = new Map(previous.map(entry => [entry.id, entry.sourcePath]));
+  return nextEntries
+    .filter(entry => {
+      if (!entry.sourcePath) return false;
+      if (!previousById.has(entry.id)) return true;
+      return previousById.get(entry.id) !== entry.sourcePath;
+    })
+    .map(entry => entry.sourcePath!)
+    .sort((a, b) => a.localeCompare(b));
+}
+
+function collectFolderManifestChanges(
+  previousFolders: { path: string }[] = [],
+  nextFolders: { path: string }[] = [],
+): { createdFolderPaths: string[]; deletedFolderPaths: string[] } {
+  const previousPaths = new Set(previousFolders.map(folder => folder.path));
+  const nextPaths = new Set(nextFolders.map(folder => folder.path));
+
+  const createdFolderPaths = [...nextPaths].filter(path => !previousPaths.has(path)).sort((a, b) => a.localeCompare(b));
+  const deletedFolderPaths = [...previousPaths].filter(path => !nextPaths.has(path)).sort((a, b) => a.localeCompare(b));
+
+  return { createdFolderPaths, deletedFolderPaths };
 }
 
 function fallbackElementLayout(
@@ -246,6 +295,7 @@ export function listModelFormats(): ModelFormatAdapter[] {
 
 export function detectModelFormatByFileName(fileName: string): ModelFormatAdapter | undefined {
   const lower = fileName.toLowerCase();
+  if (lower.endsWith('.openarchi.md')) return registry.getById('openarchi-markdown');
   if (lower.endsWith('.openarchi.json') || lower.endsWith('.json')) return registry.getById('openarchi-json');
   if (lower.endsWith('.coarchi.xml') || lower.endsWith('.coarchi')) return registry.getById('coarchi-xml');
   if (lower.endsWith('.archimate.xml') || lower.endsWith('.archimate')) return registry.getById('coarchi-xml');
@@ -267,16 +317,18 @@ export function importEditorModelFromText(raw: string, formatId: string): ModelI
   }
 
   const parsed = adapter.parse(raw);
-  if (!parsed.model || hasDiagnosticErrors(parsed.diagnostics)) {
+  const validationDiagnostics = parsed.model ? validateCanonicalDocument(parsed.model) : [];
+  const diagnostics = [...parsed.diagnostics, ...validationDiagnostics];
+  if (!parsed.model || hasDiagnosticErrors(diagnostics)) {
     return {
-      diagnostics: parsed.diagnostics,
+      diagnostics,
     };
   }
 
   return {
     model: canonicalToEditorModel(parsed.model),
     document: parsed.model,
-    diagnostics: parsed.diagnostics,
+    diagnostics,
   };
 }
 
@@ -303,7 +355,8 @@ export function isFragmentedModelDirectory(files: OpenFileEntry[]): boolean {
   // it's likely fragmented. Check if any single file could be a complete model.
   const hasLargeModelFile = files.some(f => {
     const lower = f.relativePath.toLowerCase();
-    return lower.endsWith('.archimate') ||
+    return lower.endsWith('.openarchi.md') ||
+           lower.endsWith('.archimate') ||
            lower.endsWith('.archimate.xml') ||
            lower.endsWith('.openarchi.json');
   });
@@ -357,8 +410,13 @@ export async function importFragmentedModel(
   );
 
   if (!parsed.model || hasDiagnosticErrors(parsed.diagnostics)) {
-    return { diagnostics: parsed.diagnostics };
+    const diagnostics = parsed.model
+      ? [...parsed.diagnostics, ...validateCanonicalDocument(parsed.model)]
+      : parsed.diagnostics;
+    return { diagnostics };
   }
+
+  const diagnostics = [...parsed.diagnostics, ...validateCanonicalDocument(parsed.model)];
 
   // Use combined conversion to build model + layouts in a single pass
   const { model, elementLayouts, relationshipLayouts } = canonicalToEditorModelWithLayouts(parsed.model);
@@ -366,7 +424,7 @@ export async function importFragmentedModel(
   return {
     model,
     document: parsed.model,
-    diagnostics: parsed.diagnostics,
+    diagnostics,
     elementLayouts,
     relationshipLayouts,
   };
@@ -390,7 +448,12 @@ export function exportEditorModelToText(model: OpenArchiModel, formatId: string)
   }
 
   const canonical = editorToCanonicalModel(model);
-  return adapter.serialize(canonical);
+  const validationDiagnostics = validateCanonicalDocument(canonical);
+  const result = adapter.serialize(canonical);
+  return {
+    ...result,
+    diagnostics: [...validationDiagnostics, ...result.diagnostics],
+  };
 }
 
 /**
@@ -403,30 +466,51 @@ export function exportFragmentedEditorModel(
   elementLayouts?: ElementLayoutsByView,
   relationshipLayouts?: RelationshipLayoutsByView,
 ): FragmentedSerializeResult {
-  const canonical = applyLayoutsToCanonical(
+  const canonicalWithLayouts = applyLayoutsToCanonical(
     mergeEditorModelIntoCanonical(model, baseDocument),
     model,
     elementLayouts,
     relationshipLayouts,
     baseDocument,
   );
+  const canonical = ensureCanonicalSourcePaths(canonicalWithLayouts);
+  const validationDiagnostics = validateCanonicalDocument(canonical);
   const result = serializeCoArchiFragmented(canonical);
 
-  if (!baseDocument) return result;
-
-  const nextElementIds = new Set(canonical.elements.map(element => element.id));
-  const nextRelationshipIds = new Set(canonical.relationships.map(relationship => relationship.id));
-  const nextViewIds = new Set(canonical.views.map(view => view.id));
+  if (!baseDocument) {
+    return {
+      ...result,
+      diagnostics: [...validationDiagnostics, ...result.diagnostics],
+    };
+  }
 
   const deletedPaths = [
-    ...collectDeletedFragmentPaths(baseDocument.elements, nextElementIds),
-    ...collectDeletedFragmentPaths(baseDocument.relationships, nextRelationshipIds),
-    ...collectDeletedFragmentPaths(baseDocument.views, nextViewIds),
+    ...collectDeletedFragmentPaths(baseDocument.elements, canonical.elements),
+    ...collectDeletedFragmentPaths(baseDocument.relationships, canonical.relationships),
+    ...collectDeletedFragmentPaths(baseDocument.views, canonical.views),
   ];
+
+  const createdPaths = [
+    ...collectCreatedFragmentPaths(baseDocument.elements, canonical.elements),
+    ...collectCreatedFragmentPaths(baseDocument.relationships, canonical.relationships),
+    ...collectCreatedFragmentPaths(baseDocument.views, canonical.views),
+  ].sort((a, b) => a.localeCompare(b));
+
+  const { createdFolderPaths, deletedFolderPaths } = collectFolderManifestChanges(
+    baseDocument.metadata?.coArchi?.folders || [],
+    canonical.metadata?.coArchi?.folders || [],
+  );
 
   return {
     ...result,
-    deletedPaths,
+    diagnostics: [...validationDiagnostics, ...result.diagnostics],
+    deletedPaths: [...deletedPaths, ...deletedFolderPaths].sort((a, b) => a.localeCompare(b)),
+    changeSet: {
+      createdPaths,
+      deletedPaths: [...deletedPaths, ...deletedFolderPaths].sort((a, b) => a.localeCompare(b)),
+      createdFolderPaths,
+      deletedFolderPaths,
+    },
     document: canonical,
   };
 }

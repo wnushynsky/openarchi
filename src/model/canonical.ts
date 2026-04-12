@@ -5,6 +5,7 @@ export interface CoArchiFolderEntry {
   name?: string;
   id?: string;
   type?: string;
+  explicit?: boolean;
 }
 
 export interface CoArchiMetadata {
@@ -14,6 +15,17 @@ export interface CoArchiMetadata {
   modelVersion?: string;
   modelPurpose?: string;
   folders?: CoArchiFolderEntry[];
+}
+
+export interface CanonicalProperty {
+  key: string;
+  value: string;
+}
+
+export interface CanonicalAiMetadata {
+  primaryPrompt?: string;
+  agentNotes?: string[];
+  generatedBy?: string;
 }
 
 /** Optional visual style metadata preserved from source diagram */
@@ -38,6 +50,9 @@ export interface CanonicalElement {
   type: string;
   name: string;
   documentation: string;
+  summary?: string;
+  tags?: string[];
+  properties?: CanonicalProperty[];
   sourcePath?: string;
 }
 
@@ -47,6 +62,9 @@ export interface CanonicalRelationship {
   sourceId: string;
   targetId: string;
   name: string;
+  documentation?: string;
+  tags?: string[];
+  properties?: CanonicalProperty[];
   sourcePath?: string;
 }
 
@@ -54,6 +72,11 @@ export interface CanonicalView {
   id: string;
   name: string;
   childViewIds: string[];
+  documentation?: string;
+  purpose?: string;
+  viewpoint?: string;
+  tags?: string[];
+  properties?: CanonicalProperty[];
   sourcePath?: string;
 }
 
@@ -98,5 +121,6 @@ export interface CanonicalModelDocument {
   metadata?: {
     sourceFormat?: string;
     coArchi?: CoArchiMetadata;
+    ai?: CanonicalAiMetadata;
   };
 }

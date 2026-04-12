@@ -2,7 +2,7 @@
 // File System Access API wrapper + fallback for opening directories & files
 // ---------------------------------------------------------------------------
 
-const VALID_EXTENSIONS = ['.archimate', '.xml', '.json'];
+const VALID_EXTENSIONS = ['.archimate', '.xml', '.json', '.openarchi.md'];
 
 function isValidFile(name: string): boolean {
   const lower = name.toLowerCase();

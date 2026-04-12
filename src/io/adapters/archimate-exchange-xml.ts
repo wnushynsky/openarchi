@@ -46,6 +46,36 @@ function getDocumentation(node: Element): string {
   return documentationChild?.textContent?.trim() || '';
 }
 
+function getProperties(node: Element): import('../../types').PropertyRecord[] | undefined {
+  const properties: import('../../types').PropertyRecord[] = [];
+
+  const candidates: Element[] = [];
+  for (const child of Array.from(node.children)) {
+    const childName = localName(child).toLowerCase();
+    if (childName === 'property') candidates.push(child);
+    if (childName === 'properties') {
+      for (const prop of Array.from(child.children)) {
+        if (localName(prop).toLowerCase() === 'property') candidates.push(prop);
+      }
+    }
+  }
+
+  for (const candidate of candidates) {
+    const key = getAttr(candidate, ['key', 'name', 'propertyDefinitionRef']);
+    if (!key) continue;
+
+    let value = getAttr(candidate, ['value']) || '';
+    if (!value) {
+      const valueChild = Array.from(candidate.children).find(child => localName(child).toLowerCase() === 'value');
+      value = valueChild?.textContent?.trim() || candidate.textContent?.trim() || '';
+    }
+
+    properties.push({ key, value });
+  }
+
+  return properties.length > 0 ? properties : undefined;
+}
+
 function extractTypeName(rawType: string | undefined): string {
   if (!rawType) return '';
   const noPrefix = rawType.includes(':') ? rawType.split(':').pop() || '' : rawType;
@@ -607,6 +637,8 @@ function parseArchiMateExchangeXml(raw: string): ParseResult {
         sourceId,
         targetId,
         name: getName(node),
+        documentation: getDocumentation(node),
+        properties: getProperties(node),
       });
       relationshipIds.add(id);
       continue;
@@ -621,6 +653,7 @@ function parseArchiMateExchangeXml(raw: string): ParseResult {
       type: mappedType,
       name: getName(node) || id,
       documentation: getDocumentation(node),
+      properties: getProperties(node),
     });
     elementIds.add(id);
   }
@@ -647,6 +680,8 @@ function parseArchiMateExchangeXml(raw: string): ParseResult {
       id,
       name: getName(viewNode) || id,
       childViewIds: [],
+      documentation: getDocumentation(viewNode),
+      properties: getProperties(viewNode),
     });
     viewIds.add(id);
 
@@ -798,6 +833,16 @@ function escapeXml(text: string): string {
     .replace(/'/g, '&apos;');
 }
 
+function propertiesXml(properties: { key: string; value: string }[] | undefined, indent: string): string[] {
+  if (!properties || properties.length === 0) return [];
+  const lines = [`${indent}<archimate:properties>`];
+  for (const property of properties) {
+    lines.push(`${indent}  <archimate:property key="${escapeXml(property.key)}" value="${escapeXml(property.value)}"/>`);
+  }
+  lines.push(`${indent}</archimate:properties>`);
+  return lines;
+}
+
 function serializeArchiMateExchangeXml(
   model: CanonicalModelDocument,
   context?: import('../adapter').SerializeContext,
@@ -827,6 +872,12 @@ function serializeArchiMateExchangeXml(
       lines.push(`    <archimate:element identifier="${escapeXml(element.id)}" xsi:type="${xmlType}"${junctionAttr}>`);
       lines.push(`      <archimate:name>${escapeXml(element.name)}</archimate:name>`);
       lines.push(`      <archimate:documentation>${escapeXml(element.documentation)}</archimate:documentation>`);
+      lines.push(...propertiesXml(element.properties, '      '));
+      lines.push(`    </archimate:element>`);
+    } else if (element.properties && element.properties.length > 0) {
+      lines.push(`    <archimate:element identifier="${escapeXml(element.id)}" xsi:type="${xmlType}"${junctionAttr}>`);
+      lines.push(`      <archimate:name>${escapeXml(element.name)}</archimate:name>`);
+      lines.push(...propertiesXml(element.properties, '      '));
       lines.push(`    </archimate:element>`);
     } else {
       lines.push(`    <archimate:element identifier="${escapeXml(element.id)}" xsi:type="${xmlType}"${junctionAttr}><archimate:name>${escapeXml(element.name)}</archimate:name></archimate:element>`);
@@ -839,8 +890,16 @@ function serializeArchiMateExchangeXml(
   lines.push('  <archimate:relationships>');
   for (const rel of model.relationships) {
     const xmlType = `archimate:${toArchiMateRelationshipType(rel.type)}`;
-    const nameAttr = rel.name ? ` name="${escapeXml(rel.name)}"` : '';
-    lines.push(`    <archimate:relationship identifier="${escapeXml(rel.id)}" xsi:type="${xmlType}" source="${escapeXml(rel.sourceId)}" target="${escapeXml(rel.targetId)}"${nameAttr}/>`);
+    if (rel.documentation || (rel.properties && rel.properties.length > 0)) {
+      lines.push(`    <archimate:relationship identifier="${escapeXml(rel.id)}" xsi:type="${xmlType}" source="${escapeXml(rel.sourceId)}" target="${escapeXml(rel.targetId)}">`);
+      if (rel.name) lines.push(`      <archimate:name>${escapeXml(rel.name)}</archimate:name>`);
+      if (rel.documentation) lines.push(`      <archimate:documentation>${escapeXml(rel.documentation)}</archimate:documentation>`);
+      lines.push(...propertiesXml(rel.properties, '      '));
+      lines.push('    </archimate:relationship>');
+    } else {
+      const nameAttr = rel.name ? ` name="${escapeXml(rel.name)}"` : '';
+      lines.push(`    <archimate:relationship identifier="${escapeXml(rel.id)}" xsi:type="${xmlType}" source="${escapeXml(rel.sourceId)}" target="${escapeXml(rel.targetId)}"${nameAttr}/>`);
+    }
   }
   lines.push('  </archimate:relationships>');
 
@@ -873,6 +932,8 @@ function serializeArchiMateExchangeXml(
     for (const view of model.views) {
       lines.push(`    <archimate:view identifier="${escapeXml(view.id)}" xsi:type="archimate:Diagram">`);
       lines.push(`      <archimate:name>${escapeXml(view.name)}</archimate:name>`);
+      if (view.documentation) lines.push(`      <archimate:documentation>${escapeXml(view.documentation)}</archimate:documentation>`);
+      lines.push(...propertiesXml(view.properties, '      '));
 
       // Nodes
       const nodes = viewNodesByView.get(view.id) || [];

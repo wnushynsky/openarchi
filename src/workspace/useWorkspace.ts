@@ -1,5 +1,6 @@
 import { useState, useRef, useEffect, useCallback } from 'react';
 import { WorkspaceManager } from './manager';
+import type { IncrementalSaveResult } from './manager';
 import type { WorkspaceState } from './types';
 import { INITIAL_WORKSPACE_STATE } from './types';
 import type { DirectoryState, OpenFileEntry } from '../io/filesystem';
@@ -17,11 +18,13 @@ export interface UseWorkspaceReturn {
   markClean: () => void;
   /** Save content to the active single file */
   saveFile: (entry: OpenFileEntry, content: string) => Promise<void>;
-  /** Save fragmented files to the directory */
+  /** Save fragmented files to the directory (incremental — only writes changed files) */
   saveFragmented: (
     files: { relativePath: string; content: string }[],
     deletedPaths?: string[],
-  ) => Promise<void>;
+  ) => Promise<IncrementalSaveResult>;
+  /** Save a single fragment file to the directory */
+  saveSingleFragment: (relativePath: string, content: string) => Promise<void>;
   /** Get a file entry by relative path */
   getFile: (relativePath: string) => OpenFileEntry | undefined;
   /** Get the currently active file entry */
@@ -106,8 +109,12 @@ export function useWorkspace(): UseWorkspaceReturn {
   const saveFragmented = useCallback(async (
     files: { relativePath: string; content: string }[],
     deletedPaths: string[] = [],
-  ) => {
-    await manager.saveFragmented(files, deletedPaths);
+  ): Promise<IncrementalSaveResult> => {
+    return manager.saveFragmented(files, deletedPaths);
+  }, [manager]);
+
+  const saveSingleFragment = useCallback(async (relativePath: string, content: string) => {
+    await manager.saveSingleFragment(relativePath, content);
   }, [manager]);
 
   const getFile = useCallback((relativePath: string) => {
@@ -142,6 +149,7 @@ export function useWorkspace(): UseWorkspaceReturn {
     markClean,
     saveFile,
     saveFragmented,
+    saveSingleFragment,
     getFile,
     getActiveFile,
     closeWorkspace,

@@ -15,7 +15,7 @@ import {
   SAMPLE_ELEMENTS, SAMPLE_RELATIONSHIPS, SAMPLE_VIEWS,
   snapToElements, type SnapGuide,
 } from './core';
-import { drawDotGrid, drawLineGrid, drawElement, drawRelationship, drawSnapGuides, getRelSegments, type RelSegments } from './canvas';
+import { drawDotGrid, drawLineGrid, drawElement, drawRelationship, drawSnapGuides, getRelSegments, exportViewToSvg, type RelSegments } from './canvas';
 import { RelPicker, CtxMenu, SearchPanel, ViewNav, PropertyPanel, ModelTree, Btn, CanvasIcon, FloatingToolbar } from './components';
 import {
   detectModelFormatByFileName,
@@ -436,7 +436,7 @@ export default function App() {
   // Workspace (directory, file, dirty, git branch – persisted to IndexedDB)
   const {
     workspace, openDirectory: wsOpenDirectory, setActiveFile: wsSetActiveFile,
-    markDirty, markClean, saveFile: wsSaveFile, saveFragmented: wsSaveFragmented,
+    markDirty, markClean, saveFile: wsSaveFile, saveFragmented: wsSaveFragmented, saveSingleFragment: wsSaveSingleFragment,
     getFile: wsGetFile, getActiveFile,
     closeWorkspace,
     restorePending, restoreDirectoryName, requestPermissionAndRestore,
@@ -2618,16 +2618,12 @@ export default function App() {
         }
         const preview = result.changeSet ? buildFragmentedSavePreview(result.changeSet) : null;
         if (preview && !window.confirm(preview)) return;
-        await wsSaveFragmented(result.files, result.deletedPaths || []);
+        const saveResult = await wsSaveFragmented(result.files, result.deletedPaths || []);
         fragmentedSourceDocumentRef.current = result.document ?? fragmentedSourceDocumentRef.current;
         setOrganizationBaseDocument(result.document ?? fragmentedSourceDocumentRef.current);
-        const summary = result.changeSet
-          ? `Saved ${result.files.length} files to ${wsDirName || 'workspace'}/`
-            + ` | +${result.changeSet.createdPaths.length} files`
-            + ` | -${result.changeSet.deletedPaths.length} files`
-            + ` | +${result.changeSet.createdFolderPaths.length} folders`
-            + ` | -${result.changeSet.deletedFolderPaths.length} folders`
-          : `Saved ${result.files.length} files to ${wsDirName || 'workspace'}/`;
+        const summary = `Wrote ${saveResult.writtenCount} of ${result.files.length} files to ${wsDirName || 'workspace'}/`
+          + (saveResult.skippedCount > 0 ? ` (${saveResult.skippedCount} unchanged)` : '')
+          + (saveResult.deletedCount > 0 ? ` | -${saveResult.deletedCount} deleted` : '');
         showTransientDiagnostic(summary);
       } catch (err) {
         alert(`Save failed: ${err}`);
@@ -2666,7 +2662,41 @@ export default function App() {
       URL.revokeObjectURL(url);
       markClean();
     }
-  }, [wsKind, workspace.directoryHandle, getActiveFile, wsFormat, wsDirName, exportModel, wsSaveFile, wsSaveFragmented, markClean, showTransientDiagnostic, saveViewLayoutSnapshot, currentViewId, buildFragmentedSaveDocument, buildEditorModelForExport]);
+  }, [wsKind, workspace.directoryHandle, getActiveFile, wsFormat, wsDirName, exportModel, wsSaveFile, wsSaveFragmented, wsSaveSingleFragment, markClean, showTransientDiagnostic, saveViewLayoutSnapshot, currentViewId, buildFragmentedSaveDocument, buildEditorModelForExport]);
+
+  const handleSaveAsJson = useCallback(async () => {
+    if (!workspace.directoryHandle) {
+      alert('No directory open — cannot save JSON file.');
+      return;
+    }
+    try {
+      const result = exportEditorModelToText(buildEditorModelForExport(), 'openarchi-json');
+      if (result.diagnostics.some(d => d.severity === 'error')) {
+        alert(result.diagnostics.find(d => d.severity === 'error')?.message || 'Export failed');
+        return;
+      }
+      await wsSaveSingleFragment('model.openarchi.json', result.content);
+      showTransientDiagnostic(`Saved model.openarchi.json to ${wsDirName || 'workspace'}/`);
+    } catch (err) {
+      alert(`Save failed: ${err}`);
+    }
+  }, [workspace.directoryHandle, buildEditorModelForExport, wsSaveSingleFragment, wsDirName, showTransientDiagnostic]);
+
+  const handleExportSvg = useCallback(() => {
+    const viewName = views.find(v => v.id === currentViewId)?.name || 'view';
+    const svg = exportViewToSvg(
+      visibleDiagramElements as ModelElement[],
+      visibleRelationships as ModelRelationship[],
+    );
+    const blob = new Blob([svg], { type: 'image/svg+xml' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `${viewName.replace(/[^a-zA-Z0-9_-]/g, '_')}.svg`;
+    a.click();
+    URL.revokeObjectURL(url);
+    showTransientDiagnostic(`Exported ${viewName}.svg`);
+  }, [views, currentViewId, visibleDiagramElements, visibleRelationships, showTransientDiagnostic]);
 
   // Mark dirty on model changes (skip initial render)
   const isInitialRender = useRef(true);
@@ -3760,6 +3790,7 @@ export default function App() {
           {showSearch && (
             <SearchPanel
               elements={elements}
+              relationships={relationships}
               views={views}
               onSelectElement={id => {
                 setSelectedNodeId(null);
@@ -3771,6 +3802,12 @@ export default function App() {
                 const semanticInView = visibleElements.find(element => element.id === id);
                 const el = inView || semanticInView || elements.find(element => element.id === id);
                 if (el) setCam(p => ({ ...p, x: cSize.w / 2 - el.x * p.s, y: cSize.h / 2 - el.y * p.s }));
+              }}
+              onSelectRelationship={id => {
+                setSelectedNodeId(null);
+                setSelectedConnectionId(null);
+                setSelectedId(id);
+                setSelType('relationship');
               }}
               onSelectView={id => navigateToView(id)}
               onClose={() => setShowSearch(false)}
@@ -3805,7 +3842,9 @@ export default function App() {
           onOpenDir={handleOpenDirectory}
           onImport={importModel}
           onExport={exportModel}
+          onExportSvg={handleExportSvg}
           onSave={handleSave}
+          onSaveAsJson={workspace.directoryHandle ? handleSaveAsJson : undefined}
           canSave={!!wsActiveFilePath || wsKind === 'coarchi-directory'}
           isDirty={isDirty}
           dirState={!!wsDirName}

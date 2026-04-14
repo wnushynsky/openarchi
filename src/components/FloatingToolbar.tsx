@@ -98,8 +98,8 @@ function ElementPicker({
 // File menu popover
 // ============================================================
 
-function FileMenu({ onOpenDir, onImport, onExport, onSave, canSave, isDirty, dirState, dirFiles, activeFilePath, onSelectFile, ioFormatId, onFormatChange, modelFormats, onClose }: {
-  onOpenDir: () => void; onImport: () => void; onExport: () => void; onSave: () => void;
+function FileMenu({ onOpenDir, onImport, onExport, onExportSvg, onSave, onSaveAsJson, canSave, isDirty, dirState, dirFiles, activeFilePath, onSelectFile, ioFormatId, onFormatChange, modelFormats, onClose }: {
+  onOpenDir: () => void; onImport: () => void; onExport: () => void; onExportSvg?: () => void; onSave: () => void; onSaveAsJson?: () => void;
   canSave: boolean; isDirty: boolean; dirState: boolean;
   dirFiles: { relativePath: string }[]; activeFilePath: string; onSelectFile: (p: string) => void;
   ioFormatId: string; onFormatChange: (id: string) => void; modelFormats: { id: string; label: string }[]; onClose: () => void;
@@ -130,6 +130,7 @@ function FileMenu({ onOpenDir, onImport, onExport, onSave, canSave, isDirty, dir
       <Row label="Open Directory" onClick={() => { onOpenDir(); onClose(); }} />
       <Row label="Import" onClick={() => { onImport(); onClose(); }} />
       <Row label="Export" onClick={() => { onExport(); onClose(); }} />
+      {onExportSvg && <Row label="Export View as SVG" onClick={() => { onExportSvg(); onClose(); }} />}
       {canSave && (
         <button onClick={() => { onSave(); onClose(); }}
           style={{
@@ -150,6 +151,9 @@ function FileMenu({ onOpenDir, onImport, onExport, onSave, canSave, isDirty, dir
           </span>
           <span style={{ fontSize: 11, color: 'var(--text-faint, #b0b0b8)', fontWeight: 500, fontFamily: 'inherit' }}>{'\u2318S'}</span>
         </button>
+      )}
+      {onSaveAsJson && dirState && (
+        <Row label="Save as JSON" onClick={() => { onSaveAsJson(); onClose(); }} />
       )}
       {dirState && dirFiles.length > 1 && (<>
         <div style={{ height: 1, background: 'var(--border, rgba(0,0,0,0.06))', margin: '3px 8px' }} />
@@ -202,7 +206,9 @@ export interface FloatingToolbarProps {
   onOpenDir: () => void;
   onImport: () => void;
   onExport: () => void;
+  onExportSvg?: () => void;
   onSave: () => void;
+  onSaveAsJson?: () => void;
   canSave: boolean;
   isDirty: boolean;
   dirState: boolean;
@@ -225,7 +231,7 @@ export interface FloatingToolbarProps {
 export function FloatingToolbar(props: FloatingToolbarProps) {
   const {
     activeLayer, onLayerChange, onAddElement, onDeleteSelected, hasSelection,
-    onOpenDir, onImport, onExport, onSave, canSave, isDirty, dirState, dirFiles, activeFilePath, onSelectFile,
+    onOpenDir, onImport, onExport, onExportSvg, onSave, onSaveAsJson, canSave, isDirty, dirState, dirFiles, activeFilePath, onSelectFile,
     ioFormatId, onFormatChange, modelFormats,
     gridType, onToggleGrid, onSearch,
     interactionMode, onToggleMode,
@@ -287,7 +293,7 @@ export function FloatingToolbar(props: FloatingToolbarProps) {
           onClose={() => setPickerLayer(null)}
         />
       )}
-      {showMenu && <FileMenu onOpenDir={onOpenDir} onImport={onImport} onExport={onExport} onSave={onSave} canSave={canSave} isDirty={isDirty} dirState={dirState} dirFiles={dirFiles} activeFilePath={activeFilePath} onSelectFile={onSelectFile} ioFormatId={ioFormatId} onFormatChange={onFormatChange} modelFormats={modelFormats} onClose={() => setShowMenu(false)} />}
+      {showMenu && <FileMenu onOpenDir={onOpenDir} onImport={onImport} onExport={onExport} onExportSvg={onExportSvg} onSave={onSave} onSaveAsJson={onSaveAsJson} canSave={canSave} isDirty={isDirty} dirState={dirState} dirFiles={dirFiles} activeFilePath={activeFilePath} onSelectFile={onSelectFile} ioFormatId={ioFormatId} onFormatChange={onFormatChange} modelFormats={modelFormats} onClose={() => setShowMenu(false)} />}
 
       <div style={{
         display: 'flex', alignItems: 'center', gap: 4,

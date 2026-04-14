@@ -594,30 +594,69 @@ function walkViewChildren(
   }
 }
 
+/** Pick the node instance closest to an anchor point (squared distance). */
+function pickNearestNode(candidates: CanonicalViewNode[], ax: number, ay: number): CanonicalViewNode {
+  let best = candidates[0];
+  let bestD = Infinity;
+  for (const c of candidates) {
+    const d = (c.x + c.width / 2 - ax) ** 2 + (c.y + c.height / 2 - ay) ** 2;
+    if (d < bestD) { bestD = d; best = c; }
+  }
+  return best;
+}
+
 /** Resolve all pending connections now that every node position is known */
 function resolvePendingViewConnections(ctx: ViewWalkContext): void {
   // Pre-build lookup maps to avoid O(n) .find() per connection
   const relById = new Map(ctx.relationships.map(r => [r.id, r]));
   const nodeById = new Map<string, CanonicalViewNode>();
-  const nodeByElementId = new Map<string, CanonicalViewNode>();
+  const nodesByElementId = new Map<string, CanonicalViewNode[]>();
   for (const vn of ctx.viewNodes) {
     if (vn.viewId !== ctx.viewId) continue;
     nodeById.set(vn.id, vn);
-    if (!nodeByElementId.has(vn.elementId)) nodeByElementId.set(vn.elementId, vn);
+    const arr = nodesByElementId.get(vn.elementId);
+    if (arr) arr.push(vn);
+    else nodesByElementId.set(vn.elementId, [vn]);
   }
 
   for (const conn of ctx.pendingConnections) {
     const rel = relById.get(conn.relationshipId);
-    let sourceCenter: { x: number; y: number } | null = null;
-    let targetCenter: { x: number; y: number } | null = null;
+
+    // Prefer explicit node IDs; fall back to elementId with proximity selection
     const srcNode = conn.sourceNodeId ? nodeById.get(conn.sourceNodeId) : undefined;
     const tgtNode = conn.targetNodeId ? nodeById.get(conn.targetNodeId) : undefined;
-    const resolvedSourceNode = srcNode || (rel ? nodeByElementId.get(rel.sourceId) : undefined);
-    const resolvedTargetNode = tgtNode || (rel ? nodeByElementId.get(rel.targetId) : undefined);
-    if (rel) {
-      if (resolvedSourceNode) sourceCenter = { x: resolvedSourceNode.x + resolvedSourceNode.width / 2, y: resolvedSourceNode.y + resolvedSourceNode.height / 2 };
-      if (resolvedTargetNode) targetCenter = { x: resolvedTargetNode.x + resolvedTargetNode.width / 2, y: resolvedTargetNode.y + resolvedTargetNode.height / 2 };
+
+    let resolvedSourceNode = srcNode;
+    let resolvedTargetNode = tgtNode;
+
+    if (!resolvedSourceNode && rel) {
+      const candidates = nodesByElementId.get(rel.sourceId);
+      if (candidates?.length) {
+        if (resolvedTargetNode) {
+          // Pick source instance closest to the known target
+          resolvedSourceNode = pickNearestNode(candidates, resolvedTargetNode.x + resolvedTargetNode.width / 2, resolvedTargetNode.y + resolvedTargetNode.height / 2);
+        } else {
+          resolvedSourceNode = candidates[0];
+        }
+      }
     }
+
+    if (!resolvedTargetNode && rel) {
+      const candidates = nodesByElementId.get(rel.targetId);
+      if (candidates?.length) {
+        if (resolvedSourceNode) {
+          // Pick target instance closest to the (now resolved) source
+          resolvedTargetNode = pickNearestNode(candidates, resolvedSourceNode.x + resolvedSourceNode.width / 2, resolvedSourceNode.y + resolvedSourceNode.height / 2);
+        } else {
+          resolvedTargetNode = candidates[0];
+        }
+      }
+    }
+
+    let sourceCenter: { x: number; y: number } | null = null;
+    let targetCenter: { x: number; y: number } | null = null;
+    if (resolvedSourceNode) sourceCenter = { x: resolvedSourceNode.x + resolvedSourceNode.width / 2, y: resolvedSourceNode.y + resolvedSourceNode.height / 2 };
+    if (resolvedTargetNode) targetCenter = { x: resolvedTargetNode.x + resolvedTargetNode.width / 2, y: resolvedTargetNode.y + resolvedTargetNode.height / 2 };
 
     // Preserve raw relative bendpoints for dynamic resolution during drags
     const relativeBendpoints = conn.rawBendpoints
@@ -1089,8 +1128,8 @@ export function parseCoArchiFragments(xmlContents: string[], filePaths?: string[
   const coArchiFolders: CoArchiFolderEntry[] = [];
   let coArchiRoot: CoArchiMetadata | undefined;
 
-  const elementIds = new Set<string>();
-  const relationshipIds = new Set<string>();
+  const elementIdxById = new Map<string, number>();
+  const relationshipIdxById = new Map<string, number>();
   const viewIds = new Set<string>();
   const viewNodeKeys = new Set<string>();
   const viewConnectionKeys = new Set<string>();
@@ -1103,6 +1142,8 @@ export function parseCoArchiFragments(xmlContents: string[], filePaths?: string[
   const deferredViews: { doc: Document; node: Element; id: string; path?: string }[] = [];
   let skippedRelCount = 0;
   const skippedRelSample: { id: string; tag: string; sourceId: string; targetId: string; attrs: string }[] = [];
+  let duplicateElementCount = 0;
+  let duplicateRelCount = 0;
 
   // Pass 1: collect elements, relationships, and identify views
   for (let fileIdx = 0; fileIdx < xmlContents.length; fileIdx++) {
@@ -1142,8 +1183,6 @@ export function parseCoArchiFragments(xmlContents: string[], filePaths?: string[
       const isRelationshipByType = typeName.endsWith('relationship');
 
       if (isRelationshipByTag || isRelationshipByType) {
-        if (relationshipIds.has(id)) continue;
-
         const sourceId = getRef(node, ['source', 'sourceRef']);
         const targetId = getRef(node, ['target', 'targetRef']);
         if (!sourceId || !targetId) {
@@ -1166,7 +1205,7 @@ export function parseCoArchiFragments(xmlContents: string[], filePaths?: string[
           });
         }
 
-        allRelationships.push({
+        const newRel = {
           id,
           type: mappedType || 'association',
           sourceId,
@@ -1175,8 +1214,20 @@ export function parseCoArchiFragments(xmlContents: string[], filePaths?: string[
           documentation: getDocumentation(node),
           properties: getProperties(node),
           sourcePath: path,
-        });
-        relationshipIds.add(id);
+        };
+
+        const existingRelIdx = relationshipIdxById.get(id);
+        if (existingRelIdx !== undefined) {
+          // Prefer the entry with richer metadata
+          const existing = allRelationships[existingRelIdx];
+          const newRicher = (!existing.documentation && !!newRel.documentation)
+            || (newRel.properties?.length ?? 0) > (existing.properties?.length ?? 0);
+          if (newRicher) allRelationships[existingRelIdx] = newRel;
+          duplicateRelCount++;
+        } else {
+          relationshipIdxById.set(id, allRelationships.length);
+          allRelationships.push(newRel);
+        }
         continue;
       }
 
@@ -1197,17 +1248,27 @@ export function parseCoArchiFragments(xmlContents: string[], filePaths?: string[
       // Regular element
       const mappedType = mapElementType(rawType, node);
       if (!mappedType) continue;
-      if (elementIds.has(id)) continue;
 
-      allElements.push({
+      const newEl = {
         id,
         type: mappedType,
         name: getName(node) || id,
         documentation: getDocumentation(node),
         properties: getProperties(node),
         sourcePath: path,
-      });
-      elementIds.add(id);
+      };
+
+      const existingElIdx = elementIdxById.get(id);
+      if (existingElIdx !== undefined) {
+        const existing = allElements[existingElIdx];
+        const newRicher = (!existing.documentation && !!newEl.documentation)
+          || (newEl.properties?.length ?? 0) > (existing.properties?.length ?? 0);
+        if (newRicher) allElements[existingElIdx] = newEl;
+        duplicateElementCount++;
+      } else {
+        elementIdxById.set(id, allElements.length);
+        allElements.push(newEl);
+      }
     }
   }
 
@@ -1217,6 +1278,20 @@ export function parseCoArchiFragments(xmlContents: string[], filePaths?: string[
       severity: 'warning',
       code: 'COARCHI_REL_MISSING_ENDPOINTS',
       message: `${skippedRelCount} relationships skipped (missing source/target ref). First: ${skippedRelSample[0]?.attrs || 'n/a'}`,
+    });
+  }
+  if (duplicateElementCount > 0) {
+    diagnostics.push({
+      severity: 'info',
+      code: 'COARCHI_DUPLICATE_ELEMENT_IDS',
+      message: `${duplicateElementCount} duplicate element IDs encountered; kept richer entry for each.`,
+    });
+  }
+  if (duplicateRelCount > 0) {
+    diagnostics.push({
+      severity: 'info',
+      code: 'COARCHI_DUPLICATE_RELATIONSHIP_IDS',
+      message: `${duplicateRelCount} duplicate relationship IDs encountered; kept richer entry for each.`,
     });
   }
 
@@ -1239,8 +1314,8 @@ export function parseCoArchiFragments(xmlContents: string[], filePaths?: string[
 
     const walkCtx: ViewWalkContext = {
       viewId: id,
-      elementIds,
-      relationshipIds,
+      elementIds: new Set(elementIdxById.keys()),
+      relationshipIds: new Set(relationshipIdxById.keys()),
       viewNodeKeys,
       viewConnectionKeys,
       viewNodes: allViewNodes,
@@ -1299,7 +1374,8 @@ export function parseCoArchiFragments(xmlContents: string[], filePaths?: string[
   }
 
   // Diagnostic: verify relationship endpoint integrity
-  const orphanedRels = allRelationships.filter(r => !elementIds.has(r.sourceId) || !elementIds.has(r.targetId));
+  const allElementIds = new Set(elementIdxById.keys());
+  const orphanedRels = allRelationships.filter(r => !allElementIds.has(r.sourceId) || !allElementIds.has(r.targetId));
   if (orphanedRels.length > 0) {
     diagnostics.push({
       severity: 'warning',
@@ -1309,7 +1385,7 @@ export function parseCoArchiFragments(xmlContents: string[], filePaths?: string[
   }
 
   // Diagnostic: verify view node integrity
-  const viewNodesWithoutElement = allViewNodes.filter(vn => !elementIds.has(vn.elementId));
+  const viewNodesWithoutElement = allViewNodes.filter(vn => !allElementIds.has(vn.elementId));
   if (viewNodesWithoutElement.length > 0) {
     diagnostics.push({
       severity: 'warning',
@@ -1368,8 +1444,8 @@ export async function parseCoArchiFragmentsStreaming(
   const coArchiFolders: CoArchiFolderEntry[] = [];
   let coArchiRoot: CoArchiMetadata | undefined;
 
-  const elementIds = new Set<string>();
-  const relationshipIds = new Set<string>();
+  const elementIdxById = new Map<string, number>();
+  const relationshipIdxById = new Map<string, number>();
   const viewIds = new Set<string>();
   const viewNodeKeys = new Set<string>();
   const viewConnectionKeys = new Set<string>();
@@ -1378,6 +1454,9 @@ export async function parseCoArchiFragmentsStreaming(
   const deferredViews: { xml: string; path: string; id: string; name: string }[] = [];
 
   let skippedRelCount = 0;
+  const skippedRelSample: { id: string; tag: string; sourceId: string; targetId: string; attrs: string }[] = [];
+  let duplicateElementCount = 0;
+  let duplicateRelCount = 0;
   let filesProcessed = 0;
 
   // ---- Pass 1: Stream through all files, extract elements/relationships, defer views ----
@@ -1418,11 +1497,13 @@ export async function parseCoArchiFragmentsStreaming(
       const isRelationshipByType = typeName.endsWith('relationship');
 
       if (isRelationshipByTag || isRelationshipByType) {
-        if (relationshipIds.has(id)) continue;
-
         const sourceId = getRef(node, ['source', 'sourceRef']);
         const targetId = getRef(node, ['target', 'targetRef']);
         if (!sourceId || !targetId) {
+          if (skippedRelSample.length < 5) skippedRelSample.push({
+            id, tag, sourceId: sourceId ?? '(missing)', targetId: targetId ?? '(missing)',
+            attrs: Array.from(node.attributes).map(a => `${a.name}=${a.value.slice(0, 40)}`).join(', '),
+          });
           skippedRelCount++;
           continue;
         }
@@ -1437,15 +1518,28 @@ export async function parseCoArchiFragmentsStreaming(
           });
         }
 
-        allRelationships.push({
+        const newRel = {
           id,
           type: mappedType || 'association',
           sourceId,
           targetId,
           name: getName(node),
+          documentation: getDocumentation(node),
+          properties: getProperties(node),
           sourcePath: path,
-        });
-        relationshipIds.add(id);
+        };
+
+        const existingRelIdx = relationshipIdxById.get(id);
+        if (existingRelIdx !== undefined) {
+          const existing = allRelationships[existingRelIdx];
+          const newRicher = (!existing.documentation && !!newRel.documentation)
+            || (newRel.properties?.length ?? 0) > (existing.properties?.length ?? 0);
+          if (newRicher) allRelationships[existingRelIdx] = newRel;
+          duplicateRelCount++;
+        } else {
+          relationshipIdxById.set(id, allRelationships.length);
+          allRelationships.push(newRel);
+        }
         continue;
       }
 
@@ -1466,16 +1560,27 @@ export async function parseCoArchiFragmentsStreaming(
       // Regular element
       const mappedType = mapElementType(rawType, node);
       if (!mappedType) continue;
-      if (elementIds.has(id)) continue;
 
-      allElements.push({
+      const newEl = {
         id,
         type: mappedType,
         name: getName(node) || id,
         documentation: getDocumentation(node),
+        properties: getProperties(node),
         sourcePath: path,
-      });
-      elementIds.add(id);
+      };
+
+      const existingElIdx = elementIdxById.get(id);
+      if (existingElIdx !== undefined) {
+        const existing = allElements[existingElIdx];
+        const newRicher = (!existing.documentation && !!newEl.documentation)
+          || (newEl.properties?.length ?? 0) > (existing.properties?.length ?? 0);
+        if (newRicher) allElements[existingElIdx] = newEl;
+        duplicateElementCount++;
+      } else {
+        elementIdxById.set(id, allElements.length);
+        allElements.push(newEl);
+      }
     }
 
     // doc and content go out of scope here — GC can reclaim them
@@ -1493,7 +1598,21 @@ export async function parseCoArchiFragmentsStreaming(
     diagnostics.push({
       severity: 'warning',
       code: 'COARCHI_REL_MISSING_ENDPOINTS',
-      message: `${skippedRelCount} relationships skipped (missing source/target ref).`,
+      message: `${skippedRelCount} relationships skipped (missing source/target ref). First: ${skippedRelSample[0]?.attrs || 'n/a'}`,
+    });
+  }
+  if (duplicateElementCount > 0) {
+    diagnostics.push({
+      severity: 'info',
+      code: 'COARCHI_DUPLICATE_ELEMENT_IDS',
+      message: `${duplicateElementCount} duplicate element IDs encountered; kept richer entry for each.`,
+    });
+  }
+  if (duplicateRelCount > 0) {
+    diagnostics.push({
+      severity: 'info',
+      code: 'COARCHI_DUPLICATE_RELATIONSHIP_IDS',
+      message: `${duplicateRelCount} duplicate relationship IDs encountered; kept richer entry for each.`,
     });
   }
 
@@ -1529,8 +1648,8 @@ export async function parseCoArchiFragmentsStreaming(
     if (viewRoot) {
       const walkCtx: ViewWalkContext = {
         viewId: dv.id,
-        elementIds,
-        relationshipIds,
+        elementIds: new Set(elementIdxById.keys()),
+        relationshipIds: new Set(relationshipIdxById.keys()),
         viewNodeKeys,
         viewConnectionKeys,
         viewNodes: allViewNodes,
@@ -1595,7 +1714,8 @@ export async function parseCoArchiFragmentsStreaming(
   }
 
   // Diagnostic: verify relationship endpoint integrity
-  const orphanedRels = allRelationships.filter(r => !elementIds.has(r.sourceId) || !elementIds.has(r.targetId));
+  const allElementIds = new Set(elementIdxById.keys());
+  const orphanedRels = allRelationships.filter(r => !allElementIds.has(r.sourceId) || !allElementIds.has(r.targetId));
   if (orphanedRels.length > 0) {
     diagnostics.push({
       severity: 'warning',
@@ -1828,7 +1948,9 @@ export function serializeCoArchiFragmented(model: CanonicalModelDocument): impor
         `    id="${escapeXml(el.id)}"`;
 
       // Junction subtype
-      if (el.type === 'orJunction') {
+      if (el.type === 'andJunction') {
+        xml += `\n    type="and"`;
+      } else if (el.type === 'orJunction') {
         xml += `\n    type="or"`;
       }
 

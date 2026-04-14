@@ -15,9 +15,26 @@ import { INITIAL_WORKSPACE_STATE } from './types';
 
 export type WorkspaceListener = (state: WorkspaceState) => void;
 
+/** Fast string hash for change detection (djb2). Not cryptographic. */
+function hashContent(s: string): number {
+  let h = 5381;
+  for (let i = 0; i < s.length; i++) {
+    h = ((h << 5) + h + s.charCodeAt(i)) | 0;
+  }
+  return h;
+}
+
+export interface IncrementalSaveResult {
+  writtenCount: number;
+  skippedCount: number;
+  deletedCount: number;
+}
+
 export class WorkspaceManager {
   private _state: WorkspaceState = { ...INITIAL_WORKSPACE_STATE };
   private _listeners: Set<WorkspaceListener> = new Set();
+  /** Content hashes from the last successful save, keyed by relative path */
+  private _lastSavedHashes = new Map<string, number>();
 
   get state(): WorkspaceState {
     return this._state;
@@ -128,26 +145,56 @@ export class WorkspaceManager {
 
   /**
    * Write multiple files to the directory (fragmented save).
+   * Only writes files whose content actually changed since the last save.
    * Requires a directory handle (File System Access API).
    */
   async saveFragmented(
     files: { relativePath: string; content: string }[],
     deletedPaths: string[] = [],
-  ): Promise<void> {
+  ): Promise<IncrementalSaveResult> {
     const handle = this._state.directoryHandle;
     if (!handle) {
       throw new Error('No directory handle — cannot save fragmented model');
     }
 
+    let deletedCount = 0;
     for (const path of deletedPaths) {
       await deleteFileAtPath(handle, path);
+      this._lastSavedHashes.delete(path);
+      deletedCount++;
     }
+
+    let writtenCount = 0;
+    let skippedCount = 0;
+    const newHashes = new Map<string, number>();
 
     for (const file of files) {
+      const h = hashContent(file.content);
+      newHashes.set(file.relativePath, h);
+      if (this._lastSavedHashes.get(file.relativePath) === h) {
+        skippedCount++;
+        continue;
+      }
       await writeFileAtPath(handle, file.relativePath, file.content);
+      writtenCount++;
     }
 
+    this._lastSavedHashes = newHashes;
     this.markClean();
+    return { writtenCount, skippedCount, deletedCount };
+  }
+
+  /**
+   * Write a single fragment file to the directory.
+   * Useful for saving just the currently selected item without a full save.
+   */
+  async saveSingleFragment(relativePath: string, content: string): Promise<void> {
+    const handle = this._state.directoryHandle;
+    if (!handle) {
+      throw new Error('No directory handle — cannot save fragment');
+    }
+    await writeFileAtPath(handle, relativePath, content);
+    this._lastSavedHashes.set(relativePath, hashContent(content));
   }
 
   /** Get a file entry by relative path */
@@ -262,6 +309,7 @@ export class WorkspaceManager {
 
   async close(): Promise<void> {
     await clearWorkspace();
+    this._lastSavedHashes.clear();
     this._state = { ...INITIAL_WORKSPACE_STATE };
     this.emit();
   }

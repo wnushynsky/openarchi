@@ -1,5 +1,33 @@
 import type { Waypoint } from '../types';
 
+export interface CoArchiFolderEntry {
+  path: string;
+  name?: string;
+  id?: string;
+  type?: string;
+  explicit?: boolean;
+}
+
+export interface CoArchiMetadata {
+  rootFilePath?: string;
+  modelName?: string;
+  modelId?: string;
+  modelVersion?: string;
+  modelPurpose?: string;
+  folders?: CoArchiFolderEntry[];
+}
+
+export interface CanonicalProperty {
+  key: string;
+  value: string;
+}
+
+export interface CanonicalAiMetadata {
+  primaryPrompt?: string;
+  agentNotes?: string[];
+  generatedBy?: string;
+}
+
 /** Optional visual style metadata preserved from source diagram */
 export interface DiagramStyle {
   fillColor?: string;
@@ -22,6 +50,10 @@ export interface CanonicalElement {
   type: string;
   name: string;
   documentation: string;
+  summary?: string;
+  tags?: string[];
+  properties?: CanonicalProperty[];
+  sourcePath?: string;
 }
 
 export interface CanonicalRelationship {
@@ -30,12 +62,22 @@ export interface CanonicalRelationship {
   sourceId: string;
   targetId: string;
   name: string;
+  documentation?: string;
+  tags?: string[];
+  properties?: CanonicalProperty[];
+  sourcePath?: string;
 }
 
 export interface CanonicalView {
   id: string;
   name: string;
   childViewIds: string[];
+  documentation?: string;
+  purpose?: string;
+  viewpoint?: string;
+  tags?: string[];
+  properties?: CanonicalProperty[];
+  sourcePath?: string;
 }
 
 export interface CanonicalViewNode {
@@ -59,6 +101,8 @@ export interface CanonicalViewConnection {
   id: string;
   viewId: string;
   relationshipId: string;
+  sourceNodeId?: string;
+  targetNodeId?: string;
   waypoints: Waypoint[];
   labelPosition: number;
   /** Source diagram style metadata (preserved for fidelity, optional) */
@@ -76,6 +120,7 @@ export interface CanonicalModelDocument {
   viewConnections: CanonicalViewConnection[];
   metadata?: {
     sourceFormat?: string;
+    coArchi?: CoArchiMetadata;
+    ai?: CanonicalAiMetadata;
   };
 }
-

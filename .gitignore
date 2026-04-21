@@ -1,9 +1,13 @@
 node_modules/
 dist/
 .vite/
+.test-dist/
+target/
 *.local
 .DS_Store
 .idea/
 *.tsbuildinfo
 /.claude/
 /.claude/settings.local.json
+/src-tauri/target/
+/src-tauri/gen/

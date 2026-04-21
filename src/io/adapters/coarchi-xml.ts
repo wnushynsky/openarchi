@@ -2,6 +2,8 @@ import { ELEMENT_TYPES, RELATIONSHIP_TYPES } from '../../core';
 import type {
   CanonicalElement,
   CanonicalModelDocument,
+  CoArchiFolderEntry,
+  CoArchiMetadata,
   CanonicalRelationship,
   CanonicalView,
   CanonicalViewConnection,
@@ -103,6 +105,36 @@ function getDocumentation(node: Element): string {
   }
 
   return '';
+}
+
+function getProperties(node: Element): import('../../types').PropertyRecord[] | undefined {
+  const properties: import('../../types').PropertyRecord[] = [];
+
+  const candidates: Element[] = [];
+  for (const child of Array.from(node.children)) {
+    const childName = localName(child).toLowerCase();
+    if (childName === 'property') candidates.push(child);
+    if (childName === 'properties') {
+      for (const prop of Array.from(child.children)) {
+        if (localName(prop).toLowerCase() === 'property') candidates.push(prop);
+      }
+    }
+  }
+
+  for (const candidate of candidates) {
+    const key = getAttr(candidate, ['key', 'name', 'propertyDefinitionRef']);
+    if (!key) continue;
+
+    let value = getAttr(candidate, ['value']) || '';
+    if (!value) {
+      const valueChild = Array.from(candidate.children).find(child => localName(child).toLowerCase() === 'value');
+      value = valueChild?.textContent?.trim() || candidate.textContent?.trim() || '';
+    }
+
+    properties.push({ key, value });
+  }
+
+  return properties.length > 0 ? properties : undefined;
 }
 
 /** Extract text from a <content> child element (used by DiagramModelNote) */
@@ -325,6 +357,8 @@ interface PendingConnection {
   id: string;
   viewId: string;
   relationshipId: string;
+  sourceNodeId?: string;
+  targetNodeId?: string;
   rawBendpoints: RawBendpoint[];
   labelPosition: number;
   style?: import('../../model/canonical').DiagramStyle;
@@ -415,6 +449,8 @@ function walkViewChildren(
           id: connId,
           viewId: ctx.viewId,
           relationshipId: relId,
+          sourceNodeId: getAttr(child, ['source', 'sourceRef']),
+          targetNodeId: getAttr(child, ['target', 'targetRef']),
           rawBendpoints: parseRawBendpoints(child),
           labelPosition: asNumber(getAttr(child, ['labelPos', 'labelPosition'])) ?? 0.5,
           style,
@@ -430,8 +466,8 @@ function walkViewChildren(
       const typeLower = extractTypeName(rawType).toLowerCase();
       const diagramObjectId = getAttr(child, ['identifier', 'id']);
 
-      // Type detection: .archimate format uses short names (Group, Note)
-      // while coArchi/GRAFICO uses long names (DiagramModelGroup, DiagramModelNote)
+      // Type detection: Archi uses short names (Group, Note, DiagramObject, Connection)
+      // via ecore ExtendedMetaData; legacy files may use long names (DiagramModelGroup, etc.)
       const tagLowerChild = localName(child).toLowerCase();
       const isViewRef = typeLower.includes('diagrammodelreference')
         || tagLowerChild.includes('diagrammodelreference');
@@ -459,6 +495,7 @@ function walkViewChildren(
               viewId: ctx.viewId,
               elementId: diagramObjectId,
               x: absX, y: absY, width, height,
+              style,
               linkedViewId: targetViewId,
               parentNodeId,
               nestingDepth: depth,
@@ -485,6 +522,7 @@ function walkViewChildren(
             viewId: ctx.viewId,
             elementId: diagramObjectId,
             x: absX, y: absY, width, height,
+            style,
             parentNodeId,
             nestingDepth: depth,
           });
@@ -509,6 +547,7 @@ function walkViewChildren(
             viewId: ctx.viewId,
             elementId: diagramObjectId,
             x: absX, y: absY, width, height,
+            style,
             parentNodeId,
             nestingDepth: depth,
           });
@@ -527,7 +566,7 @@ function walkViewChildren(
   }
 
   // Also handle <sourceConnection(s)> / <connection(s)> elements at this level
-  // GRAFICO uses plural "sourceConnections" while some formats use singular
+  // Archi uses singular "sourceConnection"; accept plural for legacy compatibility
   const connectionNodes = Array.from(parentEl.children).filter(c => {
     const tag = localName(c).toLowerCase();
     return tag === 'sourceconnection' || tag === 'sourceconnections'
@@ -546,6 +585,8 @@ function walkViewChildren(
           id: connId,
           viewId: ctx.viewId,
           relationshipId: relId,
+          sourceNodeId: getAttr(conn, ['source', 'sourceRef']),
+          targetNodeId: getAttr(conn, ['target', 'targetRef']),
           rawBendpoints: parseRawBendpoints(conn),
           labelPosition: asNumber(getAttr(conn, ['labelPos', 'labelPosition'])) ?? 0.5,
           style: parseStyle(conn),
@@ -556,18 +597,69 @@ function walkViewChildren(
   }
 }
 
+/** Pick the node instance closest to an anchor point (squared distance). */
+function pickNearestNode(candidates: CanonicalViewNode[], ax: number, ay: number): CanonicalViewNode {
+  let best = candidates[0];
+  let bestD = Infinity;
+  for (const c of candidates) {
+    const d = (c.x + c.width / 2 - ax) ** 2 + (c.y + c.height / 2 - ay) ** 2;
+    if (d < bestD) { bestD = d; best = c; }
+  }
+  return best;
+}
+
 /** Resolve all pending connections now that every node position is known */
 function resolvePendingViewConnections(ctx: ViewWalkContext): void {
+  // Pre-build lookup maps to avoid O(n) .find() per connection
+  const relById = new Map(ctx.relationships.map(r => [r.id, r]));
+  const nodeById = new Map<string, CanonicalViewNode>();
+  const nodesByElementId = new Map<string, CanonicalViewNode[]>();
+  for (const vn of ctx.viewNodes) {
+    if (vn.viewId !== ctx.viewId) continue;
+    nodeById.set(vn.id, vn);
+    const arr = nodesByElementId.get(vn.elementId);
+    if (arr) arr.push(vn);
+    else nodesByElementId.set(vn.elementId, [vn]);
+  }
+
   for (const conn of ctx.pendingConnections) {
-    const rel = ctx.relationships.find(r => r.id === conn.relationshipId);
+    const rel = relById.get(conn.relationshipId);
+
+    // Prefer explicit node IDs; fall back to elementId with proximity selection
+    const srcNode = conn.sourceNodeId ? nodeById.get(conn.sourceNodeId) : undefined;
+    const tgtNode = conn.targetNodeId ? nodeById.get(conn.targetNodeId) : undefined;
+
+    let resolvedSourceNode = srcNode;
+    let resolvedTargetNode = tgtNode;
+
+    if (!resolvedSourceNode && rel) {
+      const candidates = nodesByElementId.get(rel.sourceId);
+      if (candidates?.length) {
+        if (resolvedTargetNode) {
+          // Pick source instance closest to the known target
+          resolvedSourceNode = pickNearestNode(candidates, resolvedTargetNode.x + resolvedTargetNode.width / 2, resolvedTargetNode.y + resolvedTargetNode.height / 2);
+        } else {
+          resolvedSourceNode = candidates[0];
+        }
+      }
+    }
+
+    if (!resolvedTargetNode && rel) {
+      const candidates = nodesByElementId.get(rel.targetId);
+      if (candidates?.length) {
+        if (resolvedSourceNode) {
+          // Pick target instance closest to the (now resolved) source
+          resolvedTargetNode = pickNearestNode(candidates, resolvedSourceNode.x + resolvedSourceNode.width / 2, resolvedSourceNode.y + resolvedSourceNode.height / 2);
+        } else {
+          resolvedTargetNode = candidates[0];
+        }
+      }
+    }
+
     let sourceCenter: { x: number; y: number } | null = null;
     let targetCenter: { x: number; y: number } | null = null;
-    if (rel) {
-      const srcNode = ctx.viewNodes.find(vn => vn.viewId === ctx.viewId && vn.elementId === rel.sourceId);
-      const tgtNode = ctx.viewNodes.find(vn => vn.viewId === ctx.viewId && vn.elementId === rel.targetId);
-      if (srcNode) sourceCenter = { x: srcNode.x + srcNode.width / 2, y: srcNode.y + srcNode.height / 2 };
-      if (tgtNode) targetCenter = { x: tgtNode.x + tgtNode.width / 2, y: tgtNode.y + tgtNode.height / 2 };
-    }
+    if (resolvedSourceNode) sourceCenter = { x: resolvedSourceNode.x + resolvedSourceNode.width / 2, y: resolvedSourceNode.y + resolvedSourceNode.height / 2 };
+    if (resolvedTargetNode) targetCenter = { x: resolvedTargetNode.x + resolvedTargetNode.width / 2, y: resolvedTargetNode.y + resolvedTargetNode.height / 2 };
 
     // Preserve raw relative bendpoints for dynamic resolution during drags
     const relativeBendpoints = conn.rawBendpoints
@@ -578,6 +670,8 @@ function resolvePendingViewConnections(ctx: ViewWalkContext): void {
       id: conn.id,
       viewId: conn.viewId,
       relationshipId: conn.relationshipId,
+      sourceNodeId: resolvedSourceNode?.id || conn.sourceNodeId,
+      targetNodeId: resolvedTargetNode?.id || conn.targetNodeId,
       waypoints: resolveBendpoints(conn.rawBendpoints, sourceCenter, targetCenter),
       labelPosition: conn.labelPosition,
       style: conn.style,
@@ -670,6 +764,8 @@ function parseCoArchiXml(raw: string): ParseResult {
         sourceId,
         targetId,
         name: getName(node),
+        documentation: getDocumentation(node),
+        properties: getProperties(node),
       });
       relationshipIds.add(id);
       continue;
@@ -689,6 +785,7 @@ function parseCoArchiXml(raw: string): ParseResult {
       type: mappedType,
       name: getName(node) || id,
       documentation: getDocumentation(node),
+      properties: getProperties(node),
     });
     elementIds.add(id);
   }
@@ -727,6 +824,9 @@ function parseCoArchiXml(raw: string): ParseResult {
       id,
       name: getName(viewNode) || id,
       childViewIds: [],
+      documentation: getDocumentation(viewNode),
+      viewpoint: getAttr(viewNode, ['viewpoint']) || undefined,
+      properties: getProperties(viewNode),
     });
     viewIds.add(id);
 
@@ -843,6 +943,7 @@ function finalizeCoArchiModel(
   viewNodes: CanonicalViewNode[],
   viewConnections: CanonicalViewConnection[],
   diagnostics: ModelDiagnostic[],
+  coArchiMetadata?: CoArchiMetadata,
 ): ParseResult {
   if (views.length === 0) {
     views.push({ id: 'v1', name: 'Imported View', childViewIds: [] });
@@ -869,15 +970,29 @@ function finalizeCoArchiModel(
     });
   }
 
+  // Pre-group nodes and connections by viewId to avoid O(views × nodes) filtering
+  const nodesByViewId = new Map<string, CanonicalViewNode[]>();
+  for (const node of viewNodes) {
+    if (!nodesByViewId.has(node.viewId)) nodesByViewId.set(node.viewId, []);
+    nodesByViewId.get(node.viewId)!.push(node);
+  }
+  const connectionsByViewId = new Map<string, CanonicalViewConnection[]>();
+  for (const conn of viewConnections) {
+    if (!connectionsByViewId.has(conn.viewId)) connectionsByViewId.set(conn.viewId, []);
+    connectionsByViewId.get(conn.viewId)!.push(conn);
+  }
+
   // Normalize coordinates per view: shift so the top-left of content starts near (50, 50)
   const ORIGIN_PADDING = 50;
-  const viewIdSet = new Set(views.map(v => v.id));
-  for (const viewId of viewIdSet) {
-    const nodesInView = viewNodes.filter(n => n.viewId === viewId);
-    if (nodesInView.length === 0) continue;
+  for (const view of views) {
+    const nodesInView = nodesByViewId.get(view.id);
+    if (!nodesInView || nodesInView.length === 0) continue;
 
-    const minX = Math.min(...nodesInView.map(n => n.x));
-    const minY = Math.min(...nodesInView.map(n => n.y));
+    let minX = Infinity, minY = Infinity;
+    for (const n of nodesInView) {
+      if (n.x < minX) minX = n.x;
+      if (n.y < minY) minY = n.y;
+    }
     const dx = ORIGIN_PADDING - minX;
     const dy = ORIGIN_PADDING - minY;
 
@@ -890,7 +1005,7 @@ function finalizeCoArchiModel(
     }
 
     // Shift waypoints for connections in this view by the same offset
-    const connectionsInView = viewConnections.filter(c => c.viewId === viewId);
+    const connectionsInView = connectionsByViewId.get(view.id) ?? [];
     for (const conn of connectionsInView) {
       conn.waypoints = conn.waypoints.map(wp => ({ x: wp.x + dx, y: wp.y + dy }));
     }
@@ -928,10 +1043,68 @@ function finalizeCoArchiModel(
     viewConnections,
     metadata: {
       sourceFormat: 'coarchi-xml',
+      ...(coArchiMetadata ? { coArchi: coArchiMetadata } : {}),
     },
   };
 
   return { model, diagnostics };
+}
+
+interface ParsedCoArchiFolderInfo {
+  root?: {
+    path: string;
+    modelName?: string;
+    modelId?: string;
+    modelVersion?: string;
+    modelPurpose?: string;
+  };
+  folder?: CoArchiFolderEntry;
+}
+
+function parseCoArchiFolderInfo(doc: Document, path: string): ParsedCoArchiFolderInfo | null {
+  const root = doc.documentElement;
+  if (!root) return null;
+
+  const tag = localName(root).toLowerCase();
+  if (tag === 'model' || tag === 'archimatemodel') {
+    let purpose = getAttr(root, ['purpose']) || '';
+    for (const child of Array.from(root.children)) {
+      if (localName(child).toLowerCase() === 'purpose') {
+        purpose = child.textContent?.trim() || '';
+        break;
+      }
+    }
+    return {
+      root: {
+        path,
+        modelName: getName(root) || undefined,
+        modelId: getAttr(root, ['identifier', 'id']),
+        modelVersion: getAttr(root, ['version']),
+        modelPurpose: purpose || undefined,
+      },
+    };
+  }
+
+  if (tag === 'folder') {
+    return {
+      folder: {
+        path,
+        name: getName(root) || undefined,
+        id: getAttr(root, ['identifier', 'id']),
+        type: getAttr(root, ['type']),
+      },
+    };
+  }
+
+  return null;
+}
+
+function dedupeFolderEntries(folders: CoArchiFolderEntry[]): CoArchiFolderEntry[] {
+  const byPath = new Map<string, CoArchiFolderEntry>();
+  for (const folder of folders) {
+    if (!byPath.has(folder.path)) byPath.set(folder.path, folder);
+  }
+  return [...byPath.values()];
 }
 
 /**
@@ -956,9 +1129,11 @@ export function parseCoArchiFragments(xmlContents: string[], filePaths?: string[
   const allViews: CanonicalView[] = [];
   const allViewNodes: CanonicalViewNode[] = [];
   const allViewConnections: CanonicalViewConnection[] = [];
+  const coArchiFolders: CoArchiFolderEntry[] = [];
+  let coArchiRoot: CoArchiMetadata | undefined;
 
-  const elementIds = new Set<string>();
-  const relationshipIds = new Set<string>();
+  const elementIdxById = new Map<string, number>();
+  const relationshipIdxById = new Map<string, number>();
   const viewIds = new Set<string>();
   const viewNodeKeys = new Set<string>();
   const viewConnectionKeys = new Set<string>();
@@ -968,17 +1143,35 @@ export function parseCoArchiFragments(xmlContents: string[], filePaths?: string[
   // fully known before views reference them via walkViewChildren.
 
   // Collect parsed documents and deferred view candidates
-  const parsedDocs: Document[] = [];
   const deferredViews: { doc: Document; node: Element; id: string; path?: string }[] = [];
   let skippedRelCount = 0;
   const skippedRelSample: { id: string; tag: string; sourceId: string; targetId: string; attrs: string }[] = [];
+  let duplicateElementCount = 0;
+  let duplicateRelCount = 0;
 
   // Pass 1: collect elements, relationships, and identify views
   for (let fileIdx = 0; fileIdx < xmlContents.length; fileIdx++) {
     const raw = xmlContents[fileIdx];
     const doc = new DOMParser().parseFromString(raw, 'application/xml');
     if (doc.querySelector('parsererror')) continue;
-    parsedDocs.push(doc);
+    const path = filePaths?.[fileIdx];
+
+    if (path && path.toLowerCase().endsWith('folder.xml')) {
+      const folderInfo = parseCoArchiFolderInfo(doc, path);
+      if (folderInfo?.root) {
+        coArchiRoot = {
+          ...coArchiRoot,
+          rootFilePath: folderInfo.root.path,
+          modelName: folderInfo.root.modelName,
+          modelId: folderInfo.root.modelId,
+          modelVersion: folderInfo.root.modelVersion,
+          modelPurpose: folderInfo.root.modelPurpose,
+        };
+      } else if (folderInfo?.folder) {
+        coArchiFolders.push(folderInfo.folder);
+      }
+      continue;
+    }
 
     const allNodes = Array.from(doc.querySelectorAll('*'));
 
@@ -995,8 +1188,6 @@ export function parseCoArchiFragments(xmlContents: string[], filePaths?: string[
       const isRelationshipByType = typeName.endsWith('relationship');
 
       if (isRelationshipByTag || isRelationshipByType) {
-        if (relationshipIds.has(id)) continue;
-
         const sourceId = getRef(node, ['source', 'sourceRef']);
         const targetId = getRef(node, ['target', 'targetRef']);
         if (!sourceId || !targetId) {
@@ -1019,14 +1210,29 @@ export function parseCoArchiFragments(xmlContents: string[], filePaths?: string[
           });
         }
 
-        allRelationships.push({
+        const newRel = {
           id,
           type: mappedType || 'association',
           sourceId,
           targetId,
           name: getName(node),
-        });
-        relationshipIds.add(id);
+          documentation: getDocumentation(node),
+          properties: getProperties(node),
+          sourcePath: path,
+        };
+
+        const existingRelIdx = relationshipIdxById.get(id);
+        if (existingRelIdx !== undefined) {
+          // Prefer the entry with richer metadata
+          const existing = allRelationships[existingRelIdx];
+          const newRicher = (!existing.documentation && !!newRel.documentation)
+            || (newRel.properties?.length ?? 0) > (existing.properties?.length ?? 0);
+          if (newRicher) allRelationships[existingRelIdx] = newRel;
+          duplicateRelCount++;
+        } else {
+          relationshipIdxById.set(id, allRelationships.length);
+          allRelationships.push(newRel);
+        }
         continue;
       }
 
@@ -1047,15 +1253,27 @@ export function parseCoArchiFragments(xmlContents: string[], filePaths?: string[
       // Regular element
       const mappedType = mapElementType(rawType, node);
       if (!mappedType) continue;
-      if (elementIds.has(id)) continue;
 
-      allElements.push({
+      const newEl = {
         id,
         type: mappedType,
         name: getName(node) || id,
         documentation: getDocumentation(node),
-      });
-      elementIds.add(id);
+        properties: getProperties(node),
+        sourcePath: path,
+      };
+
+      const existingElIdx = elementIdxById.get(id);
+      if (existingElIdx !== undefined) {
+        const existing = allElements[existingElIdx];
+        const newRicher = (!existing.documentation && !!newEl.documentation)
+          || (newEl.properties?.length ?? 0) > (existing.properties?.length ?? 0);
+        if (newRicher) allElements[existingElIdx] = newEl;
+        duplicateElementCount++;
+      } else {
+        elementIdxById.set(id, allElements.length);
+        allElements.push(newEl);
+      }
     }
   }
 
@@ -1067,6 +1285,20 @@ export function parseCoArchiFragments(xmlContents: string[], filePaths?: string[
       message: `${skippedRelCount} relationships skipped (missing source/target ref). First: ${skippedRelSample[0]?.attrs || 'n/a'}`,
     });
   }
+  if (duplicateElementCount > 0) {
+    diagnostics.push({
+      severity: 'info',
+      code: 'COARCHI_DUPLICATE_ELEMENT_IDS',
+      message: `${duplicateElementCount} duplicate element IDs encountered; kept richer entry for each.`,
+    });
+  }
+  if (duplicateRelCount > 0) {
+    diagnostics.push({
+      severity: 'info',
+      code: 'COARCHI_DUPLICATE_RELATIONSHIP_IDS',
+      message: `${duplicateRelCount} duplicate relationship IDs encountered; kept richer entry for each.`,
+    });
+  }
 
   // Pass 2: process views now that all elements and relationships are known
   // Build view name lookup for view references
@@ -1075,17 +1307,21 @@ export function parseCoArchiFragments(xmlContents: string[], filePaths?: string[
     viewNameById.set(dv.id, getName(dv.node) || dv.id);
   }
 
-  for (const { node, id } of deferredViews) {
+  for (const { node, id, path } of deferredViews) {
     allViews.push({
       id,
       name: getName(node) || id,
       childViewIds: [],
+      documentation: getDocumentation(node),
+      viewpoint: getAttr(node, ['viewpoint']) || undefined,
+      properties: getProperties(node),
+      sourcePath: path,
     });
 
     const walkCtx: ViewWalkContext = {
       viewId: id,
-      elementIds,
-      relationshipIds,
+      elementIds: new Set(allElements.map(element => element.id)),
+      relationshipIds: new Set(relationshipIdxById.keys()),
       viewNodeKeys,
       viewConnectionKeys,
       viewNodes: allViewNodes,
@@ -1100,29 +1336,34 @@ export function parseCoArchiFragments(xmlContents: string[], filePaths?: string[
     resolvePendingViewConnections(walkCtx);
   }
 
-  // Build folder hierarchy from file paths (if available)
+  // Build folder hierarchy from file paths (if available) — O(n) with Map
   if (filePaths) {
-    const viewPathById = new Map<string, string>();
+    // Map: directory path → view ID whose file is directly in that directory
+    const viewIdByDir = new Map<string, string>();
+    // Map: parent directory → list of child view IDs in subdirectories
+    const childViewsByParentDir = new Map<string, string[]>();
+
     for (const dv of deferredViews) {
-      if (dv.path) viewPathById.set(dv.id, dv.path);
+      if (!dv.path) continue;
+      const dir = dv.path.replace(/\/[^/]+$/, '');
+      viewIdByDir.set(dir, dv.id);
+      // The grandparent directory is the parent view's directory
+      const grandDir = dir.replace(/\/[^/]+$/, '');
+      if (grandDir !== dir) {
+        if (!childViewsByParentDir.has(grandDir)) childViewsByParentDir.set(grandDir, []);
+        childViewsByParentDir.get(grandDir)!.push(dv.id);
+      }
     }
 
-    // For each view, find views whose path is a direct child directory
-    for (const parentView of allViews) {
-      const parentPath = viewPathById.get(parentView.id);
-      if (!parentPath) continue;
-      // Parent directory of this view file
-      const parentDir = parentPath.replace(/\/[^/]+$/, '');
-
-      for (const childView of allViews) {
-        if (childView.id === parentView.id) continue;
-        const childPath = viewPathById.get(childView.id);
-        if (!childPath) continue;
-        // Child's grandparent directory should match parent's directory
-        const childDir = childPath.replace(/\/[^/]+$/, '');
-        const childGrandDir = childDir.replace(/\/[^/]+$/, '');
-        if (childGrandDir === parentDir && childDir !== parentDir) {
-          parentView.childViewIds.push(childView.id);
+    // Assign children to parent views
+    for (const dv of deferredViews) {
+      if (!dv.path) continue;
+      const dir = dv.path.replace(/\/[^/]+$/, '');
+      const children = childViewsByParentDir.get(dir);
+      if (children) {
+        const parentView = allViews.find(v => v.id === dv.id);
+        if (parentView) {
+          parentView.childViewIds.push(...children);
         }
       }
     }
@@ -1139,7 +1380,8 @@ export function parseCoArchiFragments(xmlContents: string[], filePaths?: string[
   }
 
   // Diagnostic: verify relationship endpoint integrity
-  const orphanedRels = allRelationships.filter(r => !elementIds.has(r.sourceId) || !elementIds.has(r.targetId));
+  const allElementIds = new Set(elementIdxById.keys());
+  const orphanedRels = allRelationships.filter(r => !allElementIds.has(r.sourceId) || !allElementIds.has(r.targetId));
   if (orphanedRels.length > 0) {
     diagnostics.push({
       severity: 'warning',
@@ -1149,7 +1391,7 @@ export function parseCoArchiFragments(xmlContents: string[], filePaths?: string[
   }
 
   // Diagnostic: verify view node integrity
-  const viewNodesWithoutElement = allViewNodes.filter(vn => !elementIds.has(vn.elementId));
+  const viewNodesWithoutElement = allViewNodes.filter(vn => !allElementIds.has(vn.elementId));
   if (viewNodesWithoutElement.length > 0) {
     diagnostics.push({
       severity: 'warning',
@@ -1158,22 +1400,955 @@ export function parseCoArchiFragments(xmlContents: string[], filePaths?: string[
     });
   }
 
-  return finalizeCoArchiModel(allElements, allRelationships, allViews, allViewNodes, allViewConnections, diagnostics);
+  return finalizeCoArchiModel(
+    allElements,
+    allRelationships,
+    allViews,
+    allViewNodes,
+    allViewConnections,
+    diagnostics,
+    {
+      ...coArchiRoot,
+      folders: dedupeFolderEntries(coArchiFolders),
+    },
+  );
 }
 
-function serializeCoArchiXml(): SerializeResult {
-  return {
-    content: '',
-    diagnostics: [
-      {
+// ---------------------------------------------------------------------------
+// Streaming fragmented parser — processes files one at a time to avoid
+// holding all raw XML strings + DOM trees in memory simultaneously.
+// ---------------------------------------------------------------------------
+
+export type ProgressCallback = (phase: string, current: number, total: number) => void;
+
+/**
+ * Streaming version of parseCoArchiFragments for large models (500MB+).
+ * Processes files via an async iterator so only one file's raw string and DOM
+ * tree are in memory at a time. Peak memory: ~30-50MB instead of ~1.5GB.
+ */
+export async function parseCoArchiFragmentsStreaming(
+  fileIterator: AsyncIterable<{ content: string; path: string }>,
+  totalFiles: number,
+  onProgress?: ProgressCallback,
+): Promise<ParseResult> {
+  if (typeof DOMParser === 'undefined') {
+    return {
+      diagnostics: [{
         severity: 'error',
-        code: 'COARCHI_SERIALIZE_NOT_IMPLEMENTED',
-        message: 'coArchi XML export is not implemented yet.',
-      },
-    ],
+        code: 'XML_PARSER_UNAVAILABLE',
+        message: 'XML parser is not available in this runtime.',
+      }],
+    };
+  }
+
+  const diagnostics: ModelDiagnostic[] = [];
+  const allElements: CanonicalElement[] = [];
+  const allRelationships: CanonicalRelationship[] = [];
+  const allViews: CanonicalView[] = [];
+  const allViewNodes: CanonicalViewNode[] = [];
+  const allViewConnections: CanonicalViewConnection[] = [];
+  const coArchiFolders: CoArchiFolderEntry[] = [];
+  let coArchiRoot: CoArchiMetadata | undefined;
+
+  const elementIdxById = new Map<string, number>();
+  const relationshipIdxById = new Map<string, number>();
+  const viewIds = new Set<string>();
+  const viewNodeKeys = new Set<string>();
+  const viewConnectionKeys = new Set<string>();
+
+  // Deferred view data: store only the raw XML string (view files are small)
+  const deferredViews: { xml: string; path: string; id: string; name: string }[] = [];
+
+  let skippedRelCount = 0;
+  const skippedRelSample: { id: string; tag: string; sourceId: string; targetId: string; attrs: string }[] = [];
+  let duplicateElementCount = 0;
+  let duplicateRelCount = 0;
+  let filesProcessed = 0;
+
+  // ---- Pass 1: Stream through all files, extract elements/relationships, defer views ----
+  for await (const { content, path } of fileIterator) {
+    filesProcessed++;
+
+    const doc = new DOMParser().parseFromString(content, 'application/xml');
+    if (doc.querySelector('parsererror')) continue;
+
+    if (path.toLowerCase().endsWith('folder.xml')) {
+      const folderInfo = parseCoArchiFolderInfo(doc, path);
+      if (folderInfo?.root) {
+        coArchiRoot = {
+          ...coArchiRoot,
+          rootFilePath: folderInfo.root.path,
+          modelName: folderInfo.root.modelName,
+          modelId: folderInfo.root.modelId,
+          modelVersion: folderInfo.root.modelVersion,
+          modelPurpose: folderInfo.root.modelPurpose,
+        };
+      } else if (folderInfo?.folder) {
+        coArchiFolders.push(folderInfo.folder);
+      }
+      continue;
+    }
+
+    const allNodes = Array.from(doc.querySelectorAll('*'));
+
+    for (const node of allNodes) {
+      const id = getAttr(node, ['identifier', 'id']);
+      if (!id) continue;
+
+      const tag = localName(node);
+      const tagLower = tag.toLowerCase();
+      const rawType = getAttr(node, ['xsi:type', 'type']) || tag;
+      const typeName = extractTypeName(rawType).toLowerCase();
+
+      const isRelationshipByTag = tagLower === 'relationship' || tagLower.endsWith('relationship');
+      const isRelationshipByType = typeName.endsWith('relationship');
+
+      if (isRelationshipByTag || isRelationshipByType) {
+        const sourceId = getRef(node, ['source', 'sourceRef']);
+        const targetId = getRef(node, ['target', 'targetRef']);
+        if (!sourceId || !targetId) {
+          if (skippedRelSample.length < 5) skippedRelSample.push({
+            id, tag, sourceId: sourceId ?? '(missing)', targetId: targetId ?? '(missing)',
+            attrs: Array.from(node.attributes).map(a => `${a.name}=${a.value.slice(0, 40)}`).join(', '),
+          });
+          skippedRelCount++;
+          continue;
+        }
+
+        const mappedType = mapRelationshipType(rawType, tag);
+        if (!mappedType) {
+          diagnostics.push({
+            severity: 'warning',
+            code: 'COARCHI_RELATIONSHIP_TYPE_FALLBACK',
+            message: `Relationship '${id}' uses unknown type '${rawType || 'unknown'}'; mapped to association.`,
+            path: id,
+          });
+        }
+
+        const newRel = {
+          id,
+          type: mappedType || 'association',
+          sourceId,
+          targetId,
+          name: getName(node),
+          documentation: getDocumentation(node),
+          properties: getProperties(node),
+          sourcePath: path,
+        };
+
+        const existingRelIdx = relationshipIdxById.get(id);
+        if (existingRelIdx !== undefined) {
+          const existing = allRelationships[existingRelIdx];
+          const newRicher = (!existing.documentation && !!newRel.documentation)
+            || (newRel.properties?.length ?? 0) > (existing.properties?.length ?? 0);
+          if (newRicher) allRelationships[existingRelIdx] = newRel;
+          duplicateRelCount++;
+        } else {
+          relationshipIdxById.set(id, allRelationships.length);
+          allRelationships.push(newRel);
+        }
+        continue;
+      }
+
+      // Detect views — defer for Pass 2
+      const isNonViewDiagramObj = /diagrammodel(reference|note|group)/i.test(tag)
+        || /diagrammodel(reference|note|group)/i.test(typeName)
+        || /diagramobject|diagramconnection/i.test(typeName);
+      if (!isNonViewDiagramObj &&
+        (tagLower === 'view' || /diagrammodel/i.test(tag) || /diagrammodel/i.test(typeName))) {
+        if (!viewIds.has(id)) {
+          // Store only raw XML + path (not the DOM tree)
+          deferredViews.push({ xml: content, path, id, name: getName(node) || id });
+          viewIds.add(id);
+        }
+        continue;
+      }
+
+      // Regular element
+      const mappedType = mapElementType(rawType, node);
+      if (!mappedType) continue;
+
+      const newEl = {
+        id,
+        type: mappedType,
+        name: getName(node) || id,
+        documentation: getDocumentation(node),
+        properties: getProperties(node),
+        sourcePath: path,
+      };
+
+      const existingElIdx = elementIdxById.get(id);
+      if (existingElIdx !== undefined) {
+        const existing = allElements[existingElIdx];
+        const newRicher = (!existing.documentation && !!newEl.documentation)
+          || (newEl.properties?.length ?? 0) > (existing.properties?.length ?? 0);
+        if (newRicher) allElements[existingElIdx] = newEl;
+        duplicateElementCount++;
+      } else {
+        elementIdxById.set(id, allElements.length);
+        allElements.push(newEl);
+      }
+    }
+
+    // doc and content go out of scope here — GC can reclaim them
+
+    // Yield to event loop every 100 files for GC and UI responsiveness
+    if (filesProcessed % 100 === 0) {
+      onProgress?.('Reading files', filesProcessed, totalFiles);
+      await new Promise(r => setTimeout(r, 0));
+    }
+  }
+
+  onProgress?.('Reading files', totalFiles, totalFiles);
+
+  if (skippedRelCount > 0) {
+    diagnostics.push({
+      severity: 'warning',
+      code: 'COARCHI_REL_MISSING_ENDPOINTS',
+      message: `${skippedRelCount} relationships skipped (missing source/target ref). First: ${skippedRelSample[0]?.attrs || 'n/a'}`,
+    });
+  }
+  if (duplicateElementCount > 0) {
+    diagnostics.push({
+      severity: 'info',
+      code: 'COARCHI_DUPLICATE_ELEMENT_IDS',
+      message: `${duplicateElementCount} duplicate element IDs encountered; kept richer entry for each.`,
+    });
+  }
+  if (duplicateRelCount > 0) {
+    diagnostics.push({
+      severity: 'info',
+      code: 'COARCHI_DUPLICATE_RELATIONSHIP_IDS',
+      message: `${duplicateRelCount} duplicate relationship IDs encountered; kept richer entry for each.`,
+    });
+  }
+
+  // ---- Pass 2: Process deferred views (re-parse their XML one at a time) ----
+  const viewNameById = new Map<string, string>();
+  for (const dv of deferredViews) {
+    viewNameById.set(dv.id, dv.name);
+  }
+
+  for (let vi = 0; vi < deferredViews.length; vi++) {
+    const dv = deferredViews[vi];
+
+    // Re-parse just this view's XML
+    const viewDoc = new DOMParser().parseFromString(dv.xml, 'application/xml');
+    if (viewDoc.querySelector('parsererror')) continue;
+
+    // Find the view root node
+    const viewNodes = Array.from(viewDoc.querySelectorAll('*'));
+    const viewRoot = viewNodes.find(n => {
+      const nId = getAttr(n, ['identifier', 'id']);
+      return nId === dv.id;
+    });
+
+    allViews.push({
+      id: dv.id,
+      name: dv.name,
+      childViewIds: [],
+      documentation: viewRoot ? getDocumentation(viewRoot) : '',
+      viewpoint: viewRoot ? (getAttr(viewRoot, ['viewpoint']) || undefined) : undefined,
+      properties: viewRoot ? getProperties(viewRoot) : undefined,
+      sourcePath: dv.path,
+    });
+
+    if (viewRoot) {
+      const walkCtx: ViewWalkContext = {
+        viewId: dv.id,
+        elementIds: new Set(allElements.map(element => element.id)),
+        relationshipIds: new Set(relationshipIdxById.keys()),
+        viewNodeKeys,
+        viewConnectionKeys,
+        viewNodes: allViewNodes,
+        viewConnections: allViewConnections,
+        relationships: allRelationships,
+        elements: allElements,
+        viewNameById,
+        fallbackIndex: 0,
+        pendingConnections: [],
+      };
+      walkViewChildren(viewRoot, 0, 0, walkCtx, undefined, 0);
+      resolvePendingViewConnections(walkCtx);
+    }
+
+    // Release view XML and DOM
+    dv.xml = ''; // Allow GC
+
+    // Yield between views
+    if (vi % 10 === 0) {
+      onProgress?.('Processing views', vi + 1, deferredViews.length);
+      await new Promise(r => setTimeout(r, 0));
+    }
+  }
+
+  onProgress?.('Processing views', deferredViews.length, deferredViews.length);
+
+  // Build folder hierarchy from paths — O(n) with Map
+  {
+    const childViewsByParentDir = new Map<string, string[]>();
+    const viewDirById = new Map<string, string>();
+
+    for (const dv of deferredViews) {
+      if (!dv.path) continue;
+      const dir = dv.path.replace(/\/[^/]+$/, '');
+      viewDirById.set(dv.id, dir);
+      const grandDir = dir.replace(/\/[^/]+$/, '');
+      if (grandDir !== dir) {
+        if (!childViewsByParentDir.has(grandDir)) childViewsByParentDir.set(grandDir, []);
+        childViewsByParentDir.get(grandDir)!.push(dv.id);
+      }
+    }
+
+    for (const dv of deferredViews) {
+      const dir = viewDirById.get(dv.id);
+      if (!dir) continue;
+      const children = childViewsByParentDir.get(dir);
+      if (children) {
+        const parentView = allViews.find(v => v.id === dv.id);
+        if (parentView) parentView.childViewIds.push(...children);
+      }
+    }
+  }
+
+  if (allElements.length === 0) {
+    return {
+      diagnostics: [{
+        severity: 'error',
+        code: 'COARCHI_NO_ELEMENTS_FOUND',
+        message: 'No ArchiMate elements were found in the directory.',
+      }],
+    };
+  }
+
+  // Diagnostic: verify relationship endpoint integrity
+  const allElementIds = new Set(elementIdxById.keys());
+  const orphanedRels = allRelationships.filter(r => !allElementIds.has(r.sourceId) || !allElementIds.has(r.targetId));
+  if (orphanedRels.length > 0) {
+    diagnostics.push({
+      severity: 'warning',
+      code: 'COARCHI_ORPHANED_RELATIONSHIPS',
+      message: `${orphanedRels.length} of ${allRelationships.length} relationships reference elements not found in the model.`,
+    });
+  }
+
+  onProgress?.('Finalizing', 1, 1);
+
+  return finalizeCoArchiModel(
+    allElements,
+    allRelationships,
+    allViews,
+    allViewNodes,
+    allViewConnections,
+    diagnostics,
+    {
+      ...coArchiRoot,
+      folders: dedupeFolderEntries(coArchiFolders),
+    },
+  );
+}
+
+function serializeCoArchiXml(model: CanonicalModelDocument): SerializeResult {
+  // Single-file coArchi serialization: serialize the model as a monolithic XML document.
+  // For fragmented directory save, use serializeCoArchiFragmented() instead.
+  const result = serializeCoArchiFragmented(model);
+  if (result.diagnostics.some(d => d.severity === 'error')) {
+    return {
+      content: '',
+      diagnostics: result.diagnostics,
+      mimeType: 'application/xml',
+      suggestedFileName: 'model.coarchi.xml',
+    };
+  }
+  // Concatenate all fragment files into a single document (for download)
+  const content = result.files.map(f => `<!-- ${f.relativePath} -->\n${f.content}`).join('\n\n');
+  return {
+    content,
+    diagnostics: result.diagnostics,
     mimeType: 'application/xml',
     suggestedFileName: 'model.coarchi.xml',
   };
+}
+
+// ---------------------------------------------------------------------------
+// Fragmented coArchi/GRAFICO serializer
+// ---------------------------------------------------------------------------
+
+const XML_HEADER = '<?xml version="1.0" encoding="UTF-8"?>\n';
+const ARCHIMATE_NS = 'http://www.archimatetool.com/archimate';
+
+/** Convert a camelCase key like "businessActor" to PascalCase "BusinessActor" */
+function toPascalCase(s: string): string {
+  if (!s) return '';
+  return s.charAt(0).toUpperCase() + s.slice(1);
+}
+
+/**
+ * Map an editor element type key back to the Archi XML tag name.
+ * e.g. "businessActor" → "BusinessActor", "andJunction" → "Junction", "orJunction" → "Junction"
+ */
+function elementTypeToXmlTag(type: string): string {
+  if (type === 'andJunction' || type === 'orJunction') return 'Junction';
+  if (type === 'note') return 'DiagramModelNote';
+  if (type === 'grouping') return 'DiagramModelGroup';
+  if (type === 'viewReference') return 'DiagramModelReference';
+  return toPascalCase(type);
+}
+
+/**
+ * Map an editor relationship type key back to the Archi XML tag name.
+ * e.g. "composition" → "CompositionRelationship"
+ */
+function relationshipTypeToXmlTag(type: string): string {
+  return toPascalCase(type) + 'Relationship';
+}
+
+function escapeXml(s: string): string {
+  return s
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+function styleAttrs(style: import('../../model/canonical').DiagramStyle | undefined): string {
+  if (!style) return '';
+  let attrs = '';
+  if (style.fillColor !== undefined) attrs += ` fillColor="${escapeXml(style.fillColor)}"`;
+  if (style.lineColor !== undefined) attrs += ` lineColor="${escapeXml(style.lineColor)}"`;
+  if (style.fontColor !== undefined) attrs += ` fontColor="${escapeXml(style.fontColor)}"`;
+  if (style.font !== undefined) attrs += ` font="${escapeXml(style.font)}"`;
+  if (style.textAlignment !== undefined) attrs += ` textAlignment="${style.textAlignment}"`;
+  if (style.textPosition !== undefined) attrs += ` textPosition="${style.textPosition}"`;
+  if (style.lineWidth !== undefined) attrs += ` lineWidth="${style.lineWidth}"`;
+  if (style.lineStyle !== undefined) attrs += ` lineStyle="${escapeXml(style.lineStyle)}"`;
+  if (style.gradient !== undefined) attrs += ` gradient="${style.gradient}"`;
+  if (style.alpha !== undefined) attrs += ` alpha="${style.alpha}"`;
+  if (style.lineAlpha !== undefined) attrs += ` lineAlpha="${style.lineAlpha}"`;
+  if (style.nameVisible === false) attrs += ` nameVisible="false"`;
+  else if (style.nameVisible === true) attrs += ` nameVisible="true"`;
+  if (style.labelExpression !== undefined) attrs += ` labelExpression="${escapeXml(style.labelExpression)}"`;
+  return attrs;
+}
+
+function propertiesXml(properties: { key: string; value: string }[] | undefined, indent: string): string {
+  if (!properties || properties.length === 0) return '';
+  let xml = '';
+  for (const property of properties) {
+    xml += `${indent}<property key="${escapeXml(property.key)}" value="${escapeXml(property.value)}"/>\n`;
+  }
+  return xml;
+}
+
+function getDirName(path: string): string {
+  const slash = path.lastIndexOf('/');
+  return slash >= 0 ? path.slice(0, slash) : '';
+}
+
+function joinPath(...parts: string[]): string {
+  return parts
+    .map(part => part.replace(/\\/g, '/').replace(/^\/+|\/+$/g, ''))
+    .filter(Boolean)
+    .join('/');
+}
+
+function getRootModelFilePath(model: CanonicalModelDocument): string {
+  return model.metadata?.coArchi?.rootFilePath || 'model/folder.xml';
+}
+
+function getDefaultFolderXmlPath(model: CanonicalModelDocument, folderName: string): string {
+  const rootDir = getDirName(getRootModelFilePath(model));
+  return joinPath(rootDir, folderName, 'folder.xml');
+}
+
+function getFolderEntryMaps(model: CanonicalModelDocument): {
+  byPath: Map<string, CoArchiFolderEntry>;
+  byType: Map<string, CoArchiFolderEntry>;
+} {
+  const byPath = new Map<string, CoArchiFolderEntry>();
+  const byType = new Map<string, CoArchiFolderEntry>();
+  for (const folder of model.metadata?.coArchi?.folders || []) {
+    if (!byPath.has(folder.path)) byPath.set(folder.path, folder);
+    if (folder.type && !byType.has(folder.type)) byType.set(folder.type, folder);
+  }
+  return { byPath, byType };
+}
+
+function buildFolderEntry(
+  folderXmlPath: string,
+  defaults: { name: string; id: string; type: string },
+  folderByPath: Map<string, CoArchiFolderEntry>,
+  folderByType: Map<string, CoArchiFolderEntry>,
+): CoArchiFolderEntry {
+  return folderByPath.get(folderXmlPath)
+    || folderByType.get(defaults.type)
+    || {
+      path: folderXmlPath,
+      name: defaults.name,
+      id: defaults.id,
+      type: defaults.type,
+    };
+}
+
+/**
+ * Serialize a CanonicalModelDocument into the GRAFICO fragmented directory format.
+ * Returns a list of { relativePath, content } pairs to be written to disk.
+ */
+export function serializeCoArchiFragmented(model: CanonicalModelDocument): import('../adapter').FragmentedSerializeResult {
+  const files: { relativePath: string; content: string }[] = [];
+  const diagnostics: import('../../model/diagnostics').ModelDiagnostic[] = [];
+  const requiredFolders = new Map<string, CoArchiFolderEntry>();
+  const { byPath: folderByPath, byType: folderByType } = getFolderEntryMaps(model);
+  const rootFilePath = getRootModelFilePath(model);
+  const rootMeta = model.metadata?.coArchi;
+  const folderChildXml = new Map<string, string[]>();
+  const standardFolders = [
+    { folderName: 'strategy', displayName: 'Strategy', id: 'folder-strategy', type: 'strategy' },
+    { folderName: 'business', displayName: 'Business', id: 'folder-business', type: 'business' },
+    { folderName: 'application', displayName: 'Application', id: 'folder-application', type: 'application' },
+    { folderName: 'technology', displayName: 'Technology', id: 'folder-technology', type: 'technology' },
+    { folderName: 'motivation', displayName: 'Motivation', id: 'folder-motivation', type: 'motivation' },
+    { folderName: 'implementation_migration', displayName: 'Implementation & Migration', id: 'folder-implementation_migration', type: 'implementation_migration' },
+    { folderName: 'other', displayName: 'Other', id: 'folder-other', type: 'other' },
+    { folderName: 'relations', displayName: 'Relations', id: 'folder-relations', type: 'relations' },
+    { folderName: 'diagrams', displayName: 'Views', id: 'folder-views', type: 'diagrams' },
+  ];
+
+  // Root folder.xml is built after all folders are registered (see below)
+
+  // Element folder structure by layer
+  const elementsByLayer = new Map<string, typeof model.elements>();
+  for (const el of model.elements) {
+    // Skip synthetic diagram-only elements (notes, groups, view references)
+    if (el.type === 'note' || el.type === 'grouping' || el.type === 'viewReference') continue;
+    const layer = ELEMENT_TYPES[el.type]?.layer ?? 'other';
+    if (!elementsByLayer.has(layer)) elementsByLayer.set(layer, []);
+    elementsByLayer.get(layer)!.push(el);
+  }
+
+  // Map layer names to GRAFICO folder names
+  const layerFolderMap: Record<string, string> = {
+    strategy: 'strategy',
+    business: 'business',
+    application: 'application',
+    technology: 'technology',
+    motivation: 'motivation',
+    implementation: 'implementation_migration',
+    composite: 'other',
+  };
+
+  function registerFolder(folderXmlPath: string, defaults: { name: string; id: string; type: string }): void {
+    if (requiredFolders.has(folderXmlPath)) return;
+    requiredFolders.set(folderXmlPath, buildFolderEntry(folderXmlPath, defaults, folderByPath, folderByType));
+  }
+
+  function registerFolderChild(folderXmlPath: string, childXml: string): void {
+    const children = folderChildXml.get(folderXmlPath) || [];
+    children.push(childXml);
+    folderChildXml.set(folderXmlPath, children);
+  }
+
+  function getLocalHref(filePath: string, id: string): string {
+    const baseName = filePath.split('/').pop() || filePath;
+    return `${baseName}#${id}`;
+  }
+
+  function serializeHrefChild(
+    indent: string,
+    tagName: string,
+    xsiType: string | undefined,
+    filePath: string | undefined,
+    id: string,
+  ): string {
+    const href = escapeXml(getLocalHref(filePath || id, id));
+    const typeAttr = xsiType ? `\n${indent}    xsi:type="${escapeXml(xsiType)}"` : '';
+    return `${indent}<${tagName}${typeAttr}\n${indent}    href="${href}"/>\n`;
+  }
+
+  for (const folder of standardFolders) {
+    registerFolder(getDefaultFolderXmlPath(model, folder.folderName), {
+      name: folder.displayName,
+      id: folder.id,
+      type: folder.type,
+    });
+  }
+
+  for (const folder of rootMeta?.folders || []) {
+    if (folder.path === rootFilePath) continue;
+    if (!requiredFolders.has(folder.path)) {
+      requiredFolders.set(folder.path, folder);
+    }
+  }
+
+  for (const [layer, elements] of elementsByLayer) {
+    const folder = layerFolderMap[layer] ?? 'other';
+    const defaultFolderXmlPath = getDefaultFolderXmlPath(model, folder);
+    registerFolder(defaultFolderXmlPath, {
+      name: toPascalCase(layer),
+      id: `folder-${folder}`,
+      type: folder,
+    });
+
+    for (const el of elements) {
+      const tag = elementTypeToXmlTag(el.type);
+      const elementPath = el.sourcePath || `${getDirName(defaultFolderXmlPath)}/${tag}_${el.id}.xml`;
+      const elementFolderXmlPath = `${getDirName(elementPath)}/folder.xml`;
+      registerFolder(elementFolderXmlPath, {
+        name: toPascalCase(layer),
+        id: `folder-${folder}`,
+        type: folder,
+      });
+      registerFolderChild(
+        elementFolderXmlPath,
+        `  <element xsi:type="archimate:${tag}" id="${escapeXml(el.id)}" href="${escapeXml(getLocalHref(elementPath, el.id))}"/>\n`,
+      );
+      let xml = XML_HEADER +
+        `<archimate:${tag} xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"\n` +
+        `    xmlns:archimate="${ARCHIMATE_NS}"\n` +
+        `    name="${escapeXml(el.name)}"\n` +
+        `    id="${escapeXml(el.id)}"`;
+
+      // Junction subtype
+      if (el.type === 'andJunction') {
+        xml += `\n    type="and"`;
+      } else if (el.type === 'orJunction') {
+        xml += `\n    type="or"`;
+      }
+
+      const hasChildren = !!el.documentation || !!(el.properties && el.properties.length > 0);
+      if (hasChildren) {
+        xml += `>\n`;
+        if (el.documentation) {
+          xml += `  <documentation>${escapeXml(el.documentation)}</documentation>\n`;
+        }
+        xml += propertiesXml(el.properties, '  ');
+        xml += `</archimate:${tag}>\n`;
+      } else {
+        xml += `/>\n`;
+      }
+
+      files.push({
+        relativePath: elementPath,
+        content: xml,
+      });
+    }
+  }
+
+  // Relations folder
+  if (model.relationships.length > 0) {
+    const defaultRelationsFolderPath = getDefaultFolderXmlPath(model, 'relations');
+    registerFolder(defaultRelationsFolderPath, {
+      name: 'Relations',
+      id: 'folder-relations',
+      type: 'relations',
+    });
+
+    for (const rel of model.relationships) {
+      const tag = relationshipTypeToXmlTag(rel.type);
+      const relationPath = rel.sourcePath || `${getDirName(defaultRelationsFolderPath)}/${tag}_${rel.id}.xml`;
+      const relationFolderXmlPath = `${getDirName(relationPath)}/folder.xml`;
+      registerFolder(relationFolderXmlPath, {
+        name: 'Relations',
+        id: 'folder-relations',
+        type: 'relations',
+      });
+      registerFolderChild(
+        relationFolderXmlPath,
+        `  <element xsi:type="archimate:${tag}" id="${escapeXml(rel.id)}" href="${escapeXml(getLocalHref(relationPath, rel.id))}"/>\n`,
+      );
+      let xml = XML_HEADER +
+        `<archimate:${tag} xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"\n` +
+        `    xmlns:archimate="${ARCHIMATE_NS}"\n` +
+        (rel.name ? `    name="${escapeXml(rel.name)}"\n` : '') +
+        `    id="${escapeXml(rel.id)}"`;
+      const sourceElement = model.elements.find(element => element.id === rel.sourceId);
+      const targetElement = model.elements.find(element => element.id === rel.targetId);
+      const sourceType = sourceElement ? `archimate:${elementTypeToXmlTag(sourceElement.type)}` : undefined;
+      const targetType = targetElement ? `archimate:${elementTypeToXmlTag(targetElement.type)}` : undefined;
+      const hasChildren = !!rel.documentation || !!(rel.properties && rel.properties.length > 0);
+      if (hasChildren || sourceElement || targetElement) {
+        xml += `>\n`;
+        if (sourceElement) {
+          xml += serializeHrefChild('  ', 'source', sourceType, sourceElement.sourcePath, rel.sourceId);
+        }
+        if (targetElement) {
+          xml += serializeHrefChild('  ', 'target', targetType, targetElement.sourcePath, rel.targetId);
+        }
+        if (rel.documentation) {
+          xml += `  <documentation>${escapeXml(rel.documentation)}</documentation>\n`;
+        }
+        xml += propertiesXml(rel.properties, '  ');
+        xml += `</archimate:${tag}>\n`;
+      } else {
+        xml += `/>\n`;
+      }
+
+      files.push({
+        relativePath: relationPath,
+        content: xml,
+      });
+    }
+  }
+
+  // Views folder
+  if (model.views.length > 0) {
+    const defaultViewsFolderPath = getDefaultFolderXmlPath(model, 'diagrams');
+    registerFolder(defaultViewsFolderPath, {
+      name: 'Views',
+      id: 'folder-views',
+      type: 'diagrams',
+    });
+
+    for (const view of model.views) {
+      const normalizedViewPath = view.sourcePath || `${getDirName(defaultViewsFolderPath)}/ArchimateDiagramModel_${view.id}.xml`;
+      const viewFolderXmlPath = `${getDirName(normalizedViewPath)}/folder.xml`;
+      registerFolder(viewFolderXmlPath, {
+        name: 'Views',
+        id: 'folder-views',
+        type: 'diagrams',
+      });
+      registerFolderChild(
+        viewFolderXmlPath,
+        `  <element xsi:type="archimate:ArchimateDiagramModel" id="${escapeXml(view.id)}" href="${escapeXml(getLocalHref(normalizedViewPath, view.id))}"/>\n`,
+      );
+      const viewNodes = model.viewNodes.filter(vn => vn.viewId === view.id);
+      const viewConnections = model.viewConnections.filter(vc => vc.viewId === view.id);
+      const viewNodeById = new Map(viewNodes.map(node => [node.id, node]));
+
+      // Build nesting hierarchy: group nodes by parent
+      const childrenByParent = new Map<string | undefined, typeof viewNodes>();
+      for (const vn of viewNodes) {
+        const parentKey = vn.parentNodeId ?? undefined;
+        if (!childrenByParent.has(parentKey)) childrenByParent.set(parentKey, []);
+        childrenByParent.get(parentKey)!.push(vn);
+      }
+
+      // Build connection lookup by source element
+      const connectionsBySourceNodeId = new Map<string, typeof viewConnections>();
+      const connectionsByTargetNodeId = new Map<string, typeof viewConnections>();
+      for (const vc of viewConnections) {
+        const rel = model.relationships.find(r => r.id === vc.relationshipId);
+        const sourceNodeId = vc.sourceNodeId
+          || viewNodes.find(vn => {
+            return vn.elementId === rel?.sourceId;
+          })?.id;
+        const targetNodeId = vc.targetNodeId
+          || viewNodes.find(vn => vn.elementId === rel?.targetId)?.id;
+        if (!sourceNodeId) continue;
+        if (!connectionsBySourceNodeId.has(sourceNodeId)) connectionsBySourceNodeId.set(sourceNodeId, []);
+        connectionsBySourceNodeId.get(sourceNodeId)!.push(vc);
+        if (targetNodeId) {
+          if (!connectionsByTargetNodeId.has(targetNodeId)) connectionsByTargetNodeId.set(targetNodeId, []);
+          connectionsByTargetNodeId.get(targetNodeId)!.push(vc);
+        }
+      }
+
+      function serializeViewNode(vn: CanonicalViewNode, indent: string): string {
+        const el = model.elements.find(e => e.id === vn.elementId);
+        const isNote = el?.type === 'note';
+        const isGroup = el?.type === 'grouping';
+        const isViewRef = el?.type === 'viewReference';
+        const parentNode = vn.parentNodeId ? viewNodeById.get(vn.parentNodeId) : undefined;
+        const boundsX = parentNode ? vn.x - parentNode.x : vn.x;
+        const boundsY = parentNode ? vn.y - parentNode.y : vn.y;
+
+        let xsiType: string;
+        if (isNote) xsiType = 'archimate:Note';
+        else if (isGroup) xsiType = 'archimate:Group';
+        else if (isViewRef) xsiType = 'archimate:DiagramModelReference';
+        else xsiType = 'archimate:DiagramObject';
+
+        let line = `${indent}<child xsi:type="${xsiType}"`;
+        line += ` id="${escapeXml(vn.id)}"`;
+        const targetConnections = connectionsByTargetNodeId.get(vn.id) ?? [];
+        if (targetConnections.length > 0) {
+          line += ` targetConnections="${escapeXml(targetConnections.map(connection => connection.id).join(' '))}"`;
+        }
+
+        if (isViewRef && vn.linkedViewId) {
+          line += ` model="${escapeXml(vn.linkedViewId)}"`;
+        }
+        if (isNote && el) {
+          line += ` content="${escapeXml(el.name)}"`;
+        }
+        if (isGroup && el) {
+          line += ` name="${escapeXml(el.name)}"`;
+        }
+        line += styleAttrs(vn.style);
+
+        // Children of this node
+        const nestedChildren = childrenByParent.get(vn.id) ?? [];
+        // Source connections from this node's element
+        const nodeConnections = connectionsBySourceNodeId.get(vn.id) ?? [];
+
+        const hasChildren = nestedChildren.length > 0 || nodeConnections.length > 0;
+
+        if (hasChildren) {
+          line += `>\n`;
+          line += `${indent}  <bounds x="${Math.round(boundsX)}" y="${Math.round(boundsY)}" width="${Math.round(vn.width)}" height="${Math.round(vn.height)}"/>\n`;
+          if (!isNote && !isGroup && !isViewRef && el?.sourcePath) {
+            line += serializeHrefChild(
+              `${indent}  `,
+              'archimateElement',
+              `archimate:${elementTypeToXmlTag(el.type)}`,
+              el.sourcePath,
+              vn.elementId,
+            );
+          }
+
+          for (const conn of nodeConnections) {
+            line += serializeConnection(conn, indent + '  ');
+          }
+          for (const child of nestedChildren) {
+            line += serializeViewNode(child, indent + '  ');
+          }
+          line += `${indent}</child>\n`;
+        } else {
+          line += `>\n`;
+          line += `${indent}  <bounds x="${Math.round(boundsX)}" y="${Math.round(boundsY)}" width="${Math.round(vn.width)}" height="${Math.round(vn.height)}"/>\n`;
+          if (!isNote && !isGroup && !isViewRef && el?.sourcePath) {
+            line += serializeHrefChild(
+              `${indent}  `,
+              'archimateElement',
+              `archimate:${elementTypeToXmlTag(el.type)}`,
+              el.sourcePath,
+              vn.elementId,
+            );
+          }
+          line += `${indent}</child>\n`;
+        }
+
+        return line;
+      }
+
+      function serializeConnection(vc: CanonicalViewConnection, indent: string): string {
+        const rel = model.relationships.find(r => r.id === vc.relationshipId);
+        let line = `${indent}<sourceConnection xsi:type="archimate:Connection"`;
+        line += ` id="${escapeXml(vc.id)}"`;
+        // Source and target diagram node references
+        const srcNode = (vc.sourceNodeId && viewNodes.find(vn => vn.id === vc.sourceNodeId))
+          || viewNodes.find(vn => vn.elementId === rel?.sourceId);
+        const tgtNode = (vc.targetNodeId && viewNodes.find(vn => vn.id === vc.targetNodeId))
+          || viewNodes.find(vn => vn.elementId === rel?.targetId);
+        if (srcNode) line += ` source="${escapeXml(srcNode.id)}"`;
+        if (tgtNode) line += ` target="${escapeXml(tgtNode.id)}"`;
+        line += styleAttrs(vc.style);
+
+        // Bendpoints
+        const bendpoints = vc.relativeBendpoints ?? [];
+        const relationshipType = rel ? `archimate:${relationshipTypeToXmlTag(rel.type)}` : undefined;
+        if (bendpoints.length > 0 || rel?.sourcePath) {
+          line += `>\n`;
+          if (rel?.sourcePath) {
+            line += serializeHrefChild(
+              `${indent}  `,
+              'archimateRelationship',
+              relationshipType,
+              rel.sourcePath,
+              vc.relationshipId,
+            );
+          }
+          for (const bp of bendpoints) {
+            line += `${indent}  <bendpoints startX="${Math.round(bp.startX)}" startY="${Math.round(bp.startY)}" endX="${Math.round(bp.endX)}" endY="${Math.round(bp.endY)}"/>\n`;
+          }
+          line += `${indent}</sourceConnection>\n`;
+        } else {
+          line += `/>\n`;
+        }
+
+        return line;
+      }
+
+      // Build the view XML
+      let xml = XML_HEADER +
+        `<archimate:ArchimateDiagramModel xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"\n` +
+        `    xmlns:archimate="${ARCHIMATE_NS}"\n` +
+        `    name="${escapeXml(view.name)}"\n` +
+        `    id="${escapeXml(view.id)}"` +
+        (view.viewpoint ? `\n    viewpoint="${escapeXml(view.viewpoint)}"` : '') +
+        `>\n`;
+
+      if (view.documentation) {
+        xml += `  <documentation>${escapeXml(view.documentation)}</documentation>\n`;
+      }
+      xml += propertiesXml(view.properties, '  ');
+
+      // Serialize top-level nodes (no parent)
+      const topLevel = childrenByParent.get(undefined) ?? [];
+      for (const vn of topLevel) {
+        xml += serializeViewNode(vn, '  ');
+      }
+
+      xml += `</archimate:ArchimateDiagramModel>\n`;
+
+      files.push({
+        relativePath: normalizedViewPath,
+        content: xml,
+      });
+    }
+  }
+
+  const sortedFolderPaths = [...requiredFolders.keys()].sort((a, b) => a.localeCompare(b));
+  for (const folderPath of sortedFolderPaths) {
+    const folderDir = getDirName(folderPath);
+    const directChildFolders = sortedFolderPaths.filter(candidate => {
+      if (candidate === folderPath) return false;
+      return getDirName(getDirName(candidate)) === folderDir;
+    });
+
+    for (const childFolderPath of directChildFolders) {
+      const childFolder = requiredFolders.get(childFolderPath);
+      if (!childFolder) continue;
+      registerFolderChild(
+        folderPath,
+        `  <folder name="${escapeXml(childFolder.name || 'Folder')}" id="${escapeXml(childFolder.id || `folder-${childFolder.type || 'default'}`)}"${childFolder.type ? ` type="${escapeXml(childFolder.type)}"` : ''}/>\n`,
+      );
+    }
+  }
+
+  // Build root model manifest with child folder references so Archi discovers the subfolder structure
+  {
+    const rootDir = getDirName(rootFilePath);
+    const rootChildFolders = sortedFolderPaths
+      .map(path => requiredFolders.get(path)!)
+      .filter(folder => getDirName(getDirName(folder.path)) === rootDir);
+    let rootXml = XML_HEADER +
+      `<archimate:model xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"\n` +
+      `    xmlns:archimate="${ARCHIMATE_NS}"\n` +
+      `    name="${escapeXml(rootMeta?.modelName || 'OpenArchi Model')}"\n` +
+      `    id="${escapeXml(rootMeta?.modelId || 'model-root')}"\n` +
+      `    version="${escapeXml(rootMeta?.modelVersion || '5.0.0')}"` +
+      (rootMeta?.modelPurpose ? `\n    purpose="${escapeXml(rootMeta.modelPurpose)}"` : '');
+    if (rootChildFolders.length > 0) {
+      rootXml += `>\n`;
+      for (const child of rootChildFolders) {
+        rootXml += `  <folder name="${escapeXml(child.name || 'Folder')}" id="${escapeXml(child.id || `folder-${child.type || 'default'}`)}"${child.type ? ` type="${escapeXml(child.type)}"` : ''}/>\n`;
+      }
+      rootXml += `</archimate:model>\n`;
+    } else {
+      rootXml += `/>\n`;
+    }
+    files.push({ relativePath: rootFilePath, content: rootXml });
+  }
+
+  for (const folder of [...requiredFolders.values()].sort((a, b) => a.path.localeCompare(b.path))) {
+    const childXml = (folderChildXml.get(folder.path) || []).sort((a, b) => a.localeCompare(b)).join('');
+    files.push({
+      relativePath: folder.path,
+      content: XML_HEADER +
+        `<archimate:Folder xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"\n` +
+        `    xmlns:archimate="${ARCHIMATE_NS}"\n` +
+        `    name="${escapeXml(folder.name || 'Folder')}"\n` +
+        `    id="${escapeXml(folder.id || `folder-${folder.type || 'default'}`)}"\n` +
+        (folder.type ? `    type="${escapeXml(folder.type)}">\n` : '>\n') +
+        childXml +
+        `</archimate:Folder>\n`,
+    });
+  }
+
+  files.sort((a, b) => a.relativePath.localeCompare(b.relativePath));
+
+  return { files, diagnostics, document: model };
 }
 
 export const coArchiXmlAdapter: ModelFormatAdapter = {

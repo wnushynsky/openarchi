@@ -488,25 +488,32 @@ export function hitTestAnchor(elements: ModelElement[], wx: number, wy: number, 
 }
 
 /** Hit test start/end endpoint of a relationship. Only checks the given rel (should be the selected one). */
-export function hitTestEndpoint(rel: ModelRelationship, elements: ModelElement[], wx: number, wy: number): 'source' | 'target' | null {
+export function hitTestEndpoint(rel: ModelRelationship, elements: ModelElement[], wx: number, wy: number, scale: number = 1): 'source' | 'target' | null {
   const pts = getRelPoints(rel, elements);
   if (!pts) return null;
-  if (Math.hypot(pts.start.x - wx, pts.start.y - wy) < 10) return 'source';
-  if (Math.hypot(pts.end.x - wx, pts.end.y - wy) < 10) return 'target';
+  const threshold = 10 / Math.max(scale, 0.1);
+  if (Math.hypot(pts.start.x - wx, pts.start.y - wy) < threshold) return 'source';
+  if (Math.hypot(pts.end.x - wx, pts.end.y - wy) < threshold) return 'target';
   return null;
 }
 
-export function hitTestWaypoint(relationships: ModelRelationship[], wx: number, wy: number): { relId: string; wpIdx: number } | null {
+export function hitTestWaypoint(relationships: ModelRelationship[], wx: number, wy: number, scale: number = 1): { relId: string; wpIdx: number } | null {
+  const threshold = 8 / Math.max(scale, 0.1);
   for (const r of relationships) {
     if (!r.waypoints) continue;
     for (let i = 0; i < r.waypoints.length; i++) {
-      if (Math.hypot(r.waypoints[i].x - wx, r.waypoints[i].y - wy) < 8) return { relId: r.id, wpIdx: i };
+      if (Math.hypot(r.waypoints[i].x - wx, r.waypoints[i].y - wy) < threshold) return { relId: r.id, wpIdx: i };
     }
   }
   return null;
 }
 
-export function hitTestRelationship(relationships: ModelRelationship[], elements: ModelElement[], wx: number, wy: number): RelHit | null {
+export function hitTestRelationship(relationships: ModelRelationship[], elements: ModelElement[], wx: number, wy: number, scale: number = 1): RelHit | null {
+  let bestHit: RelHit | null = null;
+  let bestDistance = Infinity;
+  // Keep a consistent ~12 screen-pixel hit area regardless of zoom level
+  const threshold = 12 / Math.max(scale, 0.1);
+
   for (const rel of relationships) {
     const pts = getRelPoints(rel, elements);
     if (!pts) continue;
@@ -517,10 +524,14 @@ export function hitTestRelationship(relationships: ModelRelationship[], elements
       const len2 = dx * dx + dy * dy;
       let t = len2 === 0 ? 0 : ((wx - a.x) * dx + (wy - a.y) * dy) / len2;
       t = Math.max(0, Math.min(1, t));
-      if (Math.hypot(wx - (a.x + t * dx), wy - (a.y + t * dy)) < 8) return { rel, segIdx: i };
+      const distance = Math.hypot(wx - (a.x + t * dx), wy - (a.y + t * dy));
+      if (distance <= threshold && distance < bestDistance) {
+        bestDistance = distance;
+        bestHit = { rel, segIdx: i };
+      }
     }
   }
-  return null;
+  return bestHit;
 }
 
 /** Determine if a relationship segment is horizontal or vertical */
@@ -535,7 +546,8 @@ export function getSegmentOrientation(rel: ModelRelationship, elements: ModelEle
   return dx >= dy ? 'h' : 'v';
 }
 
-export function hitTestLabel(relationships: ModelRelationship[], elements: ModelElement[], wx: number, wy: number): ModelRelationship | null {
+export function hitTestLabel(relationships: ModelRelationship[], elements: ModelElement[], wx: number, wy: number, scale: number = 1): ModelRelationship | null {
+  const s = Math.max(scale, 0.1);
   for (const rel of relationships) {
     if (!rel.name) continue;
     const pts = getRelPoints(rel, elements);
@@ -543,7 +555,7 @@ export function hitTestLabel(relationships: ModelRelationship[], elements: Model
     const allPts = [pts.start, ...pts.waypoints, pts.end];
     const lp = rel.labelPos ?? 0.5;
     const pt = pointOnPath(allPts, lp);
-    if (Math.abs(wx - pt.x) < 40 && Math.abs(wy - pt.y) < 12) return rel;
+    if (Math.abs(wx - pt.x) < 40 / s && Math.abs(wy - pt.y) < 12 / s) return rel;
   }
   return null;
 }

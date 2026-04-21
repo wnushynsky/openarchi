@@ -42,6 +42,11 @@ export interface ElementStyle {
   fontColor?: string;
 }
 
+export interface PropertyRecord {
+  key: string;
+  value: string;
+}
+
 export interface ModelElement {
   id: string;
   type: string;
@@ -51,6 +56,8 @@ export interface ModelElement {
   w: number;
   h: number;
   documentation: string;
+  properties?: PropertyRecord[];
+  sourcePath?: string;
   linkedViewId?: string;
   zIndex?: number;
   style?: ElementStyle;
@@ -75,6 +82,9 @@ export interface ModelRelationship {
   sourceId: string;
   targetId: string;
   name: string;
+  documentation?: string;
+  properties?: PropertyRecord[];
+  sourcePath?: string;
   waypoints: Waypoint[];
   labelPos: number;
   /** Manual anchor point on source element boundary (absolute coords, snapped to edge on render) */
@@ -90,6 +100,37 @@ export interface ModelView {
   name: string;
   elementIds: string[];
   childViewIds: string[];
+  documentation?: string;
+  purpose?: string;
+  viewpoint?: string;
+  properties?: PropertyRecord[];
+  sourcePath?: string;
+}
+
+export interface DiagramNodeRecord {
+  id: string;
+  viewId: string;
+  elementId: string;
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  linkedViewId?: string;
+  zIndex?: number;
+  style?: ElementStyle;
+  parentNodeId?: string;
+  nestingDepth?: number;
+}
+
+export interface DiagramConnectionRecord {
+  id: string;
+  viewId: string;
+  relationshipId: string;
+  sourceNodeId?: string;
+  targetNodeId?: string;
+  waypoints: Waypoint[];
+  labelPos: number;
+  relativeBendpoints?: RelativeBendpoint[];
 }
 
 export interface OpenArchiModel {
@@ -97,6 +138,8 @@ export interface OpenArchiModel {
   elements: ModelElement[];
   relationships: ModelRelationship[];
   views: ModelView[];
+  diagramNodes?: DiagramNodeRecord[];
+  diagramConnections?: DiagramConnectionRecord[];
 }
 
 // ============================================================
@@ -124,6 +167,7 @@ export interface PanState {
 
 export interface DrawingRelState {
   sourceId: string;
+  sourceNodeId?: string;
   mx: number;
   my: number;
   waypoints: Point[];
@@ -158,6 +202,8 @@ export interface RelPickerState {
   sy: number;
   srcId: string;
   tgtId: string;
+  sourceNodeId?: string;
+  targetNodeId?: string;
 }
 
 export interface CtxMenuItem {

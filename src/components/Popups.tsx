@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import type { ModelElement, ModelView, CtxMenuItem, RelationshipTypeDef } from '../types';
+import type { ModelElement, ModelRelationship, ModelView, CtxMenuItem, RelationshipTypeDef } from '../types';
 import { RELATIONSHIP_TYPES, ELEMENT_TYPES, LAYERS, FONT } from '../core';
 import { CanvasIcon } from './CanvasIcon';
 
@@ -217,18 +217,29 @@ export function CtxMenu({ x, y, items, onClose }: CtxMenuProps) {
 
 interface SearchPanelProps {
   elements: ModelElement[];
+  relationships: ModelRelationship[];
   views: ModelView[];
   onSelectElement: (id: string) => void;
+  onSelectRelationship: (id: string) => void;
   onSelectView: (id: string) => void;
   onClose: () => void;
 }
 
-export function SearchPanel({ elements, views, onSelectElement, onSelectView, onClose }: SearchPanelProps) {
+export function SearchPanel({ elements, relationships, views, onSelectElement, onSelectRelationship, onSelectView, onClose }: SearchPanelProps) {
   const [q, setQ] = useState('');
   const lq = q.toLowerCase();
 
   const matchEls = q
     ? elements.filter(e => e.name?.toLowerCase().includes(lq) || ELEMENT_TYPES[e.type]?.label.toLowerCase().includes(lq) || e.documentation?.toLowerCase().includes(lq)).slice(0, 12)
+    : [];
+  const matchRels = q
+    ? relationships.filter(r => {
+      const typeDef = RELATIONSHIP_TYPES[r.type];
+      const srcName = elements.find(e => e.id === r.sourceId)?.name || '';
+      const tgtName = elements.find(e => e.id === r.targetId)?.name || '';
+      const label = r.name || `${srcName} → ${tgtName}`;
+      return label.toLowerCase().includes(lq) || typeDef?.label.toLowerCase().includes(lq) || r.documentation?.toLowerCase().includes(lq);
+    }).slice(0, 8)
     : [];
   const matchViews = q ? views.filter(v => v.name.toLowerCase().includes(lq)).slice(0, 6) : [];
 
@@ -337,7 +348,41 @@ export function SearchPanel({ elements, views, onSelectElement, onSelectView, on
               ))}
             </div>
           )}
-          {!matchEls.length && !matchViews.length && (
+          {matchRels.length > 0 && (
+            <div>
+              <div style={{
+                padding: '8px 14px 4px', fontSize: 10, fontWeight: 500,
+                color: 'var(--text-faint, #b0b0b8)',
+                textTransform: 'uppercase', letterSpacing: '0.4px',
+              }}>Relationships</div>
+              {matchRels.map(r => {
+                const srcName = elements.find(e => e.id === r.sourceId)?.name || '?';
+                const tgtName = elements.find(e => e.id === r.targetId)?.name || '?';
+                const typeDef = RELATIONSHIP_TYPES[r.type];
+                return (
+                  <button
+                    key={r.id}
+                    onClick={() => { onSelectRelationship(r.id); onClose(); }}
+                    style={{
+                      display: 'flex', alignItems: 'center', gap: 8,
+                      width: '100%', padding: '6px 14px', border: 'none',
+                      background: 'transparent', cursor: 'pointer',
+                      fontSize: 13, color: 'var(--text-secondary, #555)',
+                      fontFamily: 'inherit', textAlign: 'left', borderRadius: 4,
+                      transition: 'background var(--transition-fast, 0.12s ease)',
+                    }}
+                    onMouseEnter={itemHover}
+                    onMouseLeave={itemUnhover}
+                  >
+                    <span style={{ fontSize: 11, color: 'var(--text-faint, #b0b0b8)', flexShrink: 0 }}>{'→'}</span>
+                    <span style={{ fontWeight: 500 }}>{r.name || `${srcName} → ${tgtName}`}</span>
+                    <span style={{ marginLeft: 'auto', fontSize: 11, color: 'var(--text-faint, #b0b0b8)' }}>{typeDef?.label || r.type}</span>
+                  </button>
+                );
+              })}
+            </div>
+          )}
+          {!matchEls.length && !matchRels.length && !matchViews.length && (
             <div style={{ padding: '20px 14px', textAlign: 'center', color: 'var(--text-faint, #b0b0b8)', fontSize: 13 }}>No results</div>
           )}
         </div>

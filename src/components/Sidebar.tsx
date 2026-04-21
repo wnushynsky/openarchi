@@ -1,6 +1,7 @@
 import { useState, useMemo, useCallback, useRef, useEffect } from 'react';
-import type { ModelView, ModelElement, ModelRelationship } from '../types';
+import type { ModelView, ModelElement, ModelRelationship, PropertyRecord } from '../types';
 import { LAYERS, ELEMENT_TYPES, RELATIONSHIP_TYPES, FONT } from '../core';
+import { VIEWPOINTS, getViewpointDefinition } from '../model/viewpoints';
 import { CanvasIcon } from './CanvasIcon';
 
 const iS: React.CSSProperties = {
@@ -19,6 +20,196 @@ function PF({ label, children, c }: { label: string; children: React.ReactNode; 
   );
 }
 
+function PropertyListEditor({
+  properties,
+  onChange,
+}: {
+  properties?: PropertyRecord[];
+  onChange: (properties: PropertyRecord[]) => void;
+}) {
+  const [query, setQuery] = useState('');
+  const rows = properties && properties.length > 0 ? properties : [];
+  const normalizedQuery = query.trim().toLowerCase();
+  const visibleRows = rows
+    .map((property, index) => ({ property, index }))
+    .filter(({ property }) => {
+      if (!normalizedQuery) return true;
+      return property.key.toLowerCase().includes(normalizedQuery) || property.value.toLowerCase().includes(normalizedQuery);
+    });
+
+  const updateRow = (index: number, key: 'key' | 'value', value: string) => {
+    const next = rows.map((property, propertyIndex) => (
+      propertyIndex === index ? { ...property, [key]: value } : property
+    ));
+    onChange(next);
+  };
+
+  const addRow = () => onChange([...rows, { key: '', value: '' }]);
+  const removeRow = (index: number) => onChange(rows.filter((_, propertyIndex) => propertyIndex !== index));
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+      <input
+        value={query}
+        onChange={e => setQuery(e.target.value)}
+        placeholder="Filter properties..."
+        style={{ ...iS, fontSize: 12 }}
+      />
+      {rows.length === 0 && (
+        <div style={{ fontSize: 11, color: 'var(--text-faint, #b0b0b8)', lineHeight: 1.5 }}>
+          No properties yet.
+        </div>
+      )}
+      {rows.length > 0 && visibleRows.length === 0 && (
+        <div style={{ fontSize: 11, color: 'var(--text-faint, #b0b0b8)', lineHeight: 1.5 }}>
+          No properties match "{query}".
+        </div>
+      )}
+      {visibleRows.map(({ property, index }) => (
+        <div key={`${index}:${property.key}`} style={{ display: 'grid', gridTemplateColumns: '1fr 1fr auto', gap: 6, alignItems: 'start' }}>
+          <input
+            value={property.key}
+            onChange={e => updateRow(index, 'key', e.target.value)}
+            placeholder="key"
+            style={iS}
+          />
+          <input
+            value={property.value}
+            onChange={e => updateRow(index, 'value', e.target.value)}
+            placeholder="value"
+            style={iS}
+          />
+          <button
+            onClick={() => removeRow(index)}
+            title="Remove property"
+            style={{
+              marginTop: 2,
+              width: 24,
+              height: 24,
+              borderRadius: 5,
+              border: '1px solid var(--border, rgba(0,0,0,0.06))',
+              background: 'var(--surface-hover, rgba(0,0,0,0.035))',
+              cursor: 'pointer',
+              color: 'var(--text-muted, #8a8a90)',
+              fontSize: 12,
+              lineHeight: 1,
+            }}
+          >
+            {'\u00D7'}
+          </button>
+        </div>
+      ))}
+      <button
+        onClick={addRow}
+        style={{
+          alignSelf: 'flex-start',
+          padding: '4px 8px',
+          borderRadius: 5,
+          border: '1px solid var(--border, rgba(0,0,0,0.06))',
+          background: 'var(--surface-hover, rgba(0,0,0,0.035))',
+          cursor: 'pointer',
+          color: 'var(--text-secondary, #555)',
+          fontSize: 11.5,
+          fontFamily: 'inherit',
+        }}
+      >
+        Add Property
+      </button>
+    </div>
+  );
+}
+
+function FolderPathEditor({
+  value,
+  onCommit,
+  placeholder,
+}: {
+  value: string;
+  onCommit: (value: string) => void;
+  placeholder: string;
+}) {
+  const [draft, setDraft] = useState(value);
+
+  useEffect(() => {
+    setDraft(value);
+  }, [value]);
+
+  const commit = () => {
+    if (draft === value) return;
+    onCommit(draft);
+  };
+
+  return (
+    <input
+      value={draft}
+      onChange={event => setDraft(event.target.value)}
+      onBlur={commit}
+      onKeyDown={event => {
+        if (event.key === 'Enter') {
+          event.preventDefault();
+          commit();
+          (event.currentTarget as HTMLInputElement).blur();
+        }
+      }}
+      placeholder={placeholder}
+      style={iS}
+    />
+  );
+}
+
+function ElementRelationshipList({
+  title,
+  relationships,
+  elementsById,
+  onSelectRelationship,
+}: {
+  title: string;
+  relationships: ModelRelationship[];
+  elementsById: Map<string, ModelElement>;
+  onSelectRelationship?: (relationshipId: string) => void;
+}) {
+  return (
+    <PF label={title}>
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+        {relationships.length === 0 ? (
+          <div style={{ fontSize: 11, color: 'var(--text-faint, #b0b0b8)', lineHeight: 1.5 }}>
+            None.
+          </div>
+        ) : relationships.map(relationship => {
+          const counterpartId = title === 'Outgoing' ? relationship.targetId : relationship.sourceId;
+          const counterpart = elementsById.get(counterpartId);
+          const typeLabel = RELATIONSHIP_TYPES[relationship.type]?.label || relationship.type;
+          const relationshipLabel = relationship.name?.trim();
+          return (
+            <button
+              key={relationship.id}
+              onClick={() => onSelectRelationship?.(relationship.id)}
+              style={{
+                textAlign: 'left',
+                width: '100%',
+                borderRadius: 8,
+                border: '1px solid var(--border, rgba(0,0,0,0.06))',
+                background: 'var(--surface-hover, rgba(0,0,0,0.025))',
+                padding: '7px 8px',
+                cursor: onSelectRelationship ? 'pointer' : 'default',
+                fontFamily: 'inherit',
+              }}
+            >
+              <div style={{ fontSize: 11.5, fontWeight: 600, color: 'var(--text-primary, #1a1a1a)' }}>
+                {counterpart?.name || '\u2014'}
+              </div>
+              <div style={{ marginTop: 2, fontSize: 10.5, color: 'var(--text-muted, #8a8a90)', lineHeight: 1.4 }}>
+                {typeLabel}
+                {relationshipLabel ? ` • ${relationshipLabel}` : ''}
+              </div>
+            </button>
+          );
+        })}
+      </div>
+    </PF>
+  );
+}
+
 // ============================================================
 // View navigator — tree with search, breadcrumbs, element counts
 // ============================================================
@@ -27,6 +218,8 @@ interface ViewNavProps {
   views: ModelView[];
   currentViewId: string;
   onNavigate: (id: string) => void;
+  onAddView?: (parentViewId?: string) => void;
+  onViewContextMenu?: (viewId: string, x: number, y: number) => void;
 }
 
 function buildParentMap(views: ModelView[]): Map<string, string> {
@@ -67,11 +260,12 @@ function viewMatchesSearch(view: ModelView, query: string, viewById: Map<string,
   return false;
 }
 
-function TreeNode({ view, depth, currentViewId, onNavigate, expanded, onToggle, viewById, searchQuery, elementCountById }: {
+function TreeNode({ view, depth, currentViewId, onNavigate, onViewContextMenu, expanded, onToggle, viewById, searchQuery, elementCountById }: {
   view: ModelView;
   depth: number;
   currentViewId: string;
   onNavigate: (id: string) => void;
+  onViewContextMenu?: (viewId: string, x: number, y: number) => void;
   expanded: Set<string>;
   onToggle: (id: string) => void;
   viewById: Map<string, ModelView>;
@@ -105,6 +299,11 @@ function TreeNode({ view, depth, currentViewId, onNavigate, expanded, onToggle, 
   return (
     <>
       <div
+        draggable
+        onDragStart={e => {
+          e.dataTransfer.setData('application/openarchi-view', JSON.stringify({ viewId: view.id, viewName: view.name }));
+          e.dataTransfer.effectAllowed = 'copy';
+        }}
         style={{
           display: 'flex', alignItems: 'center', gap: 1,
           padding: `2px 8px 2px ${8 + depth * 14}px`,
@@ -116,6 +315,11 @@ function TreeNode({ view, depth, currentViewId, onNavigate, expanded, onToggle, 
           minHeight: 26,
         }}
         onClick={() => isFolder ? onToggle(view.id) : onNavigate(view.id)}
+        onContextMenu={event => {
+          if (!onViewContextMenu) return;
+          event.preventDefault();
+          onViewContextMenu(view.id, event.clientX, event.clientY);
+        }}
         onMouseEnter={e => { if (!isCurrent) e.currentTarget.style.background = 'var(--surface-hover, rgba(0,0,0,0.035))'; }}
         onMouseLeave={e => { if (!isCurrent) e.currentTarget.style.background = 'transparent'; }}
       >
@@ -155,7 +359,7 @@ function TreeNode({ view, depth, currentViewId, onNavigate, expanded, onToggle, 
       {isExpanded && children.map(c => (
         <TreeNode
           key={c.id} view={c} depth={depth + 1}
-          currentViewId={currentViewId} onNavigate={onNavigate}
+          currentViewId={currentViewId} onNavigate={onNavigate} onViewContextMenu={onViewContextMenu}
           expanded={expanded} onToggle={onToggle}
           viewById={viewById} searchQuery={searchQuery}
           elementCountById={elementCountById}
@@ -165,7 +369,7 @@ function TreeNode({ view, depth, currentViewId, onNavigate, expanded, onToggle, 
   );
 }
 
-export function ViewNav({ views, currentViewId, onNavigate }: ViewNavProps) {
+export function ViewNav({ views, currentViewId, onNavigate, onAddView, onViewContextMenu }: ViewNavProps) {
   const [searchQuery, setSearchQuery] = useState('');
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const searchRef = useRef<HTMLInputElement>(null);
@@ -242,7 +446,28 @@ export function ViewNav({ views, currentViewId, onNavigate }: ViewNavProps) {
       {/* Header */}
       <div style={{ padding: '10px 12px 6px', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
         <span style={{ fontSize: 10, fontWeight: 500, color: 'var(--text-faint, #b0b0b8)', textTransform: 'uppercase', letterSpacing: '0.5px' }}>Views</span>
-        <span style={{ fontSize: 10, color: 'var(--text-faint, #b0b0b8)', fontWeight: 400, opacity: 0.7 }}>{views.length}</span>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+          <span style={{ fontSize: 10, color: 'var(--text-faint, #b0b0b8)', fontWeight: 400, opacity: 0.7 }}>{views.length}</span>
+          {onAddView && (
+            <button
+              onClick={() => onAddView()}
+              title="New View"
+              style={{
+                width: 18, height: 18, padding: 0, border: 'none', borderRadius: 4,
+                background: 'transparent', cursor: 'pointer', display: 'flex',
+                alignItems: 'center', justifyContent: 'center',
+                color: 'var(--text-faint, #b0b0b8)',
+                transition: 'background 0.12s ease, color 0.12s ease',
+              }}
+              onMouseEnter={e => { e.currentTarget.style.background = 'var(--surface-hover, rgba(0,0,0,0.05))'; e.currentTarget.style.color = 'var(--text-secondary, #555)'; }}
+              onMouseLeave={e => { e.currentTarget.style.background = 'transparent'; e.currentTarget.style.color = 'var(--text-faint, #b0b0b8)'; }}
+            >
+              <svg width="12" height="12" viewBox="0 0 12 12" fill="none">
+                <path d="M6 2v8M2 6h8" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" />
+              </svg>
+            </button>
+          )}
+        </div>
       </div>
 
       {/* Search */}
@@ -322,7 +547,7 @@ export function ViewNav({ views, currentViewId, onNavigate }: ViewNavProps) {
         {rootViews.map(v => (
           <TreeNode
             key={v.id} view={v} depth={0}
-            currentViewId={currentViewId} onNavigate={onNavigate}
+            currentViewId={currentViewId} onNavigate={onNavigate} onViewContextMenu={onViewContextMenu}
             expanded={expanded} onToggle={onToggle}
             viewById={viewById} searchQuery={query}
             elementCountById={elementCountById}
@@ -341,14 +566,56 @@ interface PropertyPanelProps {
   selEl: ModelElement | null;
   selRel: ModelRelationship | null;
   elements: ModelElement[];
+  relationships: ModelRelationship[];
   onUpdateElement: (key: string, value: unknown) => void;
   onUpdateRelationship: (key: string, value: unknown) => void;
+  onSelectRelationship?: (relationshipId: string) => void;
+  onUpdateView?: (viewId: string, key: string, value: unknown) => void;
   side: 'left' | 'right';
   onToggleSide: () => void;
+  currentView?: ModelView | null;
+  onRenameView?: (viewId: string, name: string) => void;
+  elementFolderPath?: string;
+  relationshipFolderPath?: string;
+  viewFolderPath?: string;
+  onMoveElementToFolder?: (folderPath: string) => void;
+  onMoveRelationshipToFolder?: (folderPath: string) => void;
+  onMoveViewToFolder?: (folderPath: string) => void;
 }
 
-export function PropertyPanel({ selEl, selRel, elements, onUpdateElement, onUpdateRelationship, side, onToggleSide }: PropertyPanelProps) {
+export function PropertyPanel({
+  selEl,
+  selRel,
+  elements,
+  relationships,
+  onUpdateElement,
+  onUpdateRelationship,
+  onSelectRelationship,
+  onUpdateView,
+  side,
+  onToggleSide,
+  currentView,
+  onRenameView,
+  elementFolderPath,
+  relationshipFolderPath,
+  viewFolderPath,
+  onMoveElementToFolder,
+  onMoveRelationshipToFolder,
+  onMoveViewToFolder,
+}: PropertyPanelProps) {
   const isRight = side === 'right';
+  const elementsById = useMemo(
+    () => new Map(elements.map(element => [element.id, element])),
+    [elements],
+  );
+  const outgoingRelationships = useMemo(
+    () => selEl ? relationships.filter(relationship => relationship.sourceId === selEl.id) : [],
+    [relationships, selEl],
+  );
+  const incomingRelationships = useMemo(
+    () => selEl ? relationships.filter(relationship => relationship.targetId === selEl.id) : [],
+    [relationships, selEl],
+  );
   return (
     <div style={{
       background: 'transparent',
@@ -401,6 +668,18 @@ export function PropertyPanel({ selEl, selRel, elements, onUpdateElement, onUpda
               <PF label="Docs">
                 <textarea value={selEl.documentation || ''} onChange={e => onUpdateElement('documentation', e.target.value)} rows={3} style={{ ...iS, resize: 'vertical' }} />
               </PF>
+              <PF label="Properties">
+                <PropertyListEditor properties={selEl.properties} onChange={properties => onUpdateElement('properties', properties)} />
+              </PF>
+              {onMoveElementToFolder && elementFolderPath !== undefined && (
+                <PF label="Folder">
+                  <FolderPathEditor
+                    value={elementFolderPath}
+                    onCommit={onMoveElementToFolder}
+                    placeholder="application/domain"
+                  />
+                </PF>
+              )}
             </>
           )}
           <div style={{ display: 'flex', gap: 6 }}>
@@ -411,6 +690,18 @@ export function PropertyPanel({ selEl, selRel, elements, onUpdateElement, onUpda
             <PF label="W" c><input type="number" value={selEl.w} onChange={e => onUpdateElement('w', Math.max(60, +e.target.value))} style={iS} /></PF>
             <PF label="H" c><input type="number" value={selEl.h} onChange={e => onUpdateElement('h', Math.max(40, +e.target.value))} style={iS} /></PF>
           </div>
+          <ElementRelationshipList
+            title="Outgoing"
+            relationships={outgoingRelationships}
+            elementsById={elementsById}
+            onSelectRelationship={onSelectRelationship}
+          />
+          <ElementRelationshipList
+            title="Incoming"
+            relationships={incomingRelationships}
+            elementsById={elementsById}
+            onSelectRelationship={onSelectRelationship}
+          />
         </div>
       ) : selRel ? (
         <div style={{ padding: '4px 12px 10px', display: 'flex', flexDirection: 'column', gap: 10 }}>
@@ -422,8 +713,83 @@ export function PropertyPanel({ selEl, selRel, elements, onUpdateElement, onUpda
           </PF>
           <PF label="Source"><span style={{ fontSize: 12, color: 'var(--text-secondary, #555)', fontWeight: 400 }}>{elements.find(e => e.id === selRel.sourceId)?.name || '\u2014'}</span></PF>
           <PF label="Target"><span style={{ fontSize: 12, color: 'var(--text-secondary, #555)', fontWeight: 400 }}>{elements.find(e => e.id === selRel.targetId)?.name || '\u2014'}</span></PF>
+          <PF label="Docs"><textarea value={selRel.documentation || ''} onChange={e => onUpdateRelationship('documentation', e.target.value)} rows={3} style={{ ...iS, resize: 'vertical' }} /></PF>
+          <PF label="Properties">
+            <PropertyListEditor properties={selRel.properties} onChange={properties => onUpdateRelationship('properties', properties)} />
+          </PF>
+          {onMoveRelationshipToFolder && relationshipFolderPath !== undefined && (
+            <PF label="Folder">
+              <FolderPathEditor
+                value={relationshipFolderPath}
+                onCommit={onMoveRelationshipToFolder}
+                placeholder="relations/integration"
+              />
+            </PF>
+          )}
           <PF label="Waypoints"><span style={{ fontSize: 11, color: 'var(--text-faint, #b0b0b8)', fontWeight: 400 }}>{selRel.waypoints?.length || 0} points</span></PF>
           <PF label="Label position"><input type="range" min="0" max="100" value={Math.round((selRel.labelPos ?? 0.5) * 100)} onChange={e => onUpdateRelationship('labelPos', +e.target.value / 100)} style={{ width: '100%', accentColor: 'var(--accent, #2563eb)' }} /></PF>
+        </div>
+      ) : currentView && onRenameView ? (
+        <div style={{ padding: '4px 12px 10px', display: 'flex', flexDirection: 'column', gap: 10, overflow: 'auto' }}>
+          <PF label="View Name">
+            <input value={currentView.name} onChange={e => onRenameView(currentView.id, e.target.value)} style={iS} />
+          </PF>
+          <PF label="Docs">
+            <textarea
+              value={currentView.documentation || ''}
+              onChange={e => onUpdateView?.(currentView.id, 'documentation', e.target.value)}
+              rows={3}
+              style={{ ...iS, resize: 'vertical' }}
+            />
+          </PF>
+          <PF label="Viewpoint">
+            <select
+              value={currentView.viewpoint || ''}
+              onChange={e => onUpdateView?.(currentView.id, 'viewpoint', e.target.value || undefined)}
+              style={iS}
+            >
+              <option value="">None</option>
+              {VIEWPOINTS.map(viewpoint => (
+                <option key={viewpoint.id} value={viewpoint.id}>{viewpoint.label}</option>
+              ))}
+            </select>
+          </PF>
+          {currentView.viewpoint && getViewpointDefinition(currentView.viewpoint) && (
+            <div style={{ fontSize: 11, color: 'var(--text-faint, #b0b0b8)', lineHeight: 1.5, padding: '0 2px', fontStyle: 'italic', fontWeight: 400 }}>
+              {getViewpointDefinition(currentView.viewpoint)?.description}
+            </div>
+          )}
+          <PF label="Purpose">
+            <textarea
+              value={currentView.purpose || ''}
+              onChange={e => onUpdateView?.(currentView.id, 'purpose', e.target.value)}
+              rows={2}
+              style={{ ...iS, resize: 'vertical' }}
+            />
+          </PF>
+          <PF label="Properties">
+            <PropertyListEditor
+              properties={currentView.properties}
+              onChange={properties => onUpdateView?.(currentView.id, 'properties', properties)}
+            />
+          </PF>
+          {onMoveViewToFolder && viewFolderPath !== undefined && (
+            <PF label="Folder">
+              <FolderPathEditor
+                value={viewFolderPath}
+                onCommit={onMoveViewToFolder}
+                placeholder="views/landscape"
+              />
+            </PF>
+          )}
+          <PF label="Elements">
+            <span style={{ fontSize: 12, color: 'var(--text-secondary, #555)', fontWeight: 400 }}>{currentView.elementIds?.length ?? 0}</span>
+          </PF>
+          {(currentView.childViewIds?.length ?? 0) > 0 && (
+            <PF label="Child Views">
+              <span style={{ fontSize: 12, color: 'var(--text-secondary, #555)', fontWeight: 400 }}>{currentView.childViewIds.length}</span>
+            </PF>
+          )}
         </div>
       ) : (
         <div style={{ padding: '12px', color: 'var(--text-faint, #b0b0b8)', fontSize: 12, lineHeight: 1.8, fontWeight: 400 }}>Select an element or relationship.</div>

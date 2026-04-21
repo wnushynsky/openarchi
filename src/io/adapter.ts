@@ -22,6 +22,22 @@ export interface SerializeResult {
   suggestedFileName: string;
 }
 
+/** Result of serializing a model into multiple files (e.g. coArchi/GRAFICO directory) */
+export interface FragmentedSerializeResult {
+  files: { relativePath: string; content: string }[];
+  diagnostics: ModelDiagnostic[];
+  /** Paths that should be removed (elements deleted from the model) */
+  deletedPaths?: string[];
+  changeSet?: {
+    createdPaths: string[];
+    deletedPaths: string[];
+    createdFolderPaths: string[];
+    deletedFolderPaths: string[];
+  };
+  /** Canonical document used for the fragmented serialization */
+  document?: CanonicalModelDocument;
+}
+
 export interface ModelFormatAdapter {
   id: string;
   label: string;
@@ -53,4 +69,3 @@ export class AdapterRegistry {
     );
   }
 }
-

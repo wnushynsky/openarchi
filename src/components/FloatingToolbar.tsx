@@ -35,8 +35,19 @@ const popoverGlass: React.CSSProperties = {
 // Element picker popover — opens from layer dot
 // ============================================================
 
-function ElementPicker({ layerKey, onAddElement, onClose }: { layerKey: string; onAddElement: (type: string) => void; onClose: () => void }) {
-  const items = Object.entries(ELEMENT_TYPES).filter(([, d]) => d.layer === layerKey && !d.isNote);
+function ElementPicker({
+  layerKey,
+  onAddElement,
+  onClose,
+  allowedElementTypes,
+}: {
+  layerKey: string;
+  onAddElement: (type: string) => void;
+  onClose: () => void;
+  allowedElementTypes?: string[];
+}) {
+  const allowed = allowedElementTypes ? new Set(allowedElementTypes) : null;
+  const items = Object.entries(ELEMENT_TYPES).filter(([type, d]) => d.layer === layerKey && !d.isNote && (!allowed || allowed.has(type)));
   const L = LAYERS[layerKey];
   return (
     <div
@@ -87,8 +98,8 @@ function ElementPicker({ layerKey, onAddElement, onClose }: { layerKey: string; 
 // File menu popover
 // ============================================================
 
-function FileMenu({ onOpenDir, onImport, onExport, onSave, canSave, isDirty, dirState, dirFiles, activeFilePath, onSelectFile, ioFormatId, onFormatChange, modelFormats, onClose }: {
-  onOpenDir: () => void; onImport: () => void; onExport: () => void; onSave: () => void;
+function FileMenu({ onOpenDir, onImport, onExport, onExportSvg, onSave, onSaveAsJson, canSave, isDirty, dirState, dirFiles, activeFilePath, onSelectFile, ioFormatId, onFormatChange, modelFormats, onClose }: {
+  onOpenDir: () => void; onImport: () => void; onExport: () => void; onExportSvg?: () => void; onSave: () => void; onSaveAsJson?: () => void;
   canSave: boolean; isDirty: boolean; dirState: boolean;
   dirFiles: { relativePath: string }[]; activeFilePath: string; onSelectFile: (p: string) => void;
   ioFormatId: string; onFormatChange: (id: string) => void; modelFormats: { id: string; label: string }[]; onClose: () => void;
@@ -119,7 +130,31 @@ function FileMenu({ onOpenDir, onImport, onExport, onSave, canSave, isDirty, dir
       <Row label="Open Directory" onClick={() => { onOpenDir(); onClose(); }} />
       <Row label="Import" onClick={() => { onImport(); onClose(); }} />
       <Row label="Export" onClick={() => { onExport(); onClose(); }} />
-      {canSave && <Row label={isDirty ? 'Save *' : 'Save'} shortcut={'\u2318S'} onClick={() => { onSave(); onClose(); }} />}
+      {onExportSvg && <Row label="Export View as SVG" onClick={() => { onExportSvg(); onClose(); }} />}
+      {canSave && (
+        <button onClick={() => { onSave(); onClose(); }}
+          style={{
+            display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+            width: '100%', padding: '6px 12px', border: 'none', background: 'transparent',
+            cursor: 'pointer', fontFamily: 'inherit', fontSize: 13,
+            color: isDirty ? 'var(--accent-text, #1d4ed8)' : 'var(--text-secondary, #555)',
+            fontWeight: isDirty ? 600 : 400,
+            borderRadius: 4, margin: '0 2px', boxSizing: 'border-box',
+            transition: 'background var(--transition-fast, 0.12s ease)',
+          }}
+          onMouseEnter={e => { e.currentTarget.style.background = 'var(--surface-hover, rgba(0,0,0,0.035))'; }}
+          onMouseLeave={e => { e.currentTarget.style.background = 'transparent'; }}
+        >
+          <span style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+            {isDirty && <span style={{ width: 6, height: 6, borderRadius: '50%', background: 'var(--accent, #2563eb)', flexShrink: 0 }} />}
+            {isDirty ? 'Save (unsaved changes)' : 'Save'}
+          </span>
+          <span style={{ fontSize: 11, color: 'var(--text-faint, #b0b0b8)', fontWeight: 500, fontFamily: 'inherit' }}>{'\u2318S'}</span>
+        </button>
+      )}
+      {onSaveAsJson && dirState && (
+        <Row label="Save as JSON" onClick={() => { onSaveAsJson(); onClose(); }} />
+      )}
       {dirState && dirFiles.length > 1 && (<>
         <div style={{ height: 1, background: 'var(--border, rgba(0,0,0,0.06))', margin: '3px 8px' }} />
         <div style={{ padding: '4px 12px', fontSize: 10, fontWeight: 500, color: 'var(--text-faint, #b0b0b8)', textTransform: 'uppercase', letterSpacing: '0.4px' }}>Files</div>
@@ -171,7 +206,9 @@ export interface FloatingToolbarProps {
   onOpenDir: () => void;
   onImport: () => void;
   onExport: () => void;
+  onExportSvg?: () => void;
   onSave: () => void;
+  onSaveAsJson?: () => void;
   canSave: boolean;
   isDirty: boolean;
   dirState: boolean;
@@ -186,18 +223,25 @@ export interface FloatingToolbarProps {
   onSearch: () => void;
   interactionMode: 'view' | 'edit';
   onToggleMode: () => void;
+  allowedLayers?: string[];
+  allowedElementTypes?: string[];
+  viewpointLabel?: string;
 }
 
 export function FloatingToolbar(props: FloatingToolbarProps) {
   const {
     activeLayer, onLayerChange, onAddElement, onDeleteSelected, hasSelection,
-    onOpenDir, onImport, onExport, onSave, canSave, isDirty, dirState, dirFiles, activeFilePath, onSelectFile,
+    onOpenDir, onImport, onExport, onExportSvg, onSave, onSaveAsJson, canSave, isDirty, dirState, dirFiles, activeFilePath, onSelectFile,
     ioFormatId, onFormatChange, modelFormats,
     gridType, onToggleGrid, onSearch,
     interactionMode, onToggleMode,
+    allowedLayers,
+    allowedElementTypes,
+    viewpointLabel,
   } = props;
 
   const isViewMode = interactionMode === 'view';
+  const allowedLayerSet = allowedLayers ? new Set(allowedLayers) : null;
 
   const [pickerLayer, setPickerLayer] = useState<string | null>(null);
   const [showMenu, setShowMenu] = useState(false);
@@ -241,8 +285,15 @@ export function FloatingToolbar(props: FloatingToolbarProps) {
 
   return (
     <div ref={ref} style={{ position: 'absolute', bottom: 14, left: '50%', transform: 'translateX(-50%)', zIndex: 100, fontFamily: FONT }}>
-      {pickerLayer && <ElementPicker layerKey={pickerLayer} onAddElement={(type) => { onLayerChange(pickerLayer); onAddElement(type); }} onClose={() => setPickerLayer(null)} />}
-      {showMenu && <FileMenu onOpenDir={onOpenDir} onImport={onImport} onExport={onExport} onSave={onSave} canSave={canSave} isDirty={isDirty} dirState={dirState} dirFiles={dirFiles} activeFilePath={activeFilePath} onSelectFile={onSelectFile} ioFormatId={ioFormatId} onFormatChange={onFormatChange} modelFormats={modelFormats} onClose={() => setShowMenu(false)} />}
+      {pickerLayer && (
+        <ElementPicker
+          layerKey={pickerLayer}
+          allowedElementTypes={allowedElementTypes}
+          onAddElement={(type) => { onLayerChange(pickerLayer); onAddElement(type); }}
+          onClose={() => setPickerLayer(null)}
+        />
+      )}
+      {showMenu && <FileMenu onOpenDir={onOpenDir} onImport={onImport} onExport={onExport} onExportSvg={onExportSvg} onSave={onSave} onSaveAsJson={onSaveAsJson} canSave={canSave} isDirty={isDirty} dirState={dirState} dirFiles={dirFiles} activeFilePath={activeFilePath} onSelectFile={onSelectFile} ioFormatId={ioFormatId} onFormatChange={onFormatChange} modelFormats={modelFormats} onClose={() => setShowMenu(false)} />}
 
       <div style={{
         display: 'flex', alignItems: 'center', gap: 4,
@@ -274,23 +325,28 @@ export function FloatingToolbar(props: FloatingToolbarProps) {
           const fill = L.fill === 'transparent' ? '#dddde0' : L.fill;
           const isOpen = pickerLayer === k;
           const isActiveLayer = activeLayer === k;
+          const isAllowedLayer = !allowedLayerSet || allowedLayerSet.has(k);
           return (
             <button key={k}
-              onClick={() => { if (!isViewMode) { setPickerLayer(prev => prev === k ? null : k); setShowMenu(false); } }}
-              title={L.label}
+              onClick={() => { if (!isViewMode && isAllowedLayer) { setPickerLayer(prev => prev === k ? null : k); setShowMenu(false); } }}
+              title={isAllowedLayer ? L.label : `${L.label} not allowed in this viewpoint`}
               style={{
                 width: 24, height: 24, borderRadius: '50%', padding: 0, flexShrink: 0,
                 background: `radial-gradient(circle at 40% 35%, ${fill}, ${L.stroke}40)`,
                 border: isOpen || isActiveLayer ? `2px solid ${L.stroke}` : `1.5px solid ${L.stroke}60`,
-                cursor: isViewMode ? 'default' : 'pointer',
-                opacity: isViewMode ? 0.35 : 1,
+                cursor: isViewMode || !isAllowedLayer ? 'default' : 'pointer',
+                opacity: isViewMode ? 0.35 : isAllowedLayer ? 1 : 0.2,
                 transition: 'transform var(--transition-fast, 0.12s ease), border-color var(--transition-fast, 0.12s ease), box-shadow var(--transition-fast, 0.12s ease)',
                 boxSizing: 'border-box',
                 boxShadow: isOpen || isActiveLayer
                   ? `0 0 0 3px ${L.accent}20, inset 0 1px 2px rgba(255,255,255,0.4)`
                   : 'inset 0 1px 2px rgba(255,255,255,0.3)',
               }}
-              onMouseEnter={e => { e.currentTarget.style.transform = 'scale(1.15)'; e.currentTarget.style.borderColor = L.stroke; }}
+              onMouseEnter={e => {
+                if (!isAllowedLayer) return;
+                e.currentTarget.style.transform = 'scale(1.15)';
+                e.currentTarget.style.borderColor = L.stroke;
+              }}
               onMouseLeave={e => {
                 e.currentTarget.style.transform = 'scale(1)';
                 if (!isOpen && !isActiveLayer) e.currentTarget.style.borderColor = `${L.stroke}60`;
@@ -300,6 +356,20 @@ export function FloatingToolbar(props: FloatingToolbarProps) {
         })}
 
         {div}
+
+        {viewpointLabel && (
+          <>
+            <div style={{
+              padding: '0 8px',
+              fontSize: 11,
+              color: 'var(--text-muted, #8a8a90)',
+              whiteSpace: 'nowrap',
+            }}>
+              {viewpointLabel}
+            </div>
+            {div}
+          </>
+        )}
 
         {/* Note */}
         <button onClick={() => { if (!isViewMode) { onAddElement('note'); close(); } }} title="Note" disabled={isViewMode} style={tb(false, isViewMode)}

@@ -157,6 +157,59 @@ function FolderPathEditor({
   );
 }
 
+function ElementRelationshipList({
+  title,
+  relationships,
+  elementsById,
+  onSelectRelationship,
+}: {
+  title: string;
+  relationships: ModelRelationship[];
+  elementsById: Map<string, ModelElement>;
+  onSelectRelationship?: (relationshipId: string) => void;
+}) {
+  return (
+    <PF label={title}>
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+        {relationships.length === 0 ? (
+          <div style={{ fontSize: 11, color: 'var(--text-faint, #b0b0b8)', lineHeight: 1.5 }}>
+            None.
+          </div>
+        ) : relationships.map(relationship => {
+          const counterpartId = title === 'Outgoing' ? relationship.targetId : relationship.sourceId;
+          const counterpart = elementsById.get(counterpartId);
+          const typeLabel = RELATIONSHIP_TYPES[relationship.type]?.label || relationship.type;
+          const relationshipLabel = relationship.name?.trim();
+          return (
+            <button
+              key={relationship.id}
+              onClick={() => onSelectRelationship?.(relationship.id)}
+              style={{
+                textAlign: 'left',
+                width: '100%',
+                borderRadius: 8,
+                border: '1px solid var(--border, rgba(0,0,0,0.06))',
+                background: 'var(--surface-hover, rgba(0,0,0,0.025))',
+                padding: '7px 8px',
+                cursor: onSelectRelationship ? 'pointer' : 'default',
+                fontFamily: 'inherit',
+              }}
+            >
+              <div style={{ fontSize: 11.5, fontWeight: 600, color: 'var(--text-primary, #1a1a1a)' }}>
+                {counterpart?.name || '\u2014'}
+              </div>
+              <div style={{ marginTop: 2, fontSize: 10.5, color: 'var(--text-muted, #8a8a90)', lineHeight: 1.4 }}>
+                {typeLabel}
+                {relationshipLabel ? ` • ${relationshipLabel}` : ''}
+              </div>
+            </button>
+          );
+        })}
+      </div>
+    </PF>
+  );
+}
+
 // ============================================================
 // View navigator — tree with search, breadcrumbs, element counts
 // ============================================================
@@ -513,8 +566,10 @@ interface PropertyPanelProps {
   selEl: ModelElement | null;
   selRel: ModelRelationship | null;
   elements: ModelElement[];
+  relationships: ModelRelationship[];
   onUpdateElement: (key: string, value: unknown) => void;
   onUpdateRelationship: (key: string, value: unknown) => void;
+  onSelectRelationship?: (relationshipId: string) => void;
   onUpdateView?: (viewId: string, key: string, value: unknown) => void;
   side: 'left' | 'right';
   onToggleSide: () => void;
@@ -532,8 +587,10 @@ export function PropertyPanel({
   selEl,
   selRel,
   elements,
+  relationships,
   onUpdateElement,
   onUpdateRelationship,
+  onSelectRelationship,
   onUpdateView,
   side,
   onToggleSide,
@@ -547,6 +604,18 @@ export function PropertyPanel({
   onMoveViewToFolder,
 }: PropertyPanelProps) {
   const isRight = side === 'right';
+  const elementsById = useMemo(
+    () => new Map(elements.map(element => [element.id, element])),
+    [elements],
+  );
+  const outgoingRelationships = useMemo(
+    () => selEl ? relationships.filter(relationship => relationship.sourceId === selEl.id) : [],
+    [relationships, selEl],
+  );
+  const incomingRelationships = useMemo(
+    () => selEl ? relationships.filter(relationship => relationship.targetId === selEl.id) : [],
+    [relationships, selEl],
+  );
   return (
     <div style={{
       background: 'transparent',
@@ -621,6 +690,18 @@ export function PropertyPanel({
             <PF label="W" c><input type="number" value={selEl.w} onChange={e => onUpdateElement('w', Math.max(60, +e.target.value))} style={iS} /></PF>
             <PF label="H" c><input type="number" value={selEl.h} onChange={e => onUpdateElement('h', Math.max(40, +e.target.value))} style={iS} /></PF>
           </div>
+          <ElementRelationshipList
+            title="Outgoing"
+            relationships={outgoingRelationships}
+            elementsById={elementsById}
+            onSelectRelationship={onSelectRelationship}
+          />
+          <ElementRelationshipList
+            title="Incoming"
+            relationships={incomingRelationships}
+            elementsById={elementsById}
+            onSelectRelationship={onSelectRelationship}
+          />
         </div>
       ) : selRel ? (
         <div style={{ padding: '4px 12px 10px', display: 'flex', flexDirection: 'column', gap: 10 }}>

@@ -62,8 +62,8 @@ export function getBaseName(path: string): string {
 
 export function getCoArchiRootDir(document?: Pick<CanonicalModelDocument, 'metadata'> | null): string {
   const rootFilePath = document?.metadata?.coArchi?.rootFilePath;
-  const rootDir = rootFilePath ? getDirName(rootFilePath) : '';
-  return rootDir || 'model';
+  if (!rootFilePath) return 'model';
+  return getDirName(rootFilePath);
 }
 
 export function getDefaultElementFolder(type: string): string {
@@ -76,7 +76,7 @@ export function getDefaultRelationshipFolder(): string {
 }
 
 export function getDefaultViewFolder(): string {
-  return 'views';
+  return 'diagrams';
 }
 
 export function getDefaultElementFileName(type: string, id: string): string {
@@ -88,7 +88,7 @@ export function getDefaultRelationshipFileName(type: string, id: string): string
 }
 
 export function getDefaultViewFileName(id: string): string {
-  return `${id}.xml`;
+  return `ArchimateDiagramModel_${id}.xml`;
 }
 
 function joinPath(...parts: string[]): string {
@@ -101,6 +101,14 @@ function joinPath(...parts: string[]): string {
 function buildSourcePath(rootDir: string, relativeFolderPath: string, fileName: string): string {
   const folderPath = normalizeRelativeFolderPath(relativeFolderPath);
   return joinPath(rootDir, folderPath, fileName);
+}
+
+function buildFolderXmlPath(rootDir: string, relativeFolderPath: string): string {
+  return joinPath(rootDir, relativeFolderPath, 'folder.xml');
+}
+
+function buildRootFolderXmlPath(rootDir: string): string {
+  return joinPath(rootDir, 'folder.xml');
 }
 
 export function getRelativeFolderPathFromSourcePath(
@@ -188,7 +196,9 @@ export function relativeFolderPathToFolderXmlPath(
 ): string {
   const rootDir = getCoArchiRootDir(document);
   const normalized = normalizeRelativeFolderPath(folderPath);
-  return normalized ? `${rootDir}/${normalized}/folder.xml` : `${rootDir}/folder.xml`;
+  return normalized
+    ? buildFolderXmlPath(rootDir, normalized)
+    : buildRootFolderXmlPath(rootDir);
 }
 
 export function isSameOrDescendantFolder(folderPath: string, ancestorFolderPath: string): boolean {
@@ -245,7 +255,7 @@ export function upsertCoArchiFolderEntry(
       ...(document.metadata || {}),
       coArchi: {
         ...(document.metadata?.coArchi || {}),
-        rootFilePath: document.metadata?.coArchi?.rootFilePath || `${getCoArchiRootDir(document)}/folder.xml`,
+        rootFilePath: document.metadata?.coArchi?.rootFilePath || buildRootFolderXmlPath(getCoArchiRootDir(document)),
         folders,
       },
     },
@@ -340,7 +350,7 @@ export function ensureCanonicalSourcePaths(document: CanonicalModelDocument): Ca
   ]);
 
   const folders: CoArchiFolderEntry[] = [...allFolderPaths].sort((left, right) => left.localeCompare(right)).map(path => {
-    const folderXmlPath = `${path}/folder.xml`;
+    const folderXmlPath = joinPath(path, 'folder.xml');
     const existing = existingFolders.get(folderXmlPath);
     if (existing) return existing;
     const relativeFolderPath = getRelativeFolderPathFromSourcePath(`${path}/placeholder.xml`, document);
@@ -356,7 +366,7 @@ export function ensureCanonicalSourcePaths(document: CanonicalModelDocument): Ca
       ...(document.metadata || {}),
       coArchi: {
         ...(document.metadata?.coArchi || {}),
-        rootFilePath: document.metadata?.coArchi?.rootFilePath || `${rootDir}/folder.xml`,
+        rootFilePath: document.metadata?.coArchi?.rootFilePath || buildRootFolderXmlPath(rootDir),
         folders,
       },
     },

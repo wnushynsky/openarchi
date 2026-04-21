@@ -3,4 +3,5 @@ export type { UseWorkspaceReturn } from './useWorkspace';
 export { WorkspaceManager } from './manager';
 export type { WorkspaceState, WorkspaceMetadata, WorkspaceKind } from './types';
 export { INITIAL_WORKSPACE_STATE } from './types';
-export { detectGitBranch } from './git';
+export { detectGitBranch, readGitHistory } from './git';
+export type { GitHistoryEntry } from './git';

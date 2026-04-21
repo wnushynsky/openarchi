@@ -26,6 +26,7 @@ import {
   isFragmentedModelDirectory,
   listModelFormats,
 } from './model/service';
+import { serializeCoArchiFragmented } from './io/adapters/coarchi-xml';
 import { buildOrganizationTree } from './model/organization';
 import {
   getAllowedElementTypesForViewpoint,
@@ -58,7 +59,9 @@ import {
 import {
   type OpenFileEntry,
 } from './io/filesystem';
+import { isTauriRuntime } from './platform/tauri';
 import { useWorkspace } from './workspace';
+import type { GitHistoryEntry } from './workspace';
 import type { ModelDiagnostic } from './model/diagnostics';
 
 const getLayer = (type: string) => ELEMENT_TYPES[type]?.layer;
@@ -84,6 +87,38 @@ interface RelationshipViewLayout {
 
 type ElementLayoutsByView = Record<string, Record<string, ElementViewLayout>>;
 type RelationshipLayoutsByView = Record<string, Record<string, RelationshipViewLayout>>;
+
+interface DuplicateTraceEntry {
+  id: string;
+  occurrences: Array<{
+    name?: string;
+    type?: string;
+    sourcePath?: string;
+  }>;
+  placements: Array<{
+    viewId: string;
+    nodeId: string;
+  }>;
+}
+
+interface AffectedViewInfo {
+  viewId: string;
+  viewName: string;
+  reasons: string[];
+}
+
+interface CommitCompareState {
+  commit: GitHistoryEntry;
+  viewId: string;
+  viewName: string;
+  currentSvg: string;
+  previousSvg: string;
+  currentElementCount: number;
+  currentRelationshipCount: number;
+  previousElementCount: number;
+  previousRelationshipCount: number;
+  snapshotMissing: boolean;
+}
 
 interface DiagramNodeState {
   id: string;
@@ -120,6 +155,265 @@ type DiagramRelationshipInstance = ModelRelationship & {
   sourceNodeId: string;
   targetNodeId: string;
 };
+
+function collectDuplicateTrace(
+  document: CanonicalModelDocument | null | undefined,
+): DuplicateTraceEntry[] {
+  if (!document) return [];
+
+  const elementBuckets = new Map<string, CanonicalModelDocument['elements']>();
+  for (const element of document.elements) {
+    const bucket = elementBuckets.get(element.id) || [];
+    bucket.push(element);
+    elementBuckets.set(element.id, bucket);
+  }
+
+  return [...elementBuckets.entries()]
+    .filter(([, entries]) => entries.length > 1)
+    .map(([id, entries]) => ({
+      id,
+      occurrences: entries.map(entry => ({
+        name: entry.name,
+        type: entry.type,
+        sourcePath: entry.sourcePath,
+      })),
+      placements: document.viewNodes
+        .filter(node => node.elementId === id)
+        .map(node => ({
+          viewId: node.viewId,
+          nodeId: node.id,
+        })),
+    }))
+    .sort((left, right) => left.id.localeCompare(right.id));
+}
+
+function formatDuplicateTrace(trace: DuplicateTraceEntry[]): string {
+  if (trace.length === 0) return 'No duplicate element traces found.';
+
+  return trace.map(entry => {
+    const occurrences = entry.occurrences
+      .map((occurrence, index) =>
+        `  [${index + 1}] ${occurrence.type || 'unknown'} | ${occurrence.name || '(unnamed)'} | ${occurrence.sourcePath || '(no sourcePath)'}`)
+      .join('\n');
+    const placements = entry.placements.length > 0
+      ? entry.placements.map(placement => `  -> view=${placement.viewId}, node=${placement.nodeId}`).join('\n')
+      : '  -> no view placements';
+    return `Duplicate element '${entry.id}'\n${occurrences}\n${placements}`;
+  }).join('\n\n');
+}
+
+function buildViewElementsForRender(
+  viewId: string,
+  views: ModelView[],
+  elements: ModelElement[],
+  diagramNodesByView: DiagramNodesByView,
+): DiagramElementInstance[] {
+  const view = views.find(candidate => candidate.id === viewId) || null;
+  const visibleElementIds = view
+    ? new Set(view.elementIds || [])
+    : new Set(elements.map(element => element.id));
+  const visibleElements = elements.filter(element => visibleElementIds.has(element.id));
+  const nodes = diagramNodesByView[viewId] || [];
+
+  if (nodes.length === 0) {
+    return visibleElements.map(element => ({ ...element, elementId: element.id }));
+  }
+
+  const elementById = new Map(elements.map(element => [element.id, element]));
+  const diagramElements: DiagramElementInstance[] = [];
+  for (const node of nodes) {
+    const element = elementById.get(node.elementId);
+    if (!element) continue;
+    diagramElements.push({
+      ...element,
+      id: node.id,
+      elementId: node.elementId,
+      x: node.x,
+      y: node.y,
+      w: node.w,
+      h: node.h,
+      linkedViewId: node.linkedViewId ?? element.linkedViewId,
+      zIndex: node.zIndex ?? node.nestingDepth ?? element.zIndex,
+      style: node.style ?? element.style,
+    });
+  }
+  return diagramElements;
+}
+
+function buildViewRelationshipsForRender(
+  viewId: string,
+  views: ModelView[],
+  elements: ModelElement[],
+  relationships: ModelRelationship[],
+  diagramNodesByView: DiagramNodesByView,
+  diagramConnectionsByView: DiagramConnectionsByView,
+): DiagramRelationshipInstance[] {
+  const view = views.find(candidate => candidate.id === viewId) || null;
+  const visibleElementIds = view
+    ? new Set(view.elementIds || [])
+    : new Set(elements.map(element => element.id));
+  const visibleElements = buildViewElementsForRender(viewId, views, elements, diagramNodesByView);
+  const visibleElementMap = new Map(visibleElements.map(element => [element.id, element]));
+  const visibleNodeIdsByElementId = new Map<string, string[]>();
+  for (const element of visibleElements) {
+    const ids = visibleNodeIdsByElementId.get(element.elementId) || [];
+    ids.push(element.id);
+    visibleNodeIdsByElementId.set(element.elementId, ids);
+  }
+
+  const semanticRelationshipsById = new Map(relationships.map(relationship => [relationship.id, relationship]));
+  const elementById = new Map(elements.map(element => [element.id, element]));
+  const visibleSemanticRelationships = relationships.filter(relationship => {
+    if (!visibleElementIds.has(relationship.sourceId) || !visibleElementIds.has(relationship.targetId)) return false;
+    const source = elementById.get(relationship.sourceId);
+    const target = elementById.get(relationship.targetId);
+    if (source && target) {
+      const sourceContainsTarget = target.x >= source.x && target.y >= source.y &&
+        target.x + target.w <= source.x + source.w && target.y + target.h <= source.y + source.h;
+      const targetContainsSource = source.x >= target.x && source.y >= target.y &&
+        source.x + source.w <= target.x + target.w && source.y + source.h <= target.y + target.h;
+      if (sourceContainsTarget || targetContainsSource) return false;
+    }
+    return true;
+  });
+
+  const connections = diagramConnectionsByView[viewId] || [];
+  const nextRelationships: DiagramRelationshipInstance[] = [];
+
+  for (const connection of connections) {
+    const semanticRelationship = semanticRelationshipsById.get(connection.relationshipId);
+    if (!semanticRelationship) continue;
+    const sourceNodeId = connection.sourceNodeId || visibleNodeIdsByElementId.get(semanticRelationship.sourceId)?.[0];
+    const targetNodeId = connection.targetNodeId || visibleNodeIdsByElementId.get(semanticRelationship.targetId)?.[0];
+    if (!sourceNodeId || !targetNodeId) continue;
+
+    const sourceElement = visibleElementMap.get(sourceNodeId);
+    const targetElement = visibleElementMap.get(targetNodeId);
+    if (!sourceElement || !targetElement) continue;
+
+    const sourceContainsTarget = targetElement.x >= sourceElement.x && targetElement.y >= sourceElement.y &&
+      targetElement.x + targetElement.w <= sourceElement.x + sourceElement.w &&
+      targetElement.y + targetElement.h <= sourceElement.y + sourceElement.h;
+    const targetContainsSource = sourceElement.x >= targetElement.x && sourceElement.y >= targetElement.y &&
+      sourceElement.x + sourceElement.w <= targetElement.x + targetElement.w &&
+      sourceElement.y + sourceElement.h <= targetElement.y + targetElement.h;
+    if (sourceContainsTarget || targetContainsSource) continue;
+
+    nextRelationships.push({
+      ...semanticRelationship,
+      id: connection.id,
+      relationshipId: semanticRelationship.id,
+      sourceId: sourceNodeId,
+      targetId: targetNodeId,
+      sourceNodeId,
+      targetNodeId,
+      waypoints: connection.waypoints || [],
+      labelPos: connection.labelPos ?? 0.5,
+      relativeBendpoints: connection.relativeBendpoints,
+    });
+  }
+
+  if (nextRelationships.length > 0 || connections.length > 0) return nextRelationships;
+
+  return visibleSemanticRelationships.flatMap(relationship => {
+    const sourceNodeId = visibleNodeIdsByElementId.get(relationship.sourceId)?.[0];
+    const targetNodeId = visibleNodeIdsByElementId.get(relationship.targetId)?.[0];
+    if (!sourceNodeId || !targetNodeId) return [];
+    return [{
+      ...relationship,
+      id: `${viewId}::${relationship.id}`,
+      relationshipId: relationship.id,
+      sourceId: sourceNodeId,
+      targetId: targetNodeId,
+      sourceNodeId,
+      targetNodeId,
+    }];
+  });
+}
+
+function buildViewSvgSnapshot(
+  viewId: string,
+  views: ModelView[],
+  elements: ModelElement[],
+  relationships: ModelRelationship[],
+  diagramNodesByView: DiagramNodesByView,
+  diagramConnectionsByView: DiagramConnectionsByView,
+): {
+  svg: string;
+  elementCount: number;
+  relationshipCount: number;
+} {
+  const viewElements = buildViewElementsForRender(viewId, views, elements, diagramNodesByView);
+  const viewRelationships = buildViewRelationshipsForRender(
+    viewId,
+    views,
+    elements,
+    relationships,
+    diagramNodesByView,
+    diagramConnectionsByView,
+  );
+
+  return {
+    svg: exportViewToSvg(
+      viewElements as ModelElement[],
+      viewRelationships as ModelRelationship[],
+    ),
+    elementCount: viewElements.length,
+    relationshipCount: viewRelationships.length,
+  };
+}
+
+function nodeContainsNode(parent: DiagramNodeState, child: DiagramNodeState): boolean {
+  return child.x >= parent.x
+    && child.y >= parent.y
+    && child.x + child.w <= parent.x + parent.w
+    && child.y + child.h <= parent.y + parent.h;
+}
+
+function normalizeDiagramNodeHierarchy(nodes: DiagramNodeState[]): DiagramNodeState[] {
+  const normalizedNodes = nodes.map(node => ({ ...node }));
+  const nodeById = new Map(normalizedNodes.map(node => [node.id, node]));
+  const resolvedDepths = new Map<string, number>();
+
+  const resolveDepth = (nodeId: string, stack: Set<string> = new Set()): number => {
+    const cached = resolvedDepths.get(nodeId);
+    if (cached !== undefined) return cached;
+
+    const node = nodeById.get(nodeId);
+    if (!node) return 0;
+
+    const parentId = node.parentNodeId;
+    if (!parentId || parentId === node.id || stack.has(node.id)) {
+      node.parentNodeId = undefined;
+      node.nestingDepth = 0;
+      resolvedDepths.set(node.id, 0);
+      return 0;
+    }
+
+    const parentNode = nodeById.get(parentId);
+    if (!parentNode || !nodeContainsNode(parentNode, node)) {
+      node.parentNodeId = undefined;
+      node.nestingDepth = 0;
+      resolvedDepths.set(node.id, 0);
+      return 0;
+    }
+
+    const nextStack = new Set(stack);
+    nextStack.add(node.id);
+    const parentDepth = resolveDepth(parentNode.id, nextStack);
+    const depth = parentDepth + 1;
+    node.nestingDepth = depth;
+    resolvedDepths.set(node.id, depth);
+    return depth;
+  };
+
+  for (const node of normalizedNodes) {
+    resolveDepth(node.id);
+    node.zIndex = node.nestingDepth ?? node.zIndex ?? 0;
+  }
+
+  return normalizedNodes;
+}
 
 function buildLayoutsFromEditorModel(
   elements: ModelElement[],
@@ -411,7 +705,23 @@ export default function App() {
   const [snapGuides, setSnapGuides] = useState<SnapGuide[]>([]);
   const [diagramStateVersion, setDiagramStateVersion] = useState(0);
   const [organizationBaseDocument, setOrganizationBaseDocument] = useState<CanonicalModelDocument | null>(null);
+  const [saveNotice, setSaveNotice] = useState<{
+    kind: 'saving' | 'success' | 'error';
+    message: string;
+  } | null>(null);
+  const [gitHistory, setGitHistory] = useState<GitHistoryEntry[]>([]);
+  const [gitHistoryLoading, setGitHistoryLoading] = useState(false);
+  const [gitHistoryError, setGitHistoryError] = useState<string | null>(null);
+  const [selectedHistoryCommit, setSelectedHistoryCommit] = useState<GitHistoryEntry | null>(null);
+  const [commitChangedFiles, setCommitChangedFiles] = useState<string[]>([]);
+  const [commitAffectedViews, setCommitAffectedViews] = useState<AffectedViewInfo[]>([]);
+  const [commitDetailsLoading, setCommitDetailsLoading] = useState(false);
+  const [commitDetailsError, setCommitDetailsError] = useState<string | null>(null);
+  const [commitCompareState, setCommitCompareState] = useState<CommitCompareState | null>(null);
+  const [commitCompareLoading, setCommitCompareLoading] = useState(false);
+  const [commitCompareError, setCommitCompareError] = useState<string | null>(null);
   const saveViewLayoutSnapshotRef = useRef<(viewId: string) => void>(() => {});
+  const autoLoadedWorkspaceRef = useRef<string | null>(null);
 
   useEffect(() => {
     try {
@@ -436,10 +746,13 @@ export default function App() {
   // Workspace (directory, file, dirty, git branch – persisted to IndexedDB)
   const {
     workspace, openDirectory: wsOpenDirectory, setActiveFile: wsSetActiveFile,
-    markDirty, markClean, saveFile: wsSaveFile, saveFragmented: wsSaveFragmented, saveSingleFragment: wsSaveSingleFragment,
+    markDirty, markClean, saveFile: wsSaveFile, saveFragmented: wsSaveFragmented, saveSingleFragment: wsSaveSingleFragment, seedContentHashes: wsSeedContentHashes,
     getFile: wsGetFile, getActiveFile,
     closeWorkspace,
     restorePending, restoreDirectoryName, requestPermissionAndRestore,
+    getGitHistory: wsGetGitHistory,
+    getGitChangedFiles: wsGetGitChangedFiles,
+    getGitModelSnapshot: wsGetGitModelSnapshot,
   } = useWorkspace();
   const {
     isDirty,
@@ -456,6 +769,19 @@ export default function App() {
     setTimeout(() => {
       setImportDiag(current => (current === message ? null : current));
     }, timeoutMs);
+  }, []);
+
+  const showSaveNotice = useCallback((
+    kind: 'saving' | 'success' | 'error',
+    message: string,
+    timeoutMs: number = kind === 'error' ? 12000 : 4000,
+  ) => {
+    setSaveNotice({ kind, message });
+    if (timeoutMs > 0) {
+      setTimeout(() => {
+        setSaveNotice(current => (current?.message === message ? null : current));
+      }, timeoutMs);
+    }
   }, []);
 
   const summarizeDiagnostics = useCallback((scope: string, diagnostics: ModelDiagnostic[]) => {
@@ -779,12 +1105,14 @@ export default function App() {
       });
     }
 
+    const normalizedNodes = normalizeDiagramNodeHierarchy(nextNodes);
+
     const existingConnections = diagramConnectionsByViewRef.current[viewId] || [];
     const nextConnections: DiagramConnectionState[] = [];
     const representedRelationshipIds = new Set<string>();
     const nodeIdsByElementId = new Map<string, string[]>();
 
-    for (const node of nextNodes) {
+    for (const node of normalizedNodes) {
       const nodeIds = nodeIdsByElementId.get(node.elementId) || [];
       nodeIds.push(node.id);
       nodeIdsByElementId.set(node.elementId, nodeIds);
@@ -847,7 +1175,7 @@ export default function App() {
 
     elementLayoutsByViewRef.current = {
       ...elementLayoutsByViewRef.current,
-      [viewId]: Object.fromEntries(nextNodes.map(node => [node.elementId, {
+      [viewId]: Object.fromEntries(normalizedNodes.map(node => [node.elementId, {
         x: node.x,
         y: node.y,
         w: node.w,
@@ -867,7 +1195,7 @@ export default function App() {
     };
     diagramNodesByViewRef.current = {
       ...diagramNodesByViewRef.current,
-      [viewId]: nextNodes,
+      [viewId]: normalizedNodes,
     };
     diagramConnectionsByViewRef.current = {
       ...diagramConnectionsByViewRef.current,
@@ -899,9 +1227,13 @@ export default function App() {
     const base = fragmentedSourceDocumentRef.current;
     if (!base) return null;
 
+    const normalizedNodesByView = Object.fromEntries(
+      Object.entries(diagramNodesByViewRef.current).map(([viewId, nodes]) => [viewId, normalizeDiagramNodeHierarchy(nodes)]),
+    );
+
     return {
       ...base,
-      viewNodes: Object.values(diagramNodesByViewRef.current).flat().map(node => ({
+      viewNodes: Object.values(normalizedNodesByView).flat().map(node => ({
         id: node.id,
         viewId: node.viewId,
         elementId: node.elementId,
@@ -970,7 +1302,7 @@ export default function App() {
   }), [organizationBaseDocument, elements, relationships, views]);
 
   useEffect(() => {
-    if (!organizationTree && leftNavMode !== 'views') setLeftNavMode('views');
+    if (!organizationTree && leftNavMode === 'model') setLeftNavMode('views');
   }, [organizationTree, leftNavMode]);
 
   const currentNodeElementIdById = useMemo(() => {
@@ -1065,28 +1397,27 @@ export default function App() {
 
   // ==================== CAMERA ====================
   const [cam, setCam] = useState<Camera>({ x: 0, y: 0, s: 1 });
+  const camRef = useRef<Camera>(cam);
   const [cSize, setCSize] = useState({ w: 800, h: 600 });
 
-  // rAF-throttled camera updates — avoids re-rendering more than once per frame
-  const camPendingRef = useRef<Camera | null>(null);
+  // Keep camRef in sync when React state updates (e.g. fitToContent, view switch)
+  useEffect(() => { camRef.current = cam; }, [cam]);
+
+  // rAF-throttled camera updates — bypasses React during pan/zoom for performance.
+  // Updates camRef immediately (for drawing) and batches a single setCam per frame
+  // (so React state stays in sync for non-draw consumers).
   const camRafRef = useRef(0);
   const setCamThrottled = useCallback((next: Camera | ((prev: Camera) => Camera)) => {
-    if (typeof next === 'function') {
-      const current = camPendingRef.current ?? cam;
-      camPendingRef.current = next(current);
-    } else {
-      camPendingRef.current = next;
-    }
+    const resolved = typeof next === 'function' ? next(camRef.current) : next;
+    camRef.current = resolved;
     if (!camRafRef.current) {
       camRafRef.current = requestAnimationFrame(() => {
         camRafRef.current = 0;
-        if (camPendingRef.current) {
-          setCam(camPendingRef.current);
-          camPendingRef.current = null;
-        }
+        setCam(camRef.current);
+        drawCanvasRef.current();
       });
     }
-  }, [cam]);
+  }, []);
 
   // Fit camera to show all elements with padding
   const fitToContent = useCallback((els?: ModelElement[]) => {
@@ -1287,11 +1618,15 @@ export default function App() {
   }, []);
 
   const s2w = useCallback((sx: number, sy: number) => ({
-    x: (sx - cam.x) / cam.s,
-    y: (sy - cam.y) / cam.s,
-  }), [cam]);
+    x: (sx - camRef.current.x) / camRef.current.s,
+    y: (sy - camRef.current.y) / camRef.current.s,
+  }), []);
 
-  // Pre-compute parent IDs — prefer structural data from import, fall back to spatial detection
+  // Pre-compute parent IDs — prefer structural data from import, fall back to spatial detection.
+  // The spatial fallback is O(n^2) so we cache it and only recompute when elements are
+  // added/removed/resized (not when they move during drag).
+  const spatialParentCacheRef = useRef<{ key: string; ids: Set<string> }>({ key: '', ids: new Set() });
+
   const parentIds = useMemo(() => {
     const ids = new Set<string>();
 
@@ -1300,8 +1635,16 @@ export default function App() {
       if (node.parentNodeId) ids.add(node.parentNodeId);
     }
 
-    // If no structural data available, fall back to spatial containment detection
-    if (ids.size === 0 && visibleDiagramElements.length > 0) {
+    // If structural data exists, use it directly (fast path)
+    if (ids.size > 0) return ids;
+
+    // Spatial fallback — cache key is element IDs + sizes (position changes don't affect containment during drag)
+    if (visibleDiagramElements.length > 0) {
+      const cacheKey = visibleDiagramElements.map(el => `${el.id}:${el.w}:${el.h}`).join(',');
+      if (spatialParentCacheRef.current.key === cacheKey) {
+        return spatialParentCacheRef.current.ids;
+      }
+
       const n = visibleDiagramElements.length;
       if (n < 200) {
         for (const outer of visibleDiagramElements) {
@@ -1330,6 +1673,7 @@ export default function App() {
           }
         }
       }
+      spatialParentCacheRef.current = { key: cacheKey, ids };
     }
     return ids;
   }, [currentViewId, visibleDiagramElements]);
@@ -1358,116 +1702,169 @@ export default function App() {
   // Track canvas dimensions to avoid unnecessary reallocation
   const canvasDimsRef = useRef({ w: 0, h: 0 });
 
-  // ==================== RENDER LOOP ====================
-  useEffect(() => {
+  // ==================== RENDER LOOP (ref-based for performance) ====================
+  // Data refs — shadowed from memos so the draw function is stable and reads latest values
+  const sortedElementsRef = useRef(sortedElements);
+  const parentIdsRef = useRef(parentIds);
+  const visibleDiagramElementsRef = useRef(visibleDiagramElements);
+  const visibleRelationshipsRef = useRef(visibleRelationships);
+  const visibleElementMapRef = useRef(visibleElementMap);
+  const selectedConnectionIdRef = useRef(selectedConnectionId);
+  const selectedNodeIdRef = useRef(selectedNodeId);
+  const selTypeRef = useRef(selType);
+  const hovElIdRef = useRef(hovElId);
+  const hovRelIdRef = useRef(hovRelId);
+  const drawingRelRef = useRef(drawingRel);
+  const gridTypeRef = useRef(gridType);
+  const snapGuidesRef = useRef(snapGuides);
+  const cSizeRef = useRef(cSize);
+
+  // Keep data refs in sync
+  useEffect(() => { sortedElementsRef.current = sortedElements; }, [sortedElements]);
+  useEffect(() => { parentIdsRef.current = parentIds; }, [parentIds]);
+  useEffect(() => { visibleDiagramElementsRef.current = visibleDiagramElements; }, [visibleDiagramElements]);
+  useEffect(() => { visibleRelationshipsRef.current = visibleRelationships; }, [visibleRelationships]);
+  useEffect(() => { visibleElementMapRef.current = visibleElementMap; }, [visibleElementMap]);
+  useEffect(() => { selectedConnectionIdRef.current = selectedConnectionId; }, [selectedConnectionId]);
+  useEffect(() => { selectedNodeIdRef.current = selectedNodeId; }, [selectedNodeId]);
+  useEffect(() => { selTypeRef.current = selType; }, [selType]);
+  useEffect(() => { hovElIdRef.current = hovElId; }, [hovElId]);
+  useEffect(() => { hovRelIdRef.current = hovRelId; }, [hovRelId]);
+  useEffect(() => { drawingRelRef.current = drawingRel; }, [drawingRel]);
+  useEffect(() => { gridTypeRef.current = gridType; }, [gridType]);
+  useEffect(() => { snapGuidesRef.current = snapGuides; }, [snapGuides]);
+  useEffect(() => { cSizeRef.current = cSize; }, [cSize]);
+
+  // Cached crossing segments — recomputed only when data changes, reused during pan
+  const crossingSegsRef = useRef<{ relId: string; x1: number; y1: number; x2: number; y2: number }[]>([]);
+  const crossingSegsVersionRef = useRef(-1);
+
+  // Stable draw function — reads everything from refs, callable from RAF or React effects
+  const drawCanvasRef = useRef(() => {});
+  drawCanvasRef.current = () => {
     const canvas = canvasRef.current;
     if (!canvas) return;
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
+    const _cam = camRef.current;
+    const _cSize = cSizeRef.current;
+    const _sortedElements = sortedElementsRef.current;
+    const _parentIds = parentIdsRef.current;
+    const _visibleDiagramElements = visibleDiagramElementsRef.current;
+    const _visibleRelationships = visibleRelationshipsRef.current;
+    const _visibleElementMap = visibleElementMapRef.current;
+    const _selectedConnectionId = selectedConnectionIdRef.current;
+    const _selectedNodeId = selectedNodeIdRef.current;
+    const _selType = selTypeRef.current;
+    const _hovElId = hovElIdRef.current;
+    const _hovRelId = hovRelIdRef.current;
+    const _drawingRel = drawingRelRef.current;
+    const _gridType = gridTypeRef.current;
+    const _snapGuides = snapGuidesRef.current;
+
     const dpr = window.devicePixelRatio || 1;
-    const pw = cSize.w * dpr, ph = cSize.h * dpr;
-    // Only resize canvas buffer when dimensions actually change (expensive operation)
+    const pw = _cSize.w * dpr, ph = _cSize.h * dpr;
     if (canvasDimsRef.current.w !== pw || canvasDimsRef.current.h !== ph) {
       canvas.width = pw;
       canvas.height = ph;
-      canvas.style.width = cSize.w + 'px';
-      canvas.style.height = cSize.h + 'px';
+      canvas.style.width = _cSize.w + 'px';
+      canvas.style.height = _cSize.h + 'px';
       canvasDimsRef.current = { w: pw, h: ph };
     }
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
 
     ctx.fillStyle = '#f5f6f8';
-    ctx.fillRect(0, 0, cSize.w, cSize.h);
+    ctx.fillRect(0, 0, _cSize.w, _cSize.h);
     ctx.save();
-    ctx.translate(cam.x, cam.y);
-    ctx.scale(cam.s, cam.s);
+    ctx.translate(_cam.x, _cam.y);
+    ctx.scale(_cam.s, _cam.s);
 
     // Grid
-    if (gridType === 'dot') drawDotGrid(ctx, cSize.w, cSize.h, cam.x, cam.y, cam.s);
-    else drawLineGrid(ctx, cSize.w, cSize.h, cam.x, cam.y, cam.s);
+    if (_gridType === 'dot') drawDotGrid(ctx, _cSize.w, _cSize.h, _cam.x, _cam.y, _cam.s);
+    else drawLineGrid(ctx, _cSize.w, _cSize.h, _cam.x, _cam.y, _cam.s);
 
-    // Viewport culling — only draw elements/relationships visible on screen
-    const vpMargin = 100; // extra margin in world coords to avoid pop-in
-    const vpLeft = -cam.x / cam.s - vpMargin;
-    const vpTop = -cam.y / cam.s - vpMargin;
-    const vpRight = vpLeft + cSize.w / cam.s + vpMargin * 2;
-    const vpBottom = vpTop + cSize.h / cam.s + vpMargin * 2;
+    // Viewport culling
+    const vpMargin = 100;
+    const vpLeft = -_cam.x / _cam.s - vpMargin;
+    const vpTop = -_cam.y / _cam.s - vpMargin;
+    const vpRight = vpLeft + _cSize.w / _cam.s + vpMargin * 2;
+    const vpBottom = vpTop + _cSize.h / _cam.s + vpMargin * 2;
 
     const inViewport = (el: { x: number; y: number; w: number; h: number }) =>
       el.x + el.w >= vpLeft && el.x <= vpRight && el.y + el.h >= vpTop && el.y <= vpBottom;
 
-    const culledElements = sortedElements.filter(inViewport);
+    const culledElements = _sortedElements.filter(inViewport);
 
-    // Elements — single pass sorted by zIndex (parents draw before children)
+    // Elements
     for (const el of culledElements) {
       drawElement(
         ctx,
         el,
-        selType === 'element' && selectedNodeId === el.id,
-        (selType === 'element' && selectedNodeId === el.id) || hovElId === el.id,
-        parentIds.has(el.id),
+        _selType === 'element' && _selectedNodeId === el.id,
+        (_selType === 'element' && _selectedNodeId === el.id) || _hovElId === el.id,
+        _parentIds.has(el.id),
       );
     }
 
-    // 3. Relationships (always on top of elements) — with crossing hops
-    // For large models, skip crossing detection (expensive O(n²))
-    const skipCrossings = visibleRelationships.length > 200;
+    // Relationships — with cached crossing hops
+    const skipCrossings = _visibleRelationships.length > 200;
 
     if (skipCrossings) {
-      for (const r of visibleRelationships) {
-        drawRelationship(ctx, r, visibleDiagramElements, selType === 'relationship' && selectedConnectionId === r.id, hovRelId === r.id, [], visibleElementMap);
+      for (const r of _visibleRelationships) {
+        drawRelationship(ctx, r, _visibleDiagramElements, _selType === 'relationship' && _selectedConnectionId === r.id, _hovRelId === r.id, [], _visibleElementMap);
       }
     } else {
-      const allRelSegs: RelSegments[] = visibleRelationships
-        .map(r => getRelSegments(r, visibleDiagramElements, visibleElementMap))
-        .filter((s): s is RelSegments => s !== null);
+      // Recompute crossing segments only when data version changes
+      const currentVersion = diagramStateVersion;
+      if (crossingSegsVersionRef.current !== currentVersion) {
+        const allRelSegs: RelSegments[] = _visibleRelationships
+          .map(r => getRelSegments(r, _visibleDiagramElements, _visibleElementMap))
+          .filter((s): s is RelSegments => s !== null);
+        crossingSegsRef.current = allRelSegs.flatMap(s => s.segments.map(seg => ({ ...seg, relId: s.relId })));
+        crossingSegsVersionRef.current = currentVersion;
+      }
+      const allFlatSegs = crossingSegsRef.current;
 
-      // Pre-build a flat list of all segments with their owning relId for fast exclusion
-      const allFlatSegs = allRelSegs.flatMap(s => s.segments.map(seg => ({ ...seg, relId: s.relId })));
-
-      for (const r of visibleRelationships) {
+      for (const r of _visibleRelationships) {
         const otherSegs = allFlatSegs.filter(s => s.relId !== r.id);
-        drawRelationship(ctx, r, visibleDiagramElements, selType === 'relationship' && selectedConnectionId === r.id, hovRelId === r.id, otherSegs, visibleElementMap);
+        drawRelationship(ctx, r, _visibleDiagramElements, _selType === 'relationship' && _selectedConnectionId === r.id, _hovRelId === r.id, otherSegs, _visibleElementMap);
       }
     }
 
-    // 4. Snap guide lines
-    if (snapGuides.length > 0) {
-      drawSnapGuides(ctx, snapGuides, cSize.w, cSize.h, cam.x, cam.y, cam.s);
+    // Snap guide lines
+    if (_snapGuides.length > 0) {
+      drawSnapGuides(ctx, _snapGuides, _cSize.w, _cSize.h, _cam.x, _cam.y, _cam.s);
     }
 
-    // 5. Drawing-in-progress relationship (with waypoints + arrowhead)
-    if (drawingRel) {
-      const src = drawingRel.sourceNodeId
-        ? visibleDiagramElements.find(element => element.id === drawingRel.sourceNodeId)
-        : visibleDiagramElements.find(element => element.elementId === drawingRel.sourceId);
+    // Drawing-in-progress relationship
+    if (_drawingRel) {
+      const src = _drawingRel.sourceNodeId
+        ? _visibleDiagramElements.find(element => element.id === _drawingRel.sourceNodeId)
+        : _visibleDiagramElements.find(element => element.elementId === _drawingRel.sourceId);
       if (src) {
-        const wps = drawingRel.waypoints;
+        const wps = _drawingRel.waypoints;
         const startPt = wps.length > 0 ? wps[0] : null;
-        const a = nearestAnchor(src, startPt?.x ?? drawingRel.mx, startPt?.y ?? drawingRel.my);
+        const a = nearestAnchor(src, startPt?.x ?? _drawingRel.mx, startPt?.y ?? _drawingRel.my);
         const col = '#4a5568';
         ctx.save();
-        // Line
         ctx.beginPath();
         ctx.moveTo(a.x, a.y);
         for (const wp of wps) ctx.lineTo(wp.x, wp.y);
-        ctx.lineTo(drawingRel.mx, drawingRel.my);
+        ctx.lineTo(_drawingRel.mx, _drawingRel.my);
         ctx.strokeStyle = col; ctx.lineWidth = 1.6; ctx.setLineDash([6, 3]); ctx.stroke(); ctx.setLineDash([]);
-        // Arrowhead at cursor end (open chevron like serving arrow)
         const prevPt = wps.length > 0 ? wps[wps.length - 1] : a;
-        const dx = drawingRel.mx - prevPt.x;
-        const dy = drawingRel.my - prevPt.y;
+        const dx = _drawingRel.mx - prevPt.x;
+        const dy = _drawingRel.my - prevPt.y;
         if (Math.abs(dx) > 1 || Math.abs(dy) > 1) {
           const angle = Math.atan2(dy, dx);
           const aLen = 11;
           const aSpread = 0.45;
           ctx.beginPath();
-          ctx.moveTo(drawingRel.mx - aLen * Math.cos(angle - aSpread), drawingRel.my - aLen * Math.sin(angle - aSpread));
-          ctx.lineTo(drawingRel.mx, drawingRel.my);
-          ctx.lineTo(drawingRel.mx - aLen * Math.cos(angle + aSpread), drawingRel.my - aLen * Math.sin(angle + aSpread));
+          ctx.moveTo(_drawingRel.mx - aLen * Math.cos(angle - aSpread), _drawingRel.my - aLen * Math.sin(angle - aSpread));
+          ctx.lineTo(_drawingRel.mx, _drawingRel.my);
+          ctx.lineTo(_drawingRel.mx - aLen * Math.cos(angle + aSpread), _drawingRel.my - aLen * Math.sin(angle + aSpread));
           ctx.strokeStyle = col; ctx.lineWidth = 1.8; ctx.lineJoin = 'round'; ctx.lineCap = 'round'; ctx.stroke();
         }
-        // Waypoint dots
         for (const wp of wps) {
           ctx.beginPath(); ctx.arc(wp.x, wp.y, 4, 0, Math.PI * 2);
           ctx.fillStyle = '#fff'; ctx.fill();
@@ -1478,6 +1875,11 @@ export default function App() {
     }
 
     ctx.restore();
+  };
+
+  // Trigger redraw when data changes (NOT camera — that's handled by setCamThrottled's RAF)
+  useEffect(() => {
+    drawCanvasRef.current();
   }, [visibleDiagramElements, visibleElementMap, visibleRelationships, sortedElements, parentIds, selectedConnectionId, selectedNodeId, selType, cam, cSize, hovElId, hovRelId, drawingRel, gridType, snapGuides]);
 
   // ==================== MOUSE HANDLERS ====================
@@ -1501,9 +1903,9 @@ export default function App() {
       if (el) {
         setSelectedNodeId(el.id); setSelectedConnectionId(null); setSelectedId(el.elementId); setSelType('element');
       } else {
-        const rh = hitTestRelationship(visibleRelationships, visibleDiagramElements, wx, wy);
+        const rh = hitTestRelationship(visibleRelationships, visibleDiagramElements, wx, wy, camRef.current.s);
         if (rh) { setSelectedNodeId(null); setSelectedConnectionId(rh.rel.id); setSelectedId((rh.rel as DiagramRelationshipInstance).relationshipId); setSelType('relationship'); }
-        else { setSelectedNodeId(null); setSelectedConnectionId(null); setSelectedId(null); setSelType(null); setPanning({ sx: e.clientX, sy: e.clientY, cx: cam.x, cy: cam.y }); }
+        else { setSelectedNodeId(null); setSelectedConnectionId(null); setSelectedId(null); setSelType(null); setPanning({ sx: e.clientX, sy: e.clientY, cx: camRef.current.x, cy: camRef.current.y }); }
       }
       return;
     }
@@ -1547,15 +1949,15 @@ export default function App() {
     if (selType === 'relationship' && selectedConnectionId) {
       const selRel = visibleRelationships.find(r => r.id === selectedConnectionId);
       if (selRel) {
-        const ep = hitTestEndpoint(selRel, visibleDiagramElements, wx, wy);
+        const ep = hitTestEndpoint(selRel, visibleDiagramElements, wx, wy, camRef.current.s);
         if (ep) { pushHistory(); setDragEndpoint({ relId: selRel.id, endpoint: ep }); return; }
       }
     }
 
-    const wp = hitTestWaypoint(visibleRelationships, wx, wy);
+    const wp = hitTestWaypoint(visibleRelationships, wx, wy, camRef.current.s);
     if (wp) { pushHistory(); setDragWP({ ...wp, startX: wx, startY: wy }); return; }
 
-    const lbl = hitTestLabel(visibleRelationships, visibleDiagramElements, wx, wy);
+    const lbl = hitTestLabel(visibleRelationships, visibleDiagramElements, wx, wy, camRef.current.s);
     if (lbl) {
       const relationship = visibleRelationships.find(candidate => candidate.id === lbl.id);
       pushHistory();
@@ -1573,7 +1975,7 @@ export default function App() {
       pushHistory();
       setDragging({ id: el.id, ox: wx - el.x, oy: wy - el.y });
     } else {
-      const rh = hitTestRelationship(visibleRelationships, visibleDiagramElements, wx, wy);
+      const rh = hitTestRelationship(visibleRelationships, visibleDiagramElements, wx, wy, camRef.current.s);
       if (rh) {
         setSelectedNodeId(null); setSelectedConnectionId(rh.rel.id); setSelectedId((rh.rel as DiagramRelationshipInstance).relationshipId); setSelType('relationship');
         // If already selected, start segment drag
@@ -1585,9 +1987,9 @@ export default function App() {
           }
         }
       }
-      else { setSelectedNodeId(null); setSelectedConnectionId(null); setSelectedId(null); setSelType(null); setPanning({ sx: e.clientX, sy: e.clientY, cx: cam.x, cy: cam.y }); }
+      else { setSelectedNodeId(null); setSelectedConnectionId(null); setSelectedId(null); setSelType(null); setPanning({ sx: e.clientX, sy: e.clientY, cx: camRef.current.x, cy: camRef.current.y }); }
     }
-  }, [s2w, visibleDiagramElements, visibleRelationships, cam, relPicker, ctxMenu, drawingRel, editingElId, navigateToView, selType, selectedConnectionId, selectedNodeId, pushHistory, isViewMode, currentNodeElementIdById]);
+  }, [s2w, visibleDiagramElements, visibleRelationships, relPicker, ctxMenu, drawingRel, editingElId, navigateToView, selType, selectedConnectionId, selectedNodeId, pushHistory, isViewMode, currentNodeElementIdById]);
 
   const handleMouseMove = useCallback((e: React.MouseEvent) => {
     const canvas = canvasRef.current;
@@ -1774,14 +2176,19 @@ export default function App() {
         }
       }
       const el = hitTestElement(visibleDiagramElements, wx, wy, getLayer, isNote);
-      setHovElId(el?.id || null);
+      const newHovElId = el?.id || null;
+      if (newHovElId !== hovElId) setHovElId(newHovElId);
       if (!el) {
-        const rh = hitTestRelationship(visibleRelationships, visibleDiagramElements, wx, wy);
-        setHovRelId(rh?.rel?.id || null);
-      } else setHovRelId(null);
-      canvas.style.cursor = 'default';
+        const rh = hitTestRelationship(visibleRelationships, visibleDiagramElements, wx, wy, camRef.current.s);
+        const newHovRelId = rh?.rel?.id || null;
+        if (newHovRelId !== hovRelId) setHovRelId(newHovRelId);
+        canvas.style.cursor = rh ? 'pointer' : 'default';
+      } else {
+        if (hovRelId !== null) setHovRelId(null);
+        canvas.style.cursor = 'default';
+      }
     }
-  }, [s2w, dragging, panning, visibleDiagramElements, visibleRelationships, visibleElementMap, drawingRel, dragWP, dragEndpoint, dragLabel, dragSegment, resizing, selType, selectedNodeId, setCamThrottled, updateCurrentDiagramNode, updateCurrentDiagramConnection]);
+  }, [s2w, dragging, panning, visibleDiagramElements, visibleRelationships, visibleElementMap, drawingRel, dragWP, dragEndpoint, dragLabel, dragSegment, resizing, selType, selectedNodeId, hovElId, hovRelId, setCamThrottled, updateCurrentDiagramNode, updateCurrentDiagramConnection]);
 
   const handleMouseUp = useCallback((e: React.MouseEvent) => {
     if (drawingRel) {
@@ -1870,7 +2277,7 @@ export default function App() {
     }
 
     if (!isViewMode) {
-      const rh = hitTestRelationship(visibleRelationships, visibleDiagramElements, wx, wy);
+      const rh = hitTestRelationship(visibleRelationships, visibleDiagramElements, wx, wy, camRef.current.s);
       if (rh) {
         const relationshipId = (rh.rel as DiagramRelationshipInstance).relationshipId;
         const name = prompt('Relationship label:', rh.rel.name || '');
@@ -1971,7 +2378,7 @@ export default function App() {
       return;
     }
 
-    const rh = hitTestRelationship(visibleRelationships, visibleDiagramElements, wx, wy);
+    const rh = hitTestRelationship(visibleRelationships, visibleDiagramElements, wx, wy, camRef.current.s);
     if (rh) {
       const relationshipId = (rh.rel as DiagramRelationshipInstance).relationshipId;
       setSelectedNodeId(null);
@@ -2034,7 +2441,7 @@ export default function App() {
       return;
     }
 
-    const wp = hitTestWaypoint(visibleRelationships, wx, wy);
+    const wp = hitTestWaypoint(visibleRelationships, wx, wy, camRef.current.s);
     if (wp) {
       setCtxMenu({
         x: sx,
@@ -2062,10 +2469,11 @@ export default function App() {
     const rect = canvas.getBoundingClientRect();
     const sx = e.clientX - rect.left, sy = e.clientY - rect.top;
     const f = e.deltaY < 0 ? 1.08 : 0.93;
-    const ns = Math.min(3, Math.max(0.2, cam.s * f));
-    const wx = (sx - cam.x) / cam.s, wy = (sy - cam.y) / cam.s;
+    const c = camRef.current;
+    const ns = Math.min(3, Math.max(0.2, c.s * f));
+    const wx = (sx - c.x) / c.s, wy = (sy - c.y) / c.s;
     setCamThrottled({ s: ns, x: sx - wx * ns, y: sy - wy * ns });
-  }, [cam, setCamThrottled]);
+  }, [setCamThrottled]);
 
   // ==================== INLINE EDITING ====================
   const commitEditing = useCallback(() => {
@@ -2535,6 +2943,13 @@ export default function App() {
       fragmentedSourceDocumentRef.current = result.document ?? null;
       setOrganizationBaseDocument(result.document ?? null);
 
+      // Seed content hashes from a trial serialization so the first
+      // incremental save only writes files that actually changed.
+      if (result.document) {
+        const baseline = serializeCoArchiFragmented(result.document);
+        wsSeedContentHashes(baseline.files);
+      }
+
       setElements(result.model.elements);
       setRelationships(result.model.relationships);
       setViews(result.model.views);
@@ -2574,15 +2989,18 @@ export default function App() {
   const handleOpenDirectory = useCallback(async () => {
     try {
       const state = await wsOpenDirectory();
+      const workspaceLoadKey = `${state.backend}:${state.directoryPath || state.directoryName}:${state.files.length}:${state.canWrite}`;
 
       // Detect fragmented coArchi directory (individual XML files per element)
       if (state.files.length > 0 && isFragmentedModelDirectory(state.files)) {
+        autoLoadedWorkspaceRef.current = workspaceLoadKey;
         await loadFragmentedModel(state.files);
         return;
       }
 
       // Auto-open the first archimate/xml/json file
       if (state.files.length > 0) {
+        autoLoadedWorkspaceRef.current = workspaceLoadKey;
         await loadFileEntry(state.files[0]);
       } else {
         showTransientDiagnostic(`No supported model files found in '${state.directoryName}'.`);
@@ -2594,39 +3012,98 @@ export default function App() {
     }
   }, [wsOpenDirectory, loadFileEntry, loadFragmentedModel, showTransientDiagnostic]);
 
+  useEffect(() => {
+    if (restorePending) return;
+    if (wsFiles.length === 0) return;
+
+    const workspaceLoadKey = `${workspace.backend || 'unknown'}:${workspace.directoryPath || wsDirName || 'workspace'}:${wsFiles.length}:${wsActiveFilePath || wsKind || 'none'}`;
+    if (autoLoadedWorkspaceRef.current === workspaceLoadKey) return;
+
+    const run = async () => {
+      if (wsKind === 'coarchi-directory') {
+        autoLoadedWorkspaceRef.current = workspaceLoadKey;
+        await loadFragmentedModel(wsFiles);
+        return;
+      }
+
+      if (wsActiveFilePath) {
+        const entry = wsGetFile(wsActiveFilePath);
+        if (!entry) return;
+        autoLoadedWorkspaceRef.current = workspaceLoadKey;
+        await loadFileEntry(entry);
+      }
+    };
+
+    void run();
+  }, [
+    restorePending,
+    workspace.backend,
+    workspace.directoryPath,
+    wsDirName,
+    wsFiles,
+    wsActiveFilePath,
+    wsKind,
+    wsGetFile,
+    loadFileEntry,
+    loadFragmentedModel,
+  ]);
+
   const handleSave = useCallback(async () => {
     // Fragmented save (coArchi directory)
     if (wsKind === 'coarchi-directory') {
-      if (!workspace.directoryHandle) {
-        alert('Saving a coArchi directory requires direct write access to the opened folder.');
+      if (!workspace.canWrite) {
+        showSaveNotice('error', 'Saving a coArchi directory requires direct write access to the opened workspace.');
         return;
       }
       try {
+        showSaveNotice('saving', 'Saving fragmented workspace...', 0);
         saveViewLayoutSnapshot(currentViewId);
         const saveDocument = buildFragmentedSaveDocument();
+        const exportModel = buildEditorModelForExport();
         const result = exportFragmentedEditorModel(
-          { version: 'openarchi-0.1', elements, relationships, views },
+          exportModel,
           saveDocument ?? fragmentedSourceDocumentRef.current ?? undefined,
           saveDocument ? undefined : elementLayoutsByViewRef.current,
           saveDocument ? undefined : relationshipLayoutsByViewRef.current,
         );
-        const hasError = result.diagnostics.some(d => d.severity === 'error');
-        if (hasError) {
-          const firstError = result.diagnostics.find(d => d.severity === 'error');
-          alert(firstError?.message || 'Save failed');
-          return;
+        // Log validation issues but never block save — Archi saves regardless of validation state
+        const validationErrors = result.diagnostics.filter(d => d.severity === 'error');
+        if (validationErrors.length > 0) {
+          const duplicateTrace = collectDuplicateTrace(result.document);
+          if (duplicateTrace.length > 0) {
+            const traceText = formatDuplicateTrace(duplicateTrace);
+            console.warn('[OpenArchi] Duplicate element trace during fragmented save\n' + traceText);
+          }
+          console.warn('[OpenArchi] Saving with validation issues:', validationErrors.map(d => d.message));
         }
         const preview = result.changeSet ? buildFragmentedSavePreview(result.changeSet) : null;
-        if (preview && !window.confirm(preview)) return;
+        if (preview) {
+          if (isTauriRuntime()) {
+            console.info('[OpenArchi] Fragmented save preview\n' + preview);
+            showTransientDiagnostic('Saving fragmented workspace. Preview written to the dev console.', 5000);
+          } else if (!window.confirm(preview)) {
+            setSaveNotice(null);
+            return;
+          }
+        }
+        console.info('[OpenArchi] Saving fragmented workspace', {
+          workspace: wsDirName || 'workspace',
+          fileCount: result.files.length,
+          deletedPaths: result.deletedPaths || [],
+          rootFilePath: result.document?.metadata?.coArchi?.rootFilePath,
+        });
         const saveResult = await wsSaveFragmented(result.files, result.deletedPaths || []);
+        console.info('[OpenArchi] Fragmented save result', saveResult);
         fragmentedSourceDocumentRef.current = result.document ?? fragmentedSourceDocumentRef.current;
         setOrganizationBaseDocument(result.document ?? fragmentedSourceDocumentRef.current);
         const summary = `Wrote ${saveResult.writtenCount} of ${result.files.length} files to ${wsDirName || 'workspace'}/`
           + (saveResult.skippedCount > 0 ? ` (${saveResult.skippedCount} unchanged)` : '')
           + (saveResult.deletedCount > 0 ? ` | -${saveResult.deletedCount} deleted` : '');
         showTransientDiagnostic(summary);
+        showSaveNotice('success', summary, 6000);
       } catch (err) {
-        alert(`Save failed: ${err}`);
+        console.error('[OpenArchi] Fragmented save failed', err);
+        showSaveNotice('error', `Save failed: ${err instanceof Error ? err.message : String(err)}`);
       }
       return;
     }
@@ -2636,20 +3113,32 @@ export default function App() {
     if (!activeFileEntry || !wsFormat) {
       // Fallback to download export
       exportModel();
+      showSaveNotice('success', 'Exported model as a download.', 5000);
       return;
     }
+    showSaveNotice('saving', `Saving ${activeFileEntry.name}...`, 0);
     const result = exportEditorModelToText(buildEditorModelForExport(), wsFormat);
     const hasError = result.diagnostics.some(d => d.severity === 'error');
     if (hasError) {
+      const duplicateDiagnostics = result.diagnostics
+        .filter(diagnostic => diagnostic.code.startsWith('VALIDATION_DUPLICATE_'))
+        .map(diagnostic => diagnostic.message)
+        .join('\n');
+      if (duplicateDiagnostics) {
+        console.error('[OpenArchi] Duplicate ID diagnostics before single-file save\n' + duplicateDiagnostics);
+        showTransientDiagnostic(duplicateDiagnostics, 15000);
+      }
       const firstError = result.diagnostics.find(d => d.severity === 'error');
-      alert(firstError?.message || 'Save failed');
+      showSaveNotice('error', firstError?.message || 'Save failed');
       return;
     }
     if (activeFileEntry.writeText) {
       try {
         await wsSaveFile(activeFileEntry, result.content);
+        showSaveNotice('success', `Saved ${activeFileEntry.name}`, 5000);
       } catch (err) {
-        alert(`Save failed: ${err}`);
+        console.error('[OpenArchi] Single-file save failed', err);
+        showSaveNotice('error', `Save failed: ${err instanceof Error ? err.message : String(err)}`);
       }
     } else {
       // No write access (fallback browser) – download instead
@@ -2661,26 +3150,30 @@ export default function App() {
       a.click();
       URL.revokeObjectURL(url);
       markClean();
+      showSaveNotice('success', `Downloaded ${activeFileEntry.name}`, 5000);
     }
-  }, [wsKind, workspace.directoryHandle, getActiveFile, wsFormat, wsDirName, exportModel, wsSaveFile, wsSaveFragmented, wsSaveSingleFragment, markClean, showTransientDiagnostic, saveViewLayoutSnapshot, currentViewId, buildFragmentedSaveDocument, buildEditorModelForExport]);
+  }, [wsKind, workspace.canWrite, getActiveFile, wsFormat, wsDirName, exportModel, wsSaveFile, wsSaveFragmented, wsSaveSingleFragment, markClean, showTransientDiagnostic, showSaveNotice, saveViewLayoutSnapshot, currentViewId, buildFragmentedSaveDocument, buildEditorModelForExport]);
 
   const handleSaveAsJson = useCallback(async () => {
-    if (!workspace.directoryHandle) {
-      alert('No directory open — cannot save JSON file.');
+    if (!workspace.canWrite) {
+      showSaveNotice('error', 'No writable workspace is open — cannot save JSON file.');
       return;
     }
     try {
+      showSaveNotice('saving', 'Saving model.openarchi.json...', 0);
       const result = exportEditorModelToText(buildEditorModelForExport(), 'openarchi-json');
       if (result.diagnostics.some(d => d.severity === 'error')) {
-        alert(result.diagnostics.find(d => d.severity === 'error')?.message || 'Export failed');
+        showSaveNotice('error', result.diagnostics.find(d => d.severity === 'error')?.message || 'Export failed');
         return;
       }
       await wsSaveSingleFragment('model.openarchi.json', result.content);
       showTransientDiagnostic(`Saved model.openarchi.json to ${wsDirName || 'workspace'}/`);
+      showSaveNotice('success', `Saved model.openarchi.json to ${wsDirName || 'workspace'}/`, 6000);
     } catch (err) {
-      alert(`Save failed: ${err}`);
+      console.error('[OpenArchi] JSON save failed', err);
+      showSaveNotice('error', `Save failed: ${err instanceof Error ? err.message : String(err)}`);
     }
-  }, [workspace.directoryHandle, buildEditorModelForExport, wsSaveSingleFragment, wsDirName, showTransientDiagnostic]);
+  }, [workspace.canWrite, buildEditorModelForExport, wsSaveSingleFragment, wsDirName, showTransientDiagnostic, showSaveNotice]);
 
   const handleExportSvg = useCallback(() => {
     const viewName = views.find(v => v.id === currentViewId)?.name || 'view';
@@ -2820,6 +3313,14 @@ export default function App() {
     }
     setRelationships(p => p.map(r => r.id === selectedId ? { ...r, [k]: v } : r));
   }, [selectedId, selectedConnectionId, pushHistory, updateCurrentDiagramConnection]);
+
+  const selectRelationshipFromPanel = useCallback((relationshipId: string) => {
+    const visibleConnection = visibleRelationships.find(relationship => relationship.relationshipId === relationshipId) || null;
+    setSelectedNodeId(null);
+    setSelectedId(relationshipId);
+    setSelType('relationship');
+    setSelectedConnectionId(visibleConnection?.id || null);
+  }, [visibleRelationships]);
 
   const updView = useCallback((viewId: string, k: string, v: unknown) => {
     if (!propEditPushedRef.current) { pushHistory(); propEditPushedRef.current = true; }
@@ -2987,7 +3488,215 @@ export default function App() {
 
   const relPickerWaypoints = useRef<{ x: number; y: number }[]>([]);
 
+  const deriveAffectedViewsForPaths = useCallback((changedFiles: string[]): AffectedViewInfo[] => {
+    const changedPathSet = new Set(changedFiles);
+    if (changedPathSet.size === 0) return [];
+
+    const changedElementIds = new Set(
+      elements
+        .filter(element => element.sourcePath && changedPathSet.has(element.sourcePath))
+        .map(element => element.id),
+    );
+    const changedRelationshipIds = new Set(
+      relationships
+        .filter(relationship => relationship.sourcePath && changedPathSet.has(relationship.sourcePath))
+        .map(relationship => relationship.id),
+    );
+
+    return views
+      .map(view => {
+        const reasons: string[] = [];
+        if (view.sourcePath && changedPathSet.has(view.sourcePath)) {
+          reasons.push('view fragment changed');
+        }
+        if ((view.elementIds || []).some(elementId => changedElementIds.has(elementId))) {
+          reasons.push('contains changed elements');
+        }
+
+        const memberIds = new Set(view.elementIds || []);
+        const semanticRelationshipIds = new Set(
+          relationships
+            .filter(relationship => memberIds.has(relationship.sourceId) && memberIds.has(relationship.targetId))
+            .map(relationship => relationship.id),
+        );
+        const diagramRelationshipIds = new Set(
+          (diagramConnectionsByViewRef.current[view.id] || []).map(connection => connection.relationshipId),
+        );
+        if ([...changedRelationshipIds].some(relationshipId =>
+          semanticRelationshipIds.has(relationshipId) || diagramRelationshipIds.has(relationshipId))) {
+          reasons.push('contains changed relationships');
+        }
+
+        if (reasons.length === 0) return null;
+        return {
+          viewId: view.id,
+          viewName: view.name,
+          reasons,
+        } satisfies AffectedViewInfo;
+      })
+      .filter((view): view is AffectedViewInfo => view !== null)
+      .sort((left, right) => {
+        if (left.reasons.length !== right.reasons.length) {
+          return right.reasons.length - left.reasons.length;
+        }
+        return left.viewName.localeCompare(right.viewName);
+      });
+  }, [elements, relationships, views]);
+
+  const handleSelectHistoryCommit = useCallback(async (commit: GitHistoryEntry) => {
+    setSelectedHistoryCommit(commit);
+    setCommitChangedFiles([]);
+    setCommitAffectedViews([]);
+    setCommitDetailsError(null);
+    setCommitCompareState(null);
+    setCommitCompareError(null);
+    setCommitDetailsLoading(true);
+
+    try {
+      const changedFiles = await wsGetGitChangedFiles(commit.hash);
+      setCommitChangedFiles(changedFiles);
+      setCommitAffectedViews(deriveAffectedViewsForPaths(changedFiles));
+      if (changedFiles.length === 0) {
+        setCommitDetailsError('No changed model files were detected for this commit.');
+      }
+    } catch (error) {
+      setCommitDetailsError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setCommitDetailsLoading(false);
+    }
+  }, [deriveAffectedViewsForPaths, wsGetGitChangedFiles]);
+
+  const handleCompareHistoryView = useCallback(async (commit: GitHistoryEntry, viewId: string) => {
+    const currentView = views.find(view => view.id === viewId) || null;
+    if (!currentView) {
+      setCommitCompareError('The selected view is no longer present in the current workspace.');
+      return;
+    }
+
+    setCommitCompareLoading(true);
+    setCommitCompareError(null);
+    setCommitCompareState(null);
+
+    try {
+      const snapshotFiles = await wsGetGitModelSnapshot(commit.hash);
+      if (snapshotFiles.length === 0) {
+        throw new Error('No model snapshot could be loaded for this commit.');
+      }
+
+      const snapshotEntries: OpenFileEntry[] = snapshotFiles.map(file => ({
+        name: file.relativePath.split('/').pop() || file.relativePath,
+        relativePath: file.relativePath,
+        readText: async () => file.content,
+      }));
+
+      const result = await importFragmentedModel(snapshotEntries);
+      if (!result.model) {
+        const firstError = result.diagnostics.find(diagnostic => diagnostic.severity === 'error');
+        throw new Error(firstError?.message || 'Failed to import the selected git snapshot.');
+      }
+
+      const snapshotDiagramState = result.document
+        ? buildDiagramStateFromCanonicalDocument(result.document)
+        : buildDiagramStateFromEditorModel(result.model.elements, result.model.relationships, result.model.views);
+
+      const currentSnapshot = buildViewSvgSnapshot(
+        currentView.id,
+        views,
+        elements,
+        relationships,
+        diagramNodesByViewRef.current,
+        diagramConnectionsByViewRef.current,
+      );
+
+      const snapshotView = result.model.views.find(view => view.id === currentView.id)
+        || result.model.views.find(view => view.sourcePath && currentView.sourcePath && view.sourcePath === currentView.sourcePath)
+        || result.model.views.find(view => view.name === currentView.name);
+
+      const previousSnapshot = snapshotView
+        ? buildViewSvgSnapshot(
+          snapshotView.id,
+          result.model.views,
+          result.model.elements,
+          result.model.relationships,
+          snapshotDiagramState.diagramNodesByView,
+          snapshotDiagramState.diagramConnectionsByView,
+        )
+        : {
+          svg: exportViewToSvg([], []),
+          elementCount: 0,
+          relationshipCount: 0,
+        };
+
+      setCommitCompareState({
+        commit,
+        viewId: currentView.id,
+        viewName: currentView.name,
+        currentSvg: currentSnapshot.svg,
+        previousSvg: previousSnapshot.svg,
+        currentElementCount: currentSnapshot.elementCount,
+        currentRelationshipCount: currentSnapshot.relationshipCount,
+        previousElementCount: previousSnapshot.elementCount,
+        previousRelationshipCount: previousSnapshot.relationshipCount,
+        snapshotMissing: !snapshotView,
+      });
+    } catch (error) {
+      setCommitCompareError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setCommitCompareLoading(false);
+    }
+  }, [elements, relationships, views, wsGetGitModelSnapshot]);
+
   const [showChangelog, setShowChangelog] = useState(false);
+
+  useEffect(() => {
+    if (!showChangelog) return;
+    if (!gitBranch) {
+      setGitHistory([]);
+      setGitHistoryError('No git repository detected for the current workspace.');
+      return;
+    }
+
+    let cancelled = false;
+    setGitHistoryLoading(true);
+    setGitHistoryError(null);
+
+    (async () => {
+      try {
+        const history = await wsGetGitHistory(30);
+        if (cancelled) return;
+        setGitHistory(history);
+        if (history.length === 0) {
+          setGitHistoryError(isTauriRuntime()
+            ? 'No commits found or git history is unavailable for this workspace.'
+            : 'Git history is only available in the Tauri desktop app right now.');
+        }
+      } catch (error) {
+        if (cancelled) return;
+        setGitHistory([]);
+        setGitHistoryError(error instanceof Error ? error.message : String(error));
+      } finally {
+        if (!cancelled) {
+          setGitHistoryLoading(false);
+        }
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [showChangelog, gitBranch, wsGetGitHistory]);
+
+  useEffect(() => {
+    if (showChangelog) return;
+    setSelectedHistoryCommit(null);
+    setCommitChangedFiles([]);
+    setCommitAffectedViews([]);
+    setCommitDetailsError(null);
+    setCommitDetailsLoading(false);
+    setCommitCompareState(null);
+    setCommitCompareError(null);
+    setCommitCompareLoading(false);
+  }, [showChangelog]);
 
   // ==================== RENDER ====================
   return (
@@ -3393,17 +4102,63 @@ export default function App() {
                   }}>{'\u00D7'}</button>
                 </div>
                 <div style={{ padding: '4px 14px 6px', fontSize: 10, color: 'var(--text-muted, #8a8a90)' }}>
-                  {activeView?.name || 'Unknown view'}
+                  {gitBranch ? `${gitBranch} • ${activeView?.name || 'Unknown view'}` : (activeView?.name || 'Unknown view')}
                 </div>
                 <div style={{ flex: 1, overflow: 'auto', padding: '6px 14px 14px' }}>
-                  <div style={{ color: 'var(--text-faint, #b0b0b8)', fontSize: 12, lineHeight: 1.7 }}>
-                    <p style={{ margin: '0 0 8px', fontWeight: 400 }}>
-                      Git history for elements, relationships and properties in this view will appear here.
-                    </p>
-                    <p style={{ margin: 0, fontSize: 11, fontStyle: 'italic' }}>
-                      Coming soon — requires a git-backed model (coArchi directory).
-                    </p>
-                  </div>
+                  {gitHistoryLoading ? (
+                    <div style={{ color: 'var(--text-faint, #b0b0b8)', fontSize: 12, lineHeight: 1.7 }}>
+                      Loading git history...
+                    </div>
+                  ) : gitHistoryError ? (
+                    <div style={{ color: 'var(--text-faint, #b0b0b8)', fontSize: 12, lineHeight: 1.7 }}>
+                      {gitHistoryError}
+                    </div>
+                  ) : (
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+                      {gitHistory.map(commit => {
+                        const selected = selectedHistoryCommit?.hash === commit.hash;
+                        return (
+                        <button
+                          key={commit.hash}
+                          onClick={() => void handleSelectHistoryCommit(commit)}
+                          style={{
+                            textAlign: 'left',
+                            width: '100%',
+                            padding: '9px 10px',
+                            borderRadius: 8,
+                            background: selected
+                              ? 'var(--surface-selected, rgba(37,99,235,0.09))'
+                              : 'var(--surface-hover, rgba(0,0,0,0.02))',
+                            border: selected
+                              ? '1px solid rgba(37,99,235,0.24)'
+                              : '1px solid var(--border, rgba(0,0,0,0.06))',
+                            cursor: 'pointer',
+                            fontFamily: 'inherit',
+                          }}
+                        >
+                          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8 }}>
+                            <span style={{
+                              fontSize: 11,
+                              fontWeight: 700,
+                              color: 'var(--accent-text, #1d4ed8)',
+                              fontFamily: 'monospace',
+                            }}>
+                              {commit.shortHash}
+                            </span>
+                            <span style={{ fontSize: 10, color: 'var(--text-faint, #b0b0b8)' }}>
+                              {commit.date}
+                            </span>
+                          </div>
+                          <div style={{ marginTop: 5, fontSize: 12, color: 'var(--text-primary, #1a1a1a)', lineHeight: 1.45 }}>
+                            {commit.subject}
+                          </div>
+                          <div style={{ marginTop: 5, fontSize: 10.5, color: 'var(--text-muted, #8a8a90)' }}>
+                            {commit.author}
+                          </div>
+                        </button>
+                      )})}
+                    </div>
+                  )}
                 </div>
               </div>
             )}
@@ -3547,11 +4302,13 @@ export default function App() {
               window.addEventListener('mouseup', onUp);
             }}
           />
-          {organizationTree && (
+          {(() => {
+            const hasOrg = !!organizationTree;
+            return (
             <div style={{ padding: '8px 10px 0' }}>
               <div style={{
                 display: 'grid',
-                gridTemplateColumns: '1fr 1fr',
+                gridTemplateColumns: hasOrg ? '1fr 1fr' : '1fr',
                 gap: 4,
                 padding: 3,
                 borderRadius: 8,
@@ -3573,6 +4330,7 @@ export default function App() {
                 >
                   Views
                 </button>
+                {hasOrg && (
                 <button
                   onClick={() => setLeftNavMode('model')}
                   style={{
@@ -3589,9 +4347,11 @@ export default function App() {
                 >
                   Model
                 </button>
+                )}
               </div>
             </div>
-          )}
+            );
+          })()}
           {organizationTree && leftNavMode === 'model' ? (
             <ModelTree
               tree={organizationTree}
@@ -3621,8 +4381,10 @@ export default function App() {
               selEl={selEl}
               selRel={selRel}
               elements={elements}
+              relationships={relationships}
               onUpdateElement={updEl}
               onUpdateRelationship={updRel}
+              onSelectRelationship={selectRelationshipFromPanel}
               onUpdateView={updView}
               side="left"
               onToggleSide={() => setPropSide('right')}
@@ -3844,7 +4606,7 @@ export default function App() {
           onExport={exportModel}
           onExportSvg={handleExportSvg}
           onSave={handleSave}
-          onSaveAsJson={workspace.directoryHandle ? handleSaveAsJson : undefined}
+          onSaveAsJson={workspace.canWrite ? handleSaveAsJson : undefined}
           canSave={!!wsActiveFilePath || wsKind === 'coarchi-directory'}
           isDirty={isDirty}
           dirState={!!wsDirName}
@@ -4023,6 +4785,345 @@ export default function App() {
           </div>
         )}
 
+        {saveNotice && (
+          <div
+            onClick={() => setSaveNotice(null)}
+            style={{
+              position: 'absolute',
+              top: 14,
+              left: '50%',
+              transform: 'translateX(-50%)',
+              minWidth: 240,
+              maxWidth: '70vw',
+              padding: '10px 14px',
+              zIndex: 110,
+              background: saveNotice.kind === 'error'
+                ? 'rgba(190, 24, 93, 0.96)'
+                : saveNotice.kind === 'success'
+                  ? 'rgba(5, 150, 105, 0.96)'
+                  : 'rgba(37, 99, 235, 0.96)',
+              color: '#fff',
+              borderRadius: 10,
+              fontSize: 12,
+              fontWeight: 600,
+              letterSpacing: '-0.01em',
+              cursor: 'pointer',
+              boxShadow: '0 10px 30px rgba(0,0,0,0.18)',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              gap: 8,
+              whiteSpace: 'pre-wrap',
+            }}
+          >
+            <span style={{
+              width: 8,
+              height: 8,
+              borderRadius: '50%',
+              background: 'rgba(255,255,255,0.9)',
+              boxShadow: saveNotice.kind === 'saving' ? '0 0 0 6px rgba(255,255,255,0.16)' : 'none',
+            }} />
+            {saveNotice.message}
+          </div>
+        )}
+
+        {selectedHistoryCommit && (
+          <div
+            onMouseDown={() => {
+              setSelectedHistoryCommit(null);
+              setCommitCompareState(null);
+              setCommitCompareError(null);
+            }}
+            style={{
+              position: 'absolute',
+              inset: 0,
+              zIndex: 130,
+              background: 'rgba(15, 23, 42, 0.28)',
+              backdropFilter: 'blur(10px)',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              padding: 24,
+            }}
+          >
+            <div
+              onMouseDown={event => event.stopPropagation()}
+              style={{
+                width: 'min(1100px, calc(100vw - 40px))',
+                maxHeight: 'calc(100vh - 64px)',
+                overflow: 'hidden',
+                background: 'var(--glass-strong, rgba(255,255,255,0.96))',
+                border: '1px solid var(--glass-border, rgba(255,255,255,0.55))',
+                borderRadius: 'var(--radius-lg, 14px)',
+                boxShadow: 'var(--shadow-xl, 0 8px 40px rgba(0,0,0,0.16))',
+                display: 'flex',
+                flexDirection: 'column',
+              }}
+            >
+              <div style={{
+                padding: '16px 18px 14px',
+                borderBottom: '1px solid var(--border, rgba(0,0,0,0.06))',
+                display: 'flex',
+                alignItems: 'flex-start',
+                justifyContent: 'space-between',
+                gap: 16,
+              }}>
+                <div>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+                    <span style={{
+                      fontSize: 11,
+                      fontWeight: 700,
+                      color: 'var(--accent-text, #1d4ed8)',
+                      fontFamily: 'monospace',
+                    }}>
+                      {selectedHistoryCommit.shortHash}
+                    </span>
+                    <span style={{ fontSize: 11, color: 'var(--text-muted, #8a8a90)' }}>
+                      {selectedHistoryCommit.author} • {selectedHistoryCommit.date}
+                    </span>
+                  </div>
+                  <div style={{ marginTop: 6, fontSize: 17, fontWeight: 600, color: 'var(--text-primary, #1a1a1a)' }}>
+                    {selectedHistoryCommit.subject}
+                  </div>
+                  <div style={{ marginTop: 6, fontSize: 11.5, color: 'var(--text-secondary, #555)' }}>
+                    Changed model fragments and affected views in the current workspace. Compare opens the selected historical view against what is on disk now.
+                  </div>
+                </div>
+                <button
+                  onClick={() => {
+                    setSelectedHistoryCommit(null);
+                    setCommitCompareState(null);
+                    setCommitCompareError(null);
+                  }}
+                  style={{
+                    width: 30,
+                    height: 30,
+                    borderRadius: 8,
+                    border: 'none',
+                    background: 'transparent',
+                    color: 'var(--text-faint, #b0b0b8)',
+                    cursor: 'pointer',
+                    fontSize: 18,
+                    lineHeight: 1,
+                  }}
+                >
+                  {'\u00D7'}
+                </button>
+              </div>
+
+              <div style={{
+                padding: 18,
+                overflow: 'auto',
+                display: 'grid',
+                gridTemplateColumns: 'minmax(260px, 320px) minmax(0, 1fr)',
+                gap: 16,
+              }}>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
+                  <div style={{
+                    borderRadius: 12,
+                    border: '1px solid var(--border, rgba(0,0,0,0.06))',
+                    background: 'var(--surface-solid, #fff)',
+                    padding: '12px 12px 10px',
+                  }}>
+                    <div style={{ fontSize: 11, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.4px', color: 'var(--text-faint, #b0b0b8)' }}>
+                      Changed Files
+                    </div>
+                    <div style={{ marginTop: 10, display: 'flex', flexDirection: 'column', gap: 6, maxHeight: 260, overflow: 'auto' }}>
+                      {commitDetailsLoading ? (
+                        <div style={{ fontSize: 12, color: 'var(--text-muted, #8a8a90)' }}>Loading changed files...</div>
+                      ) : commitChangedFiles.length > 0 ? (
+                        commitChangedFiles.map(path => (
+                          <div
+                            key={path}
+                            style={{
+                              fontSize: 11,
+                              lineHeight: 1.45,
+                              color: 'var(--text-secondary, #555)',
+                              fontFamily: 'monospace',
+                              padding: '6px 8px',
+                              borderRadius: 8,
+                              background: 'var(--surface-hover, rgba(0,0,0,0.02))',
+                            }}
+                          >
+                            {path}
+                          </div>
+                        ))
+                      ) : (
+                        <div style={{ fontSize: 12, color: 'var(--text-muted, #8a8a90)' }}>
+                          No changed model files were detected for this commit.
+                        </div>
+                      )}
+                    </div>
+                  </div>
+
+                  <div style={{
+                    borderRadius: 12,
+                    border: '1px solid var(--border, rgba(0,0,0,0.06))',
+                    background: 'var(--surface-solid, #fff)',
+                    padding: '12px 12px 10px',
+                  }}>
+                    <div style={{ fontSize: 11, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.4px', color: 'var(--text-faint, #b0b0b8)' }}>
+                      Affected Views
+                    </div>
+                    <div style={{ marginTop: 10, display: 'flex', flexDirection: 'column', gap: 8, maxHeight: 360, overflow: 'auto' }}>
+                      {commitDetailsLoading ? (
+                        <div style={{ fontSize: 12, color: 'var(--text-muted, #8a8a90)' }}>Deriving affected views...</div>
+                      ) : commitAffectedViews.length > 0 ? (
+                        commitAffectedViews.map(view => {
+                          const isActive = commitCompareState?.viewId === view.viewId;
+                          return (
+                            <button
+                              key={view.viewId}
+                              onClick={() => void handleCompareHistoryView(selectedHistoryCommit, view.viewId)}
+                              style={{
+                                textAlign: 'left',
+                                borderRadius: 10,
+                                border: isActive ? '1px solid rgba(37,99,235,0.24)' : '1px solid var(--border, rgba(0,0,0,0.06))',
+                                background: isActive ? 'var(--surface-selected, rgba(37,99,235,0.08))' : 'var(--surface-hover, rgba(0,0,0,0.02))',
+                                padding: '10px 11px',
+                                cursor: 'pointer',
+                                fontFamily: 'inherit',
+                              }}
+                            >
+                              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8 }}>
+                                <span style={{ fontSize: 12.5, fontWeight: 600, color: 'var(--text-primary, #1a1a1a)' }}>
+                                  {view.viewName}
+                                </span>
+                                <span style={{ fontSize: 10, color: 'var(--accent-text, #1d4ed8)' }}>
+                                  Compare
+                                </span>
+                              </div>
+                              <div style={{ marginTop: 6, fontSize: 10.5, color: 'var(--text-muted, #8a8a90)', lineHeight: 1.5 }}>
+                                {view.reasons.join(' • ')}
+                              </div>
+                            </button>
+                          );
+                        })
+                      ) : (
+                        <div style={{ fontSize: 12, color: 'var(--text-muted, #8a8a90)' }}>
+                          No affected views could be derived from the current workspace state.
+                        </div>
+                      )}
+                    </div>
+                    {commitDetailsError && (
+                      <div style={{ marginTop: 10, fontSize: 11.5, color: '#b45309', lineHeight: 1.5 }}>
+                        {commitDetailsError}
+                      </div>
+                    )}
+                  </div>
+                </div>
+
+                <div style={{
+                  borderRadius: 12,
+                  border: '1px solid var(--border, rgba(0,0,0,0.06))',
+                  background: 'var(--surface-solid, #fff)',
+                  padding: '12px 12px 10px',
+                  minHeight: 520,
+                  display: 'flex',
+                  flexDirection: 'column',
+                }}>
+                  <div style={{ fontSize: 11, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.4px', color: 'var(--text-faint, #b0b0b8)' }}>
+                    View Compare
+                  </div>
+                  {commitCompareLoading ? (
+                    <div style={{ marginTop: 16, fontSize: 12, color: 'var(--text-muted, #8a8a90)' }}>
+                      Loading selected commit snapshot...
+                    </div>
+                  ) : commitCompareError ? (
+                    <div style={{ marginTop: 16, fontSize: 12, color: '#b45309', lineHeight: 1.6 }}>
+                      {commitCompareError}
+                    </div>
+                  ) : commitCompareState ? (
+                    <div style={{ marginTop: 12, display: 'flex', flexDirection: 'column', gap: 12, minHeight: 0, flex: 1 }}>
+                      <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--text-primary, #1a1a1a)' }}>
+                        {commitCompareState.viewName}
+                      </div>
+                      {commitCompareState.snapshotMissing && (
+                        <div style={{ fontSize: 11.5, color: '#b45309', lineHeight: 1.5 }}>
+                          This view does not exist in the selected commit. The left side is empty so you can compare against a newly added view.
+                        </div>
+                      )}
+                      <div style={{
+                        display: 'grid',
+                        gridTemplateColumns: 'repeat(2, minmax(0, 1fr))',
+                        gap: 12,
+                        minHeight: 0,
+                        flex: 1,
+                      }}>
+                        <div style={{
+                          borderRadius: 10,
+                          border: '1px solid var(--border, rgba(0,0,0,0.06))',
+                          background: 'var(--surface-hover, rgba(0,0,0,0.015))',
+                          padding: 10,
+                          display: 'flex',
+                          flexDirection: 'column',
+                          minHeight: 0,
+                        }}>
+                          <div style={{ fontSize: 11, fontWeight: 700, color: 'var(--text-primary, #1a1a1a)' }}>
+                            {commitCompareState.commit.shortHash}
+                          </div>
+                          <div style={{ marginTop: 4, fontSize: 10.5, color: 'var(--text-muted, #8a8a90)' }}>
+                            {commitCompareState.previousElementCount} elements • {commitCompareState.previousRelationshipCount} relationships
+                          </div>
+                          <div style={{
+                            marginTop: 10,
+                            borderRadius: 8,
+                            overflow: 'auto',
+                            background: '#fff',
+                            border: '1px solid rgba(0,0,0,0.04)',
+                            flex: 1,
+                            minHeight: 340,
+                          }}>
+                            <div
+                              style={{ minWidth: '100%', minHeight: '100%', padding: 12 }}
+                              dangerouslySetInnerHTML={{ __html: commitCompareState.previousSvg }}
+                            />
+                          </div>
+                        </div>
+
+                        <div style={{
+                          borderRadius: 10,
+                          border: '1px solid var(--border, rgba(0,0,0,0.06))',
+                          background: 'var(--surface-hover, rgba(0,0,0,0.015))',
+                          padding: 10,
+                          display: 'flex',
+                          flexDirection: 'column',
+                          minHeight: 0,
+                        }}>
+                          <div style={{ fontSize: 11, fontWeight: 700, color: 'var(--text-primary, #1a1a1a)' }}>
+                            Current Workspace
+                          </div>
+                          <div style={{ marginTop: 4, fontSize: 10.5, color: 'var(--text-muted, #8a8a90)' }}>
+                            {commitCompareState.currentElementCount} elements • {commitCompareState.currentRelationshipCount} relationships
+                          </div>
+                          <div style={{
+                            marginTop: 10,
+                            borderRadius: 8,
+                            overflow: 'auto',
+                            background: '#fff',
+                            border: '1px solid rgba(0,0,0,0.04)',
+                            flex: 1,
+                            minHeight: 340,
+                          }}>
+                            <div
+                              style={{ minWidth: '100%', minHeight: '100%', padding: 12 }}
+                              dangerouslySetInnerHTML={{ __html: commitCompareState.currentSvg }}
+                            />
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+                  ) : (
+                    <div style={{ marginTop: 16, fontSize: 12, color: 'var(--text-muted, #8a8a90)', lineHeight: 1.7 }}>
+                      Select an affected view to render the selected commit beside the current workspace.
+                    </div>
+                  )}
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
+
         {/* ====== Property panel on right side ====== */}
         {propSide === 'right' && (
           <div style={{
@@ -4039,8 +5140,10 @@ export default function App() {
               selEl={selEl}
               selRel={selRel}
               elements={elements}
+              relationships={relationships}
               onUpdateElement={updEl}
               onUpdateRelationship={updRel}
+              onSelectRelationship={selectRelationshipFromPanel}
               onUpdateView={updView}
               side="right"
               onToggleSide={() => setPropSide('left')}

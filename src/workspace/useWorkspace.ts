@@ -4,6 +4,7 @@ import type { IncrementalSaveResult } from './manager';
 import type { WorkspaceState } from './types';
 import { INITIAL_WORKSPACE_STATE } from './types';
 import type { DirectoryState, OpenFileEntry } from '../io/filesystem';
+import type { GitHistoryEntry, GitCommitFile } from './git';
 
 export interface UseWorkspaceReturn {
   /** Current workspace state */
@@ -25,6 +26,8 @@ export interface UseWorkspaceReturn {
   ) => Promise<IncrementalSaveResult>;
   /** Save a single fragment file to the directory */
   saveSingleFragment: (relativePath: string, content: string) => Promise<void>;
+  /** Pre-seed content hashes so the first incremental save skips unchanged files */
+  seedContentHashes: (files: { relativePath: string; content: string }[]) => void;
   /** Get a file entry by relative path */
   getFile: (relativePath: string) => OpenFileEntry | undefined;
   /** Get the currently active file entry */
@@ -33,6 +36,12 @@ export interface UseWorkspaceReturn {
   closeWorkspace: () => Promise<void>;
   /** Refresh git branch info */
   refreshGitBranch: () => Promise<void>;
+  /** Read recent git history for the opened workspace */
+  getGitHistory: (limit?: number) => Promise<GitHistoryEntry[]>;
+  /** Read changed files for a git commit */
+  getGitChangedFiles: (commit: string) => Promise<string[]>;
+  /** Read a full model snapshot from a git commit */
+  getGitModelSnapshot: (commit: string) => Promise<GitCommitFile[]>;
   /** True if a restore is pending and needs user permission */
   restorePending: boolean;
   /** Directory name of the pending restore (for the reconnect banner) */
@@ -117,6 +126,10 @@ export function useWorkspace(): UseWorkspaceReturn {
     await manager.saveSingleFragment(relativePath, content);
   }, [manager]);
 
+  const seedContentHashes = useCallback((files: { relativePath: string; content: string }[]) => {
+    manager.seedContentHashes(files);
+  }, [manager]);
+
   const getFile = useCallback((relativePath: string) => {
     return manager.getFile(relativePath);
   }, [manager]);
@@ -135,6 +148,18 @@ export function useWorkspace(): UseWorkspaceReturn {
     await manager.refreshGitBranch();
   }, [manager]);
 
+  const getGitHistory = useCallback(async (limit: number = 30) => {
+    return manager.getGitHistory(limit);
+  }, [manager]);
+
+  const getGitChangedFiles = useCallback(async (commit: string) => {
+    return manager.getGitChangedFiles(commit);
+  }, [manager]);
+
+  const getGitModelSnapshot = useCallback(async (commit: string) => {
+    return manager.getGitModelSnapshot(commit);
+  }, [manager]);
+
   const requestPermissionAndRestore = useCallback(async () => {
     setRestorePending(false);
     setRestoreDirectoryName(null);
@@ -150,10 +175,14 @@ export function useWorkspace(): UseWorkspaceReturn {
     saveFile,
     saveFragmented,
     saveSingleFragment,
+    seedContentHashes,
     getFile,
     getActiveFile,
     closeWorkspace,
     refreshGitBranch,
+    getGitHistory,
+    getGitChangedFiles,
+    getGitModelSnapshot,
     restorePending,
     restoreDirectoryName,
     requestPermissionAndRestore,

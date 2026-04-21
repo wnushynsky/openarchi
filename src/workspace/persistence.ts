@@ -1,12 +1,15 @@
 import type { WorkspaceMetadata } from './types';
+import type { WorkspaceBackend } from '../io/filesystem';
 
 const DB_NAME = 'openarchi-workspace';
 const DB_VERSION = 1;
 const STORE_NAME = 'state';
 const KEY = 'workspace';
 
-interface StoredWorkspace {
-  handle: FileSystemDirectoryHandle;
+export interface StoredWorkspace {
+  handle?: FileSystemDirectoryHandle;
+  directoryPath?: string;
+  backend?: WorkspaceBackend | null;
   metadata: WorkspaceMetadata;
 }
 
@@ -25,14 +28,23 @@ function openDB(): Promise<IDBDatabase> {
 }
 
 export async function saveWorkspace(
-  handle: FileSystemDirectoryHandle,
+  workspace: {
+    handle?: FileSystemDirectoryHandle | null;
+    directoryPath?: string | null;
+    backend?: WorkspaceBackend | null;
+  },
   metadata: WorkspaceMetadata,
 ): Promise<void> {
   const db = await openDB();
   return new Promise((resolve, reject) => {
     const tx = db.transaction(STORE_NAME, 'readwrite');
     const store = tx.objectStore(STORE_NAME);
-    const stored: StoredWorkspace = { handle, metadata };
+    const stored: StoredWorkspace = {
+      handle: workspace.handle ?? undefined,
+      directoryPath: workspace.directoryPath ?? undefined,
+      backend: workspace.backend ?? null,
+      metadata,
+    };
     store.put(stored, KEY);
     tx.oncomplete = () => { db.close(); resolve(); };
     tx.onerror = () => { db.close(); reject(tx.error); };

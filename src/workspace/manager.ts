@@ -1,14 +1,14 @@
 import type { OpenFileEntry, DirectoryState } from '../io/filesystem';
 import {
-  isFileSystemAccessSupported,
-  openDirectoryNative,
-  openDirectoryFallback,
+  openDirectory as openWorkspaceDirectory,
   rescanDirectory,
   deleteFileAtPath,
   writeFileAtPath,
 } from '../io/filesystem';
 import { isFragmentedModelDirectory } from '../model/service';
-import { detectGitBranch } from './git';
+import { isTauriRuntime } from '../platform/tauri';
+import { detectGitBranch, readGitHistory, readGitChangedFiles, readGitModelSnapshot } from './git';
+import type { GitHistoryEntry, GitCommitFile } from './git';
 import { saveWorkspace, loadWorkspace, clearWorkspace } from './persistence';
 import type { WorkspaceState, WorkspaceMetadata, WorkspaceKind } from './types';
 import { INITIAL_WORKSPACE_STATE } from './types';
@@ -57,46 +57,45 @@ export class WorkspaceManager {
     this.emit();
   }
 
+  private async applyOpenedDirectoryState(
+    dirState: DirectoryState,
+    metadata?: WorkspaceMetadata,
+  ): Promise<DirectoryState> {
+    this._lastSavedHashes.clear();
+
+    const isFragmented = isFragmentedModelDirectory(dirState.files);
+    const kind: WorkspaceKind = metadata?.kind
+      ?? (isFragmented ? 'coarchi-directory' : metadata?.activeFilePath ? 'single-file' : null);
+    const format = metadata?.format ?? (isFragmented ? 'coarchi-xml' : null);
+    const directoryRef = dirState.directoryPath ?? dirState.directoryHandle;
+    const gitBranch = directoryRef ? await detectGitBranch(directoryRef) : null;
+
+    this.update({
+      directoryHandle: dirState.directoryHandle ?? null,
+      directoryPath: dirState.directoryPath ?? null,
+      backend: dirState.backend,
+      directoryName: dirState.directoryName,
+      canWrite: dirState.canWrite,
+      kind,
+      files: dirState.files,
+      isFragmented: metadata?.isFragmented ?? isFragmented,
+      format,
+      isDirty: false,
+      gitBranch,
+      activeFilePath: metadata?.activeFilePath ?? null,
+    });
+
+    await this.persist();
+    return dirState;
+  }
+
   // ---------------------------------------------------------------------------
   // Open directory
   // ---------------------------------------------------------------------------
 
   async openDirectory(): Promise<DirectoryState> {
-    let dirState: DirectoryState;
-
-    if (isFileSystemAccessSupported()) {
-      dirState = await openDirectoryNative();
-    } else {
-      dirState = await openDirectoryFallback();
-    }
-
-    const isFragmented = isFragmentedModelDirectory(dirState.files);
-    const kind: WorkspaceKind = isFragmented ? 'coarchi-directory' : null;
-    const format = isFragmented ? 'coarchi-xml' : null;
-
-    let gitBranch: string | null = null;
-    if (dirState.directoryHandle) {
-      gitBranch = await detectGitBranch(dirState.directoryHandle);
-    }
-
-    this.update({
-      directoryHandle: dirState.directoryHandle ?? null,
-      directoryName: dirState.directoryName,
-      kind,
-      files: dirState.files,
-      isFragmented,
-      format,
-      isDirty: false,
-      gitBranch,
-      activeFilePath: null,
-    });
-
-    // Persist to IndexedDB if we have a handle
-    if (dirState.directoryHandle) {
-      await this.persist();
-    }
-
-    return dirState;
+    const dirState = await openWorkspaceDirectory();
+    return this.applyOpenedDirectoryState(dirState);
   }
 
   // ---------------------------------------------------------------------------
@@ -110,7 +109,7 @@ export class WorkspaceManager {
       format,
       isDirty: false,
     });
-    this.persist();
+    void this.persist();
   }
 
   // ---------------------------------------------------------------------------
@@ -138,7 +137,7 @@ export class WorkspaceManager {
     if (entry.writeText) {
       await entry.writeText(content);
     } else {
-      throw new Error('File System Access API not available — cannot save in place');
+      throw new Error('Direct write access is not available for the current workspace');
     }
     this.markClean();
   }
@@ -146,20 +145,19 @@ export class WorkspaceManager {
   /**
    * Write multiple files to the directory (fragmented save).
    * Only writes files whose content actually changed since the last save.
-   * Requires a directory handle (File System Access API).
    */
   async saveFragmented(
     files: { relativePath: string; content: string }[],
     deletedPaths: string[] = [],
   ): Promise<IncrementalSaveResult> {
-    const handle = this._state.directoryHandle;
-    if (!handle) {
-      throw new Error('No directory handle — cannot save fragmented model');
+    const root = this._state.directoryPath ?? this._state.directoryHandle;
+    if (!root) {
+      throw new Error('No writable workspace is open');
     }
 
     let deletedCount = 0;
     for (const path of deletedPaths) {
-      await deleteFileAtPath(handle, path);
+      await deleteFileAtPath(root, path);
       this._lastSavedHashes.delete(path);
       deletedCount++;
     }
@@ -175,7 +173,7 @@ export class WorkspaceManager {
         skippedCount++;
         continue;
       }
-      await writeFileAtPath(handle, file.relativePath, file.content);
+      await writeFileAtPath(root, file.relativePath, file.content);
       writtenCount++;
     }
 
@@ -189,12 +187,22 @@ export class WorkspaceManager {
    * Useful for saving just the currently selected item without a full save.
    */
   async saveSingleFragment(relativePath: string, content: string): Promise<void> {
-    const handle = this._state.directoryHandle;
-    if (!handle) {
-      throw new Error('No directory handle — cannot save fragment');
+    const root = this._state.directoryPath ?? this._state.directoryHandle;
+    if (!root) {
+      throw new Error('No writable workspace is open');
     }
-    await writeFileAtPath(handle, relativePath, content);
+    await writeFileAtPath(root, relativePath, content);
     this._lastSavedHashes.set(relativePath, hashContent(content));
+  }
+
+  /**
+   * Pre-populate content hashes from a serialized snapshot so the first
+   * incremental save can skip files that haven't changed since import.
+   */
+  seedContentHashes(files: { relativePath: string; content: string }[]): void {
+    for (const file of files) {
+      this._lastSavedHashes.set(file.relativePath, hashContent(file.content));
+    }
   }
 
   /** Get a file entry by relative path */
@@ -209,7 +217,7 @@ export class WorkspaceManager {
   }
 
   // ---------------------------------------------------------------------------
-  // Restore from IndexedDB (page refresh)
+  // Restore persisted workspace
   // ---------------------------------------------------------------------------
 
   async restore(): Promise<{
@@ -220,9 +228,21 @@ export class WorkspaceManager {
     const stored = await loadWorkspace();
     if (!stored) return null;
 
-    const { handle, metadata } = stored;
+    const { handle, directoryPath, metadata } = stored;
 
-    // Check if we still have permission
+    if (directoryPath) {
+      if (!isTauriRuntime()) {
+        await clearWorkspace();
+        return null;
+      }
+      return this.restoreFromPath(directoryPath, metadata);
+    }
+
+    if (!handle) {
+      await clearWorkspace();
+      return null;
+    }
+
     let permissionState: PermissionState;
     try {
       permissionState = await handle.queryPermission({ mode: 'readwrite' });
@@ -232,12 +252,10 @@ export class WorkspaceManager {
     }
 
     if (permissionState === 'granted') {
-      // We can restore silently
-      return await this.restoreFromHandle(handle, metadata);
+      return this.restoreFromHandle(handle, metadata);
     }
 
     if (permissionState === 'prompt') {
-      // Need user gesture to request permission
       return {
         state: this._state,
         permissionNeeded: true,
@@ -245,20 +263,33 @@ export class WorkspaceManager {
       };
     }
 
-    // Permission denied — clean up
     await clearWorkspace();
     return null;
   }
 
   /**
    * Request permission and complete restore.
-   * Must be called from a user gesture (e.g. button click).
+   * Must be called from a user gesture when restoring a browser handle.
    */
   async requestPermissionAndRestore(): Promise<WorkspaceState | null> {
     const stored = await loadWorkspace();
     if (!stored) return null;
 
-    const { handle, metadata } = stored;
+    const { handle, directoryPath, metadata } = stored;
+
+    if (directoryPath) {
+      if (!isTauriRuntime()) {
+        await clearWorkspace();
+        return null;
+      }
+      const result = await this.restoreFromPath(directoryPath, metadata);
+      return result?.state ?? null;
+    }
+
+    if (!handle) {
+      await clearWorkspace();
+      return null;
+    }
 
     try {
       const permission = await handle.requestPermission({ mode: 'readwrite' });
@@ -280,22 +311,20 @@ export class WorkspaceManager {
     metadata: WorkspaceMetadata,
   ): Promise<{ state: WorkspaceState; permissionNeeded: false; directoryName: string | null }> {
     const dirState = await rescanDirectory(handle);
-    const gitBranch = await detectGitBranch(handle);
-    const kind: WorkspaceKind = metadata.kind
-      ?? (metadata.isFragmented ? 'coarchi-directory' : metadata.activeFilePath ? 'single-file' : null);
-
-    this.update({
-      directoryHandle: handle,
+    await this.applyOpenedDirectoryState(dirState, metadata);
+    return {
+      state: this._state,
+      permissionNeeded: false,
       directoryName: dirState.directoryName,
-      kind,
-      files: dirState.files,
-      isFragmented: metadata.isFragmented,
-      format: metadata.format,
-      activeFilePath: metadata.activeFilePath,
-      isDirty: false,
-      gitBranch,
-    });
+    };
+  }
 
+  private async restoreFromPath(
+    directoryPath: string,
+    metadata: WorkspaceMetadata,
+  ): Promise<{ state: WorkspaceState; permissionNeeded: false; directoryName: string | null }> {
+    const dirState = await rescanDirectory(directoryPath);
+    await this.applyOpenedDirectoryState(dirState, metadata);
     return {
       state: this._state,
       permissionNeeded: false,
@@ -319,10 +348,28 @@ export class WorkspaceManager {
   // ---------------------------------------------------------------------------
 
   async refreshGitBranch(): Promise<void> {
-    if (this._state.directoryHandle) {
-      const gitBranch = await detectGitBranch(this._state.directoryHandle);
-      this.update({ gitBranch });
-    }
+    const directoryRef = this._state.directoryPath ?? this._state.directoryHandle;
+    if (!directoryRef) return;
+    const gitBranch = await detectGitBranch(directoryRef);
+    this.update({ gitBranch });
+  }
+
+  async getGitHistory(limit: number = 30): Promise<GitHistoryEntry[]> {
+    const directoryRef = this._state.directoryPath ?? this._state.directoryHandle;
+    if (!directoryRef) return [];
+    return readGitHistory(directoryRef, limit);
+  }
+
+  async getGitChangedFiles(commit: string): Promise<string[]> {
+    const directoryRef = this._state.directoryPath ?? this._state.directoryHandle;
+    if (!directoryRef) return [];
+    return readGitChangedFiles(directoryRef, commit);
+  }
+
+  async getGitModelSnapshot(commit: string): Promise<GitCommitFile[]> {
+    const directoryRef = this._state.directoryPath ?? this._state.directoryHandle;
+    if (!directoryRef) return [];
+    return readGitModelSnapshot(directoryRef, commit);
   }
 
   // ---------------------------------------------------------------------------
@@ -330,17 +377,36 @@ export class WorkspaceManager {
   // ---------------------------------------------------------------------------
 
   private async persist(): Promise<void> {
-    const { directoryHandle, kind, format, activeFilePath, isFragmented, directoryName } = this._state;
-    if (!directoryHandle) return;
+    const {
+      directoryHandle,
+      directoryPath,
+      backend,
+      kind,
+      format,
+      activeFilePath,
+      isFragmented,
+      directoryName,
+    } = this._state;
+    if (!directoryHandle && !directoryPath) return;
+
     try {
-      await saveWorkspace(directoryHandle, {
-        kind,
-        format,
-        activeFilePath,
-        isFragmented,
-        currentViewId: null, // will be set by the hook
-        directoryName,
-      });
+      await saveWorkspace(
+        {
+          handle: directoryHandle,
+          directoryPath,
+          backend,
+        },
+        {
+          backend,
+          directoryPath,
+          kind,
+          format,
+          activeFilePath,
+          isFragmented,
+          currentViewId: null,
+          directoryName,
+        },
+      );
     } catch {
       // IndexedDB not available — silently ignore
     }

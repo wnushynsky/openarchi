@@ -1,12 +1,18 @@
-import type { OpenFileEntry } from '../io/filesystem';
+import type { OpenFileEntry, WorkspaceBackend } from '../io/filesystem';
 
 export type WorkspaceKind = 'single-file' | 'coarchi-directory' | null;
 
 export interface WorkspaceState {
-  /** Root directory handle (null when no directory is open or on fallback browsers) */
+  /** Root directory handle (browser File System Access only) */
   directoryHandle: FileSystemDirectoryHandle | null;
+  /** Root directory path (Tauri only) */
+  directoryPath: string | null;
+  /** Active persistence backend */
+  backend: WorkspaceBackend | null;
   /** Display name of the opened directory */
   directoryName: string | null;
+  /** True when the current backend can write back to disk */
+  canWrite: boolean;
   /** High-level workspace mode used to drive save behavior */
   kind: WorkspaceKind;
   /** Detected model format */
@@ -24,6 +30,8 @@ export interface WorkspaceState {
 }
 
 export interface WorkspaceMetadata {
+  backend?: WorkspaceBackend | null;
+  directoryPath?: string | null;
   kind?: WorkspaceKind;
   format: string | null;
   activeFilePath: string | null;
@@ -34,7 +42,10 @@ export interface WorkspaceMetadata {
 
 export const INITIAL_WORKSPACE_STATE: WorkspaceState = {
   directoryHandle: null,
+  directoryPath: null,
+  backend: null,
   directoryName: null,
+  canWrite: false,
   kind: null,
   format: null,
   isFragmented: false,

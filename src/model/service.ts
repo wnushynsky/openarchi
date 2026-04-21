@@ -181,6 +181,37 @@ function applyLayoutsToCanonical(
 
   const elementById = new Map(canonical.elements.map(element => [element.id, element]));
   const relationshipById = new Map(canonical.relationships.map(relationship => [relationship.id, relationship]));
+
+  if (Array.isArray(model.diagramNodes) && model.diagramNodes.length > 0) {
+    const validViewIds = new Set(canonical.views.map(view => view.id));
+    const baseNodeById = new Map(baseDocument.viewNodes.map(node => [node.id, node]));
+    const baseConnectionById = new Map(baseDocument.viewConnections.map(connection => [connection.id, connection]));
+
+    canonical.viewNodes = canonical.viewNodes
+      .filter(node => validViewIds.has(node.viewId) && elementById.has(node.elementId))
+      .map(node => {
+        const baseNode = baseNodeById.get(node.id);
+        return {
+          ...baseNode,
+          ...node,
+          style: node.style ?? baseNode?.style,
+        };
+      });
+
+    canonical.viewConnections = canonical.viewConnections
+      .filter(connection => validViewIds.has(connection.viewId) && relationshipById.has(connection.relationshipId))
+      .map(connection => {
+        const baseConnection = baseConnectionById.get(connection.id);
+        return {
+          ...baseConnection,
+          ...connection,
+          style: connection.style ?? baseConnection?.style,
+        };
+      });
+
+    return canonical;
+  }
+
   const baseViewNodesByViewId = new Map<string, typeof baseDocument.viewNodes>();
   const baseViewConnectionsByViewId = new Map<string, typeof baseDocument.viewConnections>();
 
@@ -473,7 +504,8 @@ export function exportFragmentedEditorModel(
     relationshipLayouts,
     baseDocument,
   );
-  const canonical = ensureCanonicalSourcePaths(canonicalWithLayouts);
+  const sanitizedCanonical = sanitizeViewConnectionsForExport(canonicalWithLayouts);
+  const canonical = ensureCanonicalSourcePaths(sanitizedCanonical);
   const validationDiagnostics = validateCanonicalDocument(canonical);
   const result = serializeCoArchiFragmented(canonical);
 
@@ -512,5 +544,51 @@ export function exportFragmentedEditorModel(
       deletedFolderPaths,
     },
     document: canonical,
+  };
+}
+
+function sanitizeViewConnectionsForExport(document: CanonicalModelDocument): CanonicalModelDocument {
+  const nodeById = new Map(document.viewNodes.map(node => [node.id, node]));
+  const relationshipById = new Map(document.relationships.map(relationship => [relationship.id, relationship]));
+  const nodeIdsByViewAndElement = new Map<string, string[]>();
+
+  for (const node of document.viewNodes) {
+    const key = `${node.viewId}::${node.elementId}`;
+    const ids = nodeIdsByViewAndElement.get(key) || [];
+    ids.push(node.id);
+    nodeIdsByViewAndElement.set(key, ids);
+  }
+
+  const viewConnections = document.viewConnections.flatMap(connection => {
+    const relationship = relationshipById.get(connection.relationshipId);
+    if (!relationship) return [];
+
+    const sourceKey = `${connection.viewId}::${relationship.sourceId}`;
+    const targetKey = `${connection.viewId}::${relationship.targetId}`;
+    const sourceCandidates = nodeIdsByViewAndElement.get(sourceKey) || [];
+    const targetCandidates = nodeIdsByViewAndElement.get(targetKey) || [];
+
+    const currentSource = connection.sourceNodeId ? nodeById.get(connection.sourceNodeId) : undefined;
+    const currentTarget = connection.targetNodeId ? nodeById.get(connection.targetNodeId) : undefined;
+
+    const sourceNodeId = currentSource?.viewId === connection.viewId && currentSource.elementId === relationship.sourceId
+      ? currentSource.id
+      : sourceCandidates[0];
+    const targetNodeId = currentTarget?.viewId === connection.viewId && currentTarget.elementId === relationship.targetId
+      ? currentTarget.id
+      : targetCandidates[0];
+
+    if (!sourceNodeId || !targetNodeId) return [];
+
+    return [{
+      ...connection,
+      sourceNodeId,
+      targetNodeId,
+    }];
+  });
+
+  return {
+    ...document,
+    viewConnections,
   };
 }
